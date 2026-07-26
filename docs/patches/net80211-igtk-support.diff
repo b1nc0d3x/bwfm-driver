@@ -1,0 +1,167 @@
+# net80211 IGTK slot support (802.11 MFP integrity key IDs 4/5)
+#
+# FreeBSD net80211 reserves iv_nw_keys[IEEE80211_WEP_NKID (=4)] for
+# WEP/GTK slots 0..3 and rejects IOC_WPAKEY with kid >= 4.  That blocks
+# IGTK install from wpa_supplicant, so MFP-protected mgmt frames can't
+# be validated on RX.
+#
+# This patch adds two IGTK slots as heap-allocated pointers stealing
+# two entries from the tail iv_spare[] pad — struct ieee80211vap size
+# is unchanged, so any module that doesn't touch iv_spare/iv_igtk stays
+# ABI-compatible.  wpa_supplicant's set_key with kid 4/5 routes to
+# vap->iv_igtk[kid - IEEE80211_WEP_NKID] and completes.
+# ieee80211_is_key_global recognises iv_igtk[] entries so null_key_alloc
+# accepts them; the key flows through the driver's iv_key_set hook where
+# a FullMAC driver (like brcm_pci) forwards it to fw for BIP validation.
+#
+# The setkey/getkey ioctl handlers get the same IGTK-routing branch —
+# added twice: once in ieee80211_ioctl_getkey (around line 92), once
+# in ieee80211_ioctl_setkey (around line 1205).
+#
+# WARNING: `device wlan` is compiled into GENERIC, so wlan.ko alone is
+# not enough — the full kernel must be rebuilt.
+#
+# Apply on target (FreeBSD 15.1 base tree):
+#   sudo patch -p0 -d/ < net80211-igtk-support.diff
+#   cd /usr/src && sudo make -j4 buildkernel KERNCONF=GENERIC
+#   sudo make installkernel KERNCONF=GENERIC
+#   # rebuild driver modules that reference ieee80211vap:
+#   SRCTOP=/home/b1nc0d3x/brcm make
+#   sudo cp brcm_pci.ko /boot/modules/brcm_pci.ko
+#   sudo reboot
+#
+# Live-fire verified 2026-07-25 on BCM43602 + brcm_pci: fmop_set_key:
+# IGTK idx=4 fires with rc=0, EAPOL: SUPP_PAE entering state
+# AUTHENTICATED, data plane 5/5 pings 0.64ms avg.  Non-MFP baseline
+# unchanged (3/3 pings 2.4ms).
+--- /usr/src/sys/net80211/ieee80211.h.orig	2026-07-25 09:55:42.404231000 -0400
++++ /usr/src/sys/net80211/ieee80211.h	2026-07-25 09:57:20.039459000 -0400
+@@ -2049,6 +2049,11 @@
+ 					 IEEE80211_WEP_KIDLEN + \
+ 					 IEEE80211_WEP_CRCLEN)
+ #define	IEEE80211_WEP_NKID		4	/* number of key ids */
++#define	IEEE80211_IGTK_NKID		2	/* MFP IGTK key ids (4,5) */
++#define	IEEE80211_IGTK_KID_BASE		4	/* first IGTK key id */
++#define	IEEE80211_KEY_IS_IGTK(kid)					\
++	((kid) >= IEEE80211_IGTK_KID_BASE &&				\
++	 (kid) < IEEE80211_IGTK_KID_BASE + IEEE80211_IGTK_NKID)
+ 
+ /*
+  * 802.11i defines an extended IV for use with non-WEP ciphers.
+--- /usr/src/sys/net80211/ieee80211_var.h.orig	2026-07-25 09:55:42.409494000 -0400
++++ /usr/src/sys/net80211/ieee80211_var.h	2026-07-25 09:57:20.039684000 -0400
+@@ -617,7 +617,14 @@
+ 	struct ieee80211_rx_histogram	*rx_histogram;
+ 	struct ieee80211_tx_histogram	*tx_histogram;
+ 
+-	uint64_t		iv_spare[36];
++	/*
++	 * 802.11 MFP integrity group keys.  IGTK slots are key IDs 4 and 5
++	 * (per IEEE 802.11-2016) — distinct from the WEP/GTK slots 0..3 in
++	 * iv_nw_keys[].  Heap-allocated so struct size stays constant.
++	 */
++	struct ieee80211_key	*iv_igtk[2];
++
++	uint64_t		iv_spare[34];
+ };
+ MALLOC_DECLARE(M_80211_VAP);
+ 
+--- /usr/src/sys/net80211/ieee80211_crypto.c.orig	2026-07-25 09:55:42.414513000 -0400
++++ /usr/src/sys/net80211/ieee80211_crypto.c	2026-07-25 09:57:20.039806000 -0400
+@@ -564,6 +564,13 @@
+ 	ieee80211_key_update_begin(vap);
+ 	for (i = 0; i < IEEE80211_WEP_NKID; i++)
+ 		(void) _ieee80211_crypto_delkey(vap, &vap->iv_nw_keys[i]);
++	for (i = 0; i < IEEE80211_IGTK_NKID; i++) {
++		if (vap->iv_igtk[i] == NULL)
++			continue;
++		(void) _ieee80211_crypto_delkey(vap, vap->iv_igtk[i]);
++		IEEE80211_FREE(vap->iv_igtk[i], M_80211_CRYPTO);
++		vap->iv_igtk[i] = NULL;
++	}
+ 	ieee80211_key_update_end(vap);
+ }
+ 
+--- /usr/src/sys/net80211/ieee80211_ioctl.c.orig	2026-07-25 09:55:42.419481000 -0400
++++ /usr/src/sys/net80211/ieee80211_ioctl.c	2026-07-25 11:07:46.367058000 -0400
+@@ -92,6 +92,26 @@
+ 		if (ni == NULL)
+ 			return ENOENT;
+ 		wk = &ni->ni_ucastkey;
++	} else if (IEEE80211_KEY_IS_IGTK(kid)) {
++		/*
++		 * MFP IGTK slot (key id 4 or 5).  Allocated on first
++		 * install; retained across rekeys.  Distinct from
++		 * iv_nw_keys[] to preserve WEP/GTK semantics for the
++		 * existing 0..3 slots.
++		 */
++		int igidx = kid - IEEE80211_IGTK_KID_BASE;
++		if (vap->iv_igtk[igidx] == NULL) {
++			vap->iv_igtk[igidx] = IEEE80211_MALLOC(
++			    sizeof(struct ieee80211_key), M_80211_CRYPTO,
++			    IEEE80211_M_NOWAIT | IEEE80211_M_ZERO);
++			if (vap->iv_igtk[igidx] == NULL)
++				return ENOMEM;
++			ieee80211_crypto_resetkey(vap, vap->iv_igtk[igidx],
++			    IEEE80211_KEYIX_NONE);
++		}
++		wk = vap->iv_igtk[igidx];
++		wk->wk_keyix = kid;
++		ni = NULL;
+ 	} else {
+ 		if (kid >= IEEE80211_WEP_NKID)
+ 			return EINVAL;
+@@ -1202,6 +1222,26 @@
+ 				return ENOENT;
+ 		}
+ 		wk = &ni->ni_ucastkey;
++	} else if (IEEE80211_KEY_IS_IGTK(kid)) {
++		/*
++		 * MFP IGTK slot (key id 4 or 5).  Allocated on first
++		 * install; retained across rekeys.  Distinct from
++		 * iv_nw_keys[] to preserve WEP/GTK semantics for the
++		 * existing 0..3 slots.
++		 */
++		int igidx = kid - IEEE80211_IGTK_KID_BASE;
++		if (vap->iv_igtk[igidx] == NULL) {
++			vap->iv_igtk[igidx] = IEEE80211_MALLOC(
++			    sizeof(struct ieee80211_key), M_80211_CRYPTO,
++			    IEEE80211_M_NOWAIT | IEEE80211_M_ZERO);
++			if (vap->iv_igtk[igidx] == NULL)
++				return ENOMEM;
++			ieee80211_crypto_resetkey(vap, vap->iv_igtk[igidx],
++			    IEEE80211_KEYIX_NONE);
++		}
++		wk = vap->iv_igtk[igidx];
++		wk->wk_keyix = kid;
++		ni = NULL;
+ 	} else {
+ 		if (kid >= IEEE80211_WEP_NKID)
+ 			return EINVAL;
+--- /usr/src/sys/net80211/ieee80211.c.orig	2026-07-25 09:55:42.000000000 -0400
++++ /usr/src/sys/net80211/ieee80211.c	2026-07-25 11:24:09.819567000 -0400
+@@ -2706,8 +2706,22 @@
+ ieee80211_is_key_global(const struct ieee80211vap *vap,
+     const struct ieee80211_key *key)
+ {
+-	return (&vap->iv_nw_keys[0] <= key &&
+-	    key < &vap->iv_nw_keys[IEEE80211_WEP_NKID]);
++	int i;
++
++	if (&vap->iv_nw_keys[0] <= key &&
++	    key < &vap->iv_nw_keys[IEEE80211_WEP_NKID])
++		return (true);
++	/*
++	 * MFP IGTK slots are also "global" — per-VAP, shared, used to
++	 * validate protected group-addressed mgmt frames.  Distinct from
++	 * iv_nw_keys[] to preserve WEP/GTK semantics but semantically the
++	 * same class from a key-alloc perspective.
++	 */
++	for (i = 0; i < IEEE80211_IGTK_NKID; i++) {
++		if (vap->iv_igtk[i] == key)
++			return (true);
++	}
++	return (false);
+ }
+ 
+ /**
