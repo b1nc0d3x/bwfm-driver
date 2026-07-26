@@ -23,6 +23,16 @@ loadable module builds only what it needs.
   net80211 registration.  Association paths reuse the same core but
   are less battle-tested than the PCIe port.
 
+## Verified capabilities
+
+- WPA2-PSK association + DHCP + data plane
+- WPA2-PSK-SHA256 + 802.11w MFP (BIP-CMAC-128) with IGTK install
+- Reassociation across different SSIDs (roundtrip)
+- Concurrent scan while associated (no wedge, connection stable)
+- On-air MFP verification: Atheros in monitor mode captures
+  protected Action frames from AP that our fw validates on RX
+
+
 ## Build
 
 Each transport is an independent loadable module.  Build only what you
