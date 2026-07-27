@@ -16,7 +16,11 @@
 #
 # The setkey/getkey ioctl handlers get the same IGTK-routing branch —
 # added twice: once in ieee80211_ioctl_getkey (around line 92), once
-# in ieee80211_ioctl_setkey (around line 1205).
+# in ieee80211_ioctl_setkey (around line 1205).  ieee80211_ioctl_delkey
+# gets a third routing branch so wpa_supplicant's startup key-flush
+# sweep for IGTK slots 4/5 returns 0 instead of EINVAL (the source of
+# the noisy `ioctl[SIOCS80211, op=20, val=0, arg_len=7]: Invalid
+# argument` messages at wpa_supplicant startup).
 #
 # WARNING: `device wlan` is compiled into GENERIC, so wlan.ko alone is
 # not enough — the full kernel must be rebuilt.
@@ -136,6 +140,24 @@
 +		wk->wk_keyix = kid;
 +		ni = NULL;
  	} else {
+ 		if (kid >= IEEE80211_WEP_NKID)
+ 			return EINVAL;
+@@ -1284,6 +1324,15 @@
+ 		ieee80211_node_delucastkey(ni);
+ 		ieee80211_free_node(ni);
+ 	} else {
++		if (IEEE80211_KEY_IS_IGTK(kid)) {
++			/*
++			 * MFP IGTK slot.  Delete if allocated, else silent
++			 * NO-OP — wpa_supplicant flushes slots 4/5 at startup
++			 * before ever installing anything there.
++			 */
++			int igidx = kid - IEEE80211_IGTK_KID_BASE;
++			if (vap->iv_igtk[igidx] != NULL)
++				ieee80211_crypto_delkey(vap,
++				    vap->iv_igtk[igidx]);
++			return 0;
++		}
  		if (kid >= IEEE80211_WEP_NKID)
  			return EINVAL;
 --- /usr/src/sys/net80211/ieee80211.c.orig	2026-07-25 09:55:42.000000000 -0400
