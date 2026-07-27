@@ -810,7 +810,7 @@ brcm_handle_event(struct brcm_softc *sc, const uint8_t *p, size_t len,
     size_t evpos)
 {
 	const struct brcm_event_msg *emsg;
-	struct ieee80211com *ic = &sc->sc_ic;
+	struct ieee80211com *ic __unused = &sc->sc_ic;
 	struct ieee80211vap *vap __unused;
 	uint32_t evtype, status;
 	uint16_t eflags;
@@ -955,34 +955,18 @@ brcm_handle_event(struct brcm_softc *sc, const uint8_t *p, size_t len,
 	}
 	if (evtype == BRCM_E_EAPOL_MSG) {
 		/*
-		 * Firmware-delivered EAPOL frame.  With sup_wpa=0 the chip
-		 * emits each EAPOL packet from the AP as event type 25
-		 * instead of consuming it in its own supplicant.  Forward
-		 * the body to the FullMAC framework, which wraps it in a
-		 * synthetic 802.3 header (dst=our_mac, src=ap_mac,
-		 * ethertype=0x888e) and feeds ieee80211_input_all so
-		 * net80211 routes to userspace wpa_supplicant via the
-		 * wlan(4) BPF / EAPOL subscription.
+		 * With sup_wpa=0 the chip delivers each EAPOL frame BOTH
+		 * as a BRCM_E_EAPOL_MSG event AND as an 802.3 data frame
+		 * on the msgbuf RX ring.  The data path already forwards
+		 * to ieee80211_fmac_eapol_rx (see if_brcm_pci.c
+		 * brcm_pci_msgbuf_rx_up) so dispatching the event copy
+		 * here delivers the same frame to wpa_supplicant twice.
+		 * Symptom: each M1 triggers two M2 sends, first M2 arrives
+		 * ~1s late, hostapd 4-way timeout kills the association
+		 * and DHCPDISCOVER starves.  Ignore the event copy; keep
+		 * subscription enabled so fw stays in host-supplicant
+		 * mode (some fw revs gate that off event-mask presence).
 		 */
-		uint32_t plen = be32toh(emsg->datalen);
-		size_t payload_off = evpos + sizeof(*emsg);
-
-		if (!sc->sc_ic_attached)
-			return;
-		if (plen == 0 || plen > MCLBYTES - 14 ||
-		    payload_off + plen > len) {
-			DPRINTF(sc, 0,
-			    "EAPOL event: bogus plen=%u len=%zu\n",
-			    plen, len);
-			return;
-		}
-DPRINTF(sc, 0,
-		    "EAPOL event: %u bytes from %02x:%02x:%02x:%02x:%02x:%02x"
-		    " status=%u\n", plen,
-		    emsg->addr[0], emsg->addr[1], emsg->addr[2],
-		    emsg->addr[3], emsg->addr[4], emsg->addr[5], status);
-		ieee80211_fmac_eapol_rx(ic, emsg->addr,
-		    p + payload_off, plen);
 		return;
 	}
 	DPRINTF(sc, 1, "evt type=%u status=%u datalen=%u\n",
@@ -2266,7 +2250,7 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 	 *   1) 0xc0 = WPA2_UNSPEC | WPA2_PSK  (set_wpa_version)
 	 *   2) 0x80 = WPA2_PSK                (set_key_mgmt, after mfp)
 	 * The first pass seems to prep the fw's MFP state machine — see
-	 * the on-air trace captured from an identical
+	 * the on-air trace captured 2026-07-24 from an identical
 	 * BCM43602 + fw v7.35.177.61 on Ubuntu brcmfmac connecting to
 	 * an MFP-capable AP (docs/LINUX_MFP_IOVAR_TRACE.md).  Without
 	 * the first pass, SET_SSID / bsscfg:join returns FAIL(1) when
@@ -3768,6 +3752,24 @@ brcm_runtime_iovars(struct brcm_softc *sc)
 	 * parse the AP's beacons to know when to fire.  Skip it; the
 	 * "hardening" trade isn't worth losing join.
 	 */
+
+	/*
+	 * Explicit ARP + ND offload disable.  brcmfmac's
+	 * brcmf_configure_arp_nd_offload sets these to a non-zero mode
+	 * when the host is not promiscuous; we want them off so
+	 * DHCPOFFER + unsolicited ARP replies reach wpa_supplicant /
+	 * net80211 verbatim in host-supplicant mode.  Older fw returns
+	 * BCME_UNSUPPORTED — harmless.  Reference: brcmfmac core.c:96-131.
+	 */
+	v = htole32(0);
+	error = brcm_iovar_set(sc, "arp_ol", &v, sizeof(v));
+	DPRINTF(sc, 0, "arp_ol=0 rc=%d\n", error);
+	v = htole32(0);
+	error = brcm_iovar_set(sc, "arpoe", &v, sizeof(v));
+	DPRINTF(sc, 0, "arpoe=0 rc=%d\n", error);
+	v = htole32(0);
+	error = brcm_iovar_set(sc, "ndoe", &v, sizeof(v));
+	DPRINTF(sc, 0, "ndoe=0 rc=%d\n", error);
 
 	device_printf(sc->sc_dev,
 	    "WARNING: firmware blob is from 2011 and predates Broadpwn/Kr00k/"

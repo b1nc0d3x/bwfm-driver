@@ -71,6 +71,9 @@ struct fmac_state {
 		    const struct ieee80211_key *);
 	int	(*fs_save_key_delete)(struct ieee80211vap *,
 		    const struct ieee80211_key *);
+	int	(*fs_save_setregdomain)(struct ieee80211com *,
+		    struct ieee80211_regdomain *,
+		    int, struct ieee80211_channel []);
 
 	LIST_ENTRY(fmac_state)		    fs_link;
 };
@@ -120,6 +123,9 @@ static void	fmac_scan_end_shim(struct ieee80211com *);
 static void	fmac_scan_curchan_noop(struct ieee80211_scan_state *,
 		    unsigned long);
 static void	fmac_scan_mindwell_noop(struct ieee80211_scan_state *);
+static int	fmac_setregdomain_shim(struct ieee80211com *,
+		    struct ieee80211_regdomain *,
+		    int, struct ieee80211_channel []);
 
 int
 ieee80211_fmac_attach(struct ieee80211com *ic,
@@ -160,10 +166,18 @@ ieee80211_fmac_attach(struct ieee80211com *ic,
 	 * ic_scan_curchan runs scan_curchan_task under IEEE80211_LOCK and
 	 * calls ic->ic_transmit → bs_txdata → flowring_create → sleep,
 	 * which panics with "sleeping thread holds *_com_l"
-	 * (observed).  Point them at no-op shims for FullMAC.
+	 * (2026-07-21 fbsdmac).  Point them at no-op shims for FullMAC.
 	 */
 	ic->ic_scan_curchan  = fmac_scan_curchan_noop;
 	ic->ic_scan_mindwell = fmac_scan_mindwell_noop;
+
+	/*
+	 * Regulatory-domain sync.  Route ic_setregdomain (fired by
+	 * `ifconfig wlan0 regdomain <sku> country <cc>`) through the
+	 * fmac op so the fw's `country` iovar tracks the host's regdomain.
+	 */
+	fs->fs_save_setregdomain = ic->ic_setregdomain;
+	ic->ic_setregdomain = fmac_setregdomain_shim;
 
 	mtx_lock(&fmac_list_mtx);
 	LIST_INSERT_HEAD(&fmac_list, fs, fs_link);
@@ -185,6 +199,7 @@ ieee80211_fmac_detach(struct ieee80211com *ic)
 	ic->ic_scan_end      = fs->fs_save_scan_end;
 	ic->ic_scan_curchan  = fs->fs_save_scan_curchan;
 	ic->ic_scan_mindwell = fs->fs_save_scan_mindwell;
+	ic->ic_setregdomain  = fs->fs_save_setregdomain;
 
 	mtx_lock(&fmac_list_mtx);
 	LIST_REMOVE(fs, fs_link);
@@ -447,6 +462,39 @@ fmac_scan_mindwell_noop(struct ieee80211_scan_state *ss __unused)
 {
 }
 
+/*
+ * Regdomain shim.  Net80211 calls this from ieee80211_setregdomain when
+ * userspace runs `ifconfig wlan0 regdomain <sku> country <cc>`.  Route
+ * the ISO country code into the chip-side `country` iovar via
+ * fmop_set_country, then let net80211's saved handler apply the
+ * channel/txpower table update.  Return 0 unconditionally on set-
+ * country failure so net80211 still records the new regdomain — worst
+ * case the chip stays on the prior country until reboot.
+ */
+static int
+fmac_setregdomain_shim(struct ieee80211com *ic,
+    struct ieee80211_regdomain *reg, int nchans,
+    struct ieee80211_channel chans[])
+{
+	struct fmac_state *fs = fmac_lookup(ic);
+	char cc[3];
+	int rc;
+
+	if (fs != NULL && fs->fs_ops->fmop_set_country != NULL) {
+		cc[0] = reg->isocc[0];
+		cc[1] = reg->isocc[1];
+		cc[2] = '\0';
+		rc = fs->fs_ops->fmop_set_country(ic, cc);
+		if (rc != 0)
+			printf("fmac: fmop_set_country(%c%c) rc=%d "
+			    "— chip regdomain not updated\n",
+			    cc[0], cc[1], rc);
+	}
+	if (fs != NULL && fs->fs_save_setregdomain != NULL)
+		return (fs->fs_save_setregdomain(ic, reg, nchans, chans));
+	return (0);
+}
+
 /* ------------------------------------------------------------------
  * Driver -> net80211 up-calls
  * ------------------------------------------------------------------ */
@@ -661,7 +709,7 @@ ieee80211_fmac_eapol_rx(struct ieee80211com *ic,
 	m->m_len = m->m_pkthdr.len = 14 + len;
 	m->m_pkthdr.rcvif = vap->iv_ifp;
 	/*
-	 * Bench: ieee80211_input_all expects 802.11+radiotap
+	 * Bench 2026-06-30: ieee80211_input_all expects 802.11+radiotap
 	 * frames and DROPS our synthetic 802.3 EAPOL silently -- wlan0
 	 * Ipkts stayed at 0 even though chip delivered 3 M1 frames.
 	 *
@@ -678,20 +726,22 @@ ieee80211_fmac_eapol_rx(struct ieee80211com *ic,
 	 * unable to deliver, and Ipkts stays zero.
 	 */
 	/*
-	 * Explicit BPF tap.  ieee80211_vap_deliver_data -> if_input ->
-	 * ether_input on the wlan vap ifnet does NOT reach the BPF layer
-	 * for us (netisr ether Disp'd stays 0 even after multiple
-	 * deliver_data calls), so wpa_supplicant's BPF listener never
-	 * sees M1 and the 4-way times out.  Fire bpf_mtap directly on
-	 * the vap ifp's BPF descriptor so wpa_supplicant reads the
-	 * EAPOL frame it needs.
+	 * Tap BPF once and drop the mbuf.  wpa_supplicant's driver_bsd
+	 * reads EAPOL frames from a BPF socket bound to ethertype 0x888e;
+	 * that is the only consumer.  Do NOT also call
+	 * ieee80211_vap_deliver_data — that walks the frame through
+	 * ether_input which fires BPF a second time, so wpa_supplicant
+	 * sees every EAPOL frame twice.  Symptom of the duplicate: on
+	 * each M1 wpa_supplicant sends two M2s, the AP receives one
+	 * ~1s late and gives up on the 4-way in ~4s so dhclient times
+	 * out on DHCPDISCOVER.
 	 */
 	{
 		struct bpf_if *ifbpf = if_getbpf(vap->iv_ifp);
 		if (ifbpf != NULL && bpf_peers_present(ifbpf))
 			bpf_mtap(ifbpf, m);
 	}
-	ieee80211_vap_deliver_data(vap, m);
+	m_freem(m);
 }
 
 /*
