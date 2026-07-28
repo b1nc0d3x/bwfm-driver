@@ -1175,17 +1175,23 @@ brcm_join_wpa2_raw(struct brcm_softc *sc, const uint8_t bssid[6],
 	if (error != 0)
 		goto fail;
 
-	v = htole32(BRCM_WPA_AUTH_WPA2_PSK);
+	v = htole32(sc->sc_sae_join ? BRCM_WPA_AUTH_WPA3_SAE_PSK :
+	    BRCM_WPA_AUTH_WPA2_PSK);
 	error = brcm_iovar_set(sc, "wpa_auth", &v, sizeof(v));
 	if (error != 0)
 		goto fail;
+	if (sc->sc_sae_join) {
+		uint32_t mfp = htole32(BRCM_MFP_REQUIRED);
+		(void)brcm_iovar_set(sc, "mfp", &mfp, sizeof(mfp));
+	}
 
 	/*
 	 * Enable the in-firmware supplicant.  Required by BCM43455 fw
 	 * 7.45.x: without sup_wpa=1 the chip rejects wsec_pmk install
 	 * with BCME_BADARG (-2) and the 4-way handshake never runs.
 	 * Non-fatal: older fw (2011 BCM43236) doesn't have the iovar
-	 * and runs 4-way via host EAPOL instead.
+	 * and runs 4-way via host EAPOL instead.  For WPA3-SAE the fw
+	 * supplicant is mandatory — SAE exchange runs inside fw.
 	 */
 	v = htole32(1);
 	(void)brcm_iovar_set(sc, "sup_wpa", &v, sizeof(v));
@@ -2213,6 +2219,9 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 			rsn_ie = wpa2_psk_ccmp_rsn_ie;
 			rsn_ie_len = sizeof(wpa2_psk_ccmp_rsn_ie);
 		}
+		/* WPA3-SAE requires MFP by spec — force REQUIRED. */
+		if (sc->sc_sae_join)
+			mfp = BRCM_MFP_REQUIRED;
 
 		DPRINTF(sc, 1,
 		    "wpaie source=%s len=%zu mfp=%u\n",
@@ -2256,17 +2265,35 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 	 * the first pass, SET_SSID / bsscfg:join returns FAIL(1) when
 	 * the mfp iovar is nonzero.
 	 */
-	v = htole32(BRCM_WPA_AUTH_WPA2_UNSPEC | BRCM_WPA_AUTH_WPA2_PSK);
-	HOSTEAP_RC("wpa_auth=0xc0(first)",
-	    brcm_iovar_set(sc, "wpa_auth", &v, sizeof(v)));
+	if (sc->sc_sae_join) {
+		/* WPA3-SAE (fw offload).  Fw runs the SAE exchange, derives
+		 * the PMK, and hands us LINK-up with fw's own supplicant.
+		 * SET_WSEC_PMK below carries the plaintext password with
+		 * PASSPHRASE flag — same shape as WPA2, different AKM. */
+		v = htole32(BRCM_WPA_AUTH_WPA3_SAE_PSK);
+		HOSTEAP_RC("wpa_auth=0x40000(SAE)",
+		    brcm_iovar_set(sc, "wpa_auth", &v, sizeof(v)));
 
-	v = htole32(BRCM_WSEC_AES);
-	HOSTEAP_RC("wsec", brcm_iovar_set(sc, "wsec", &v, sizeof(v)));
+		v = htole32(BRCM_WSEC_AES);
+		HOSTEAP_RC("wsec", brcm_iovar_set(sc, "wsec", &v, sizeof(v)));
 
-	/* Second wpa_auth pass = final AKM (plain WPA2_PSK). */
-	v = htole32(BRCM_WPA_AUTH_WPA2_PSK);
-	HOSTEAP_RC("wpa_auth=0x80(final)",
-	    brcm_iovar_set(sc, "wpa_auth", &v, sizeof(v)));
+		/* Second wpa_auth pass — keep SAE AKM. */
+		v = htole32(BRCM_WPA_AUTH_WPA3_SAE_PSK);
+		HOSTEAP_RC("wpa_auth=0x40000(SAE-final)",
+		    brcm_iovar_set(sc, "wpa_auth", &v, sizeof(v)));
+	} else {
+		v = htole32(BRCM_WPA_AUTH_WPA2_UNSPEC | BRCM_WPA_AUTH_WPA2_PSK);
+		HOSTEAP_RC("wpa_auth=0xc0(first)",
+		    brcm_iovar_set(sc, "wpa_auth", &v, sizeof(v)));
+
+		v = htole32(BRCM_WSEC_AES);
+		HOSTEAP_RC("wsec", brcm_iovar_set(sc, "wsec", &v, sizeof(v)));
+
+		/* Second wpa_auth pass = final AKM (plain WPA2_PSK). */
+		v = htole32(BRCM_WPA_AUTH_WPA2_PSK);
+		HOSTEAP_RC("wpa_auth=0x80(final)",
+		    brcm_iovar_set(sc, "wpa_auth", &v, sizeof(v)));
+	}
 
 	/*
 	 * UP before the join dispatch.  Chip must be UP for the join
@@ -3778,6 +3805,50 @@ brcm_runtime_iovars(struct brcm_softc *sc)
 }
 
 /*
+ * SAE capability probe.  Attempts to set wpa_auth = WPA3_AUTH_SAE_PSK
+ * (0x40000) and reports rc back to userspace.  0 means fw accepts the
+ * WPA3-SAE AKM (a necessary but not sufficient signal — chip still
+ * needs SAE hostapd on the other side to complete an exchange).
+ * BCME_UNSUPPORTED (-23) means this fw doesn't know SAE at all.
+ *
+ * Idempotent: probing does NOT persist wpa_auth — we snapshot the
+ * prior value, try SAE, then restore.  Safe to run at any time.
+ */
+static int
+brcm_sae_probe_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct brcm_softc *sc = arg1;
+	uint32_t old, sae, restore;
+	int probe_rc, restore_rc, error;
+	char buf[64];
+
+	if (req->newptr == NULL) {
+		snprintf(buf, sizeof(buf), "run 'sysctl -w %s=1' to probe\n",
+		    "dev.brcm_pci.0.sae_probe");
+		return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
+	}
+
+	old = 0;
+	{
+		size_t l = sizeof(old);
+		(void)brcm_iovar_get(sc, "wpa_auth", &old, &l);
+	}
+	sae = htole32(BRCM_WPA_AUTH_WPA3_SAE_PSK);
+	probe_rc = brcm_iovar_set(sc, "wpa_auth", &sae, sizeof(sae));
+	restore = old;
+	restore_rc = brcm_iovar_set(sc, "wpa_auth", &restore, sizeof(restore));
+	device_printf(sc->sc_dev,
+	    "sae_probe: wpa_auth=0x%x probe_rc=%d, restored=0x%x rc=%d\n",
+	    BRCM_WPA_AUTH_WPA3_SAE_PSK, probe_rc, le32toh(old), restore_rc);
+
+	snprintf(buf, sizeof(buf),
+	    "sae_probe rc=%d (0=fw accepts SAE, -23=BCME_UNSUPPORTED)\n",
+	    probe_rc);
+	error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
+	return (error);
+}
+
+/*
  * Register the operator-facing sysctls that live on the brcm core.
  * Transports call this after brcm_attach() so the sysctl tree exists
  * and the softc is fully initialised.
@@ -3797,6 +3868,15 @@ brcm_sysctl_attach(struct brcm_softc *sc)
 	    brcm_pmk_hex_sysctl, "A",
 	    "Raw 32-byte PMK as 64 hex chars (preferred for "
 	    "2011 BCM43236 firmware; compute via wpa_passphrase)");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "sae_probe",
+	    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    brcm_sae_probe_sysctl, "A",
+	    "Test whether firmware accepts WPA3-SAE wpa_auth (write 1)");
+	SYSCTL_ADD_BOOL(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "sae_join",
+	    CTLFLAG_RW, &sc->sc_sae_join, 0,
+	    "Switch the next join to WPA3-SAE (fw offload).  Set the "
+	    "SAE password via wpa_pmk (or wpa_pmk_hex for a raw key), "
+	    "then set sae_join=1 before running wpa_supplicant.");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "scan_now",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
 	    brcm_scan_sysctl, "I",

@@ -171,7 +171,7 @@ struct brcm_softc {
 	 * ic_scan_start under IEEE80211_LOCK, and the DCMD path (sx_xlock +
 	 * cv_wait) can't safely be called under that lock — the ISR that
 	 * would signal cv_dcmd may itself need locks that block behind
-	 * IEEE80211_LOCK, resulting in a hard wedge (observed
+	 * IEEE80211_LOCK, resulting in a hard wedge (2026-07-20 fbsdmac
 	 * scan-wedge, requires physical reboot).
 	 *
 	 * Defer the escan iovar send to taskqueue_thread.  fmop_scan_start
@@ -189,7 +189,7 @@ struct brcm_softc {
 	 * Fw's `_wlc_scan_request_ex` returns -EBUSY when
 	 * wlc->pub->up==0, so any scan issued before UP silently
 	 * vanishes and net80211 wedges waiting for ESCAN_RESULT.
-	 * (Confirmed via reverse-engineering of AirPortBrcmNIC
+	 * (Confirmed 2026-07-19 via Ghidra decomp of AirPortBrcmNIC
 	 * — see project_brcm_pci_scan_wedge_root_cause memory.)
 	 */
 	bool				 sc_wlc_up;
@@ -221,7 +221,7 @@ struct brcm_softc {
 	 * (terminator of the chip-driven auth+assoc+4-way sequence).
 	 * Refuses overlapping join attempts with EAGAIN -- back-to-back
 	 * joins overlap SET_DOWN with an in-flight 4-way handshake and
-	 * wedge the chip / panic the host (observed regression).
+	 * wedge the chip / panic the host (2026-06-26 PM regression).
 	 */
 	int				 sc_join_busy;
 	time_t				 sc_join_busy_ts;	/* when join_busy was set */
@@ -251,6 +251,14 @@ struct brcm_softc {
 	bool				 sc_wpa_set;
 	uint8_t				 sc_wpa_pmk_raw[32];
 	bool				 sc_wpa_pmk_raw_set;
+
+	/*
+	 * When true, brcm_join_wpa2_host_eapol switches wpa_auth to
+	 * WPA3_AUTH_SAE_PSK and lets the chip run SAE (fw offload).
+	 * Set via dev.<drv>.N.sae_join sysctl before the next assoc
+	 * attempt.  Cleared automatically after LINK-up.
+	 */
+	bool				 sc_sae_join;
 
 	/*
 	 * Per-instance scratch for the iovar_get / iovar_set sysctls.
