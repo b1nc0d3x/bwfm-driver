@@ -2,14 +2,10 @@
 # `sdio` newbus parent (sys/dev/mmc/sdio_func.c) and probes Broadcom
 # BCM43xxx WLAN function children.
 #
-# Headers needed:
-#  - brcmvar.h  : in ${SRCTOP}/sys/dev/brcm (this tree)
-#  - sdio_func.h, sdioreg.h : in ${KERN_TREE}/sys/dev/mmc (our active
-#                  FreeBSD source tree; default /usr/src).
-#  Override KERN_TREE on the command line if your fbsd checkout lives
-#  elsewhere.
-
-KERN_TREE?=	/usr/src
+# All SDIO headers (mmc_subr.h, sdio_func.h, sdioreg.h) ship in 15.1
+# base; no external KERN_TREE required.  If you're building against an
+# older 14.x host, `-I${KERN_TREE}/sys` can be re-added on the command
+# line for the transitional case.
 
 .PATH:	${SRCTOP}/sys/dev/brcm
 
@@ -23,6 +19,6 @@ SRCS=	if_brcm_sdio.c \
 	opt_wlan.h
 
 CFLAGS+=	-I${SRCTOP}/sys/dev/brcm \
-		-I${KERN_TREE}/sys
+		-I${SRCTOP}/sys
 
 .include <bsd.kmod.mk>
