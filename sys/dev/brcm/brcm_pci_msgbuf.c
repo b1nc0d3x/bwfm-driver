@@ -661,7 +661,7 @@ msgbuf_post_ioctlresp(struct brcm_pci_msgbuf *mb)
  * ----------------------------------------------------------------- */
 static int
 pktid_alloc(struct brcm_pci_msgbuf *mb, struct mbuf *m, uint16_t flowid,
-    uint32_t *idx_out)
+    bool is_eapol, uint32_t *idx_out)
 {
 	uint32_t i, start;
 
@@ -679,6 +679,9 @@ pktid_alloc(struct brcm_pci_msgbuf *mb, struct mbuf *m, uint16_t flowid,
 			mb->pktids[j].inuse = true;
 			mb->pktids[j].m = m;
 			mb->pktids[j].flowid = flowid;
+			mb->pktids[j].is_eapol = is_eapol;
+			if (is_eapol)
+				mb->pending_eapol++;
 			mb->pktid_next_hint = j + 1;
 			if (mb->pktid_next_hint >= BRCM_MSGBUF_MAX_PKTID)
 				mb->pktid_next_hint = 1;
@@ -696,6 +699,7 @@ pktid_release(struct brcm_pci_msgbuf *mb, uint32_t idx,
     bus_dmamap_t *map_out)
 {
 	struct mbuf *m;
+	bool was_eapol;
 
 	if (idx == 0 || idx >= BRCM_MSGBUF_MAX_PKTID)
 		return (NULL);
@@ -707,12 +711,20 @@ pktid_release(struct brcm_pci_msgbuf *mb, uint32_t idx,
 	m = mb->pktids[idx].m;
 	if (map_out != NULL)
 		*map_out = mb->pktids[idx].map;
+	was_eapol = mb->pktids[idx].is_eapol;
 	mb->pktids[idx].m = NULL;
 	mb->pktids[idx].map = NULL;
 	mb->pktids[idx].pa = 0;
 	mb->pktids[idx].datalen = 0;
 	mb->pktids[idx].flowid = 0;
+	mb->pktids[idx].is_eapol = false;
 	mb->pktids[idx].inuse = false;
+	if (was_eapol) {
+		if (mb->pending_eapol > 0)
+			mb->pending_eapol--;
+		if (mb->pending_eapol == 0)
+			cv_broadcast(&mb->pending_eapol_cv);
+	}
 	mtx_unlock(&mb->pktid_mtx);
 	return (m);
 }
@@ -1178,6 +1190,44 @@ brcm_pci_msgbuf_wait_mb_ack(struct brcm_pci_softc *sc, uint32_t expect,
 	return (ETIMEDOUT);
 }
 
+/*
+ * Block up to timeout_ms milliseconds until every outstanding EAPOL TX
+ * pktid has had a TX_STATUS.  Caller is brcm_fmop_set_key on the PTK
+ * install path: wpa_supplicant issues write(M4) then SIOCS80211(WPAKEY)
+ * back-to-back, and if the WPAKEY DCMD reaches fw before M4 drains the
+ * TID-7 flowring the fw sometimes AES-encrypts M4 with the newly
+ * installed PTK, the AP can't validate the MIC (its own PTK is only
+ * installed once it accepts M4), and it deauths reason=6 four seconds
+ * later.  Typical drain is well under a millisecond; the timeout is a
+ * pathological-fw safety net.
+ */
+int
+brcm_pci_msgbuf_wait_eapol_drain(struct brcm_pci_softc *sc, int timeout_ms)
+{
+	struct brcm_pci_msgbuf *mb = brcm_pci_msgbuf_state(sc);
+	sbintime_t deadline;
+	int error = 0;
+
+	if (mb == NULL || !mb->attached)
+		return (ENXIO);
+	deadline = sbinuptime() + SBT_1MS * timeout_ms;
+	mtx_lock(&mb->pktid_mtx);
+	while (mb->pending_eapol > 0) {
+		if (sbinuptime() >= deadline) {
+			error = ETIMEDOUT;
+			break;
+		}
+		error = cv_timedwait_sbt(&mb->pending_eapol_cv,
+		    &mb->pktid_mtx, deadline, 0, C_ABSOLUTE);
+		if (error == EWOULDBLOCK) {
+			error = ETIMEDOUT;
+			break;
+		}
+	}
+	mtx_unlock(&mb->pktid_mtx);
+	return (error);
+}
+
 uint16_t
 brcm_pci_msgbuf_flowring_lookup(struct brcm_pci_softc *sc,
     const uint8_t da[6], uint8_t prio)
@@ -1401,7 +1451,15 @@ brcm_pci_msgbuf_txmbuf(struct brcm_pci_softc *sc, uint16_t flowid,
 		return (error != 0 ? error : EIO);
 	}
 
-	error = pktid_alloc(mb, m, flowid, &pktid);
+	{
+		bool is_eapol = false;
+		if (m->m_pkthdr.len >= 14 && m->m_len >= 14) {
+			const uint8_t *_p = mtod(m, const uint8_t *);
+			uint16_t _et = ((uint16_t)_p[12] << 8) | _p[13];
+			is_eapol = (_et == 0x888e);
+		}
+		error = pktid_alloc(mb, m, flowid, is_eapol, &pktid);
+	}
 	if (error != 0) {
 		bus_dmamap_unload(mb->tx_mbuf_tag, map);
 		bus_dmamap_destroy(mb->tx_mbuf_tag, map);
@@ -2338,6 +2396,7 @@ brcm_pci_msgbuf_attach(struct brcm_pci_softc *sc)
 	mtx_init(&mb->flow_mtx, "brcm_pci_flow_mtx", NULL, MTX_DEF);
 	cv_init(&mb->flow_cv, "brcm_pci_flow_cv");
 	mtx_init(&mb->pktid_mtx, "brcm_pci_pktid_mtx", NULL, MTX_DEF);
+	cv_init(&mb->pending_eapol_cv, "brcm_pci_eapol_cv");
 	mtx_init(&mb->rxpost_mtx, "brcm_pci_rxpost_mtx", NULL, MTX_DEF);
 
 	error = msgbuf_read_shared_info(mb);
@@ -2636,6 +2695,7 @@ brcm_pci_msgbuf_detach(struct brcm_pci_softc *sc)
 
 		cv_destroy(&mb->flow_cv);
 		mtx_destroy(&mb->flow_mtx);
+		cv_destroy(&mb->pending_eapol_cv);
 		mtx_destroy(&mb->pktid_mtx);
 		mtx_destroy(&mb->rxpost_mtx);
 		cv_destroy(&mb->dcmd_cv);

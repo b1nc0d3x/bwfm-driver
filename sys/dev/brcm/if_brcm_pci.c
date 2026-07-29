@@ -6340,6 +6340,12 @@ brcm_pci_bs_flowring_purge(struct brcm_softc *bsc)
 	brcm_pci_msgbuf_flowring_delete_all(SC_TO_PCI(bsc));
 }
 
+static int
+brcm_pci_bs_wait_eapol_drain(struct brcm_softc *bsc, int timeout_ms)
+{
+	return (brcm_pci_msgbuf_wait_eapol_drain(SC_TO_PCI(bsc), timeout_ms));
+}
+
 static const struct brcm_bus_ops brcm_pci_bus_ops = {
 	.bs_txctl	= brcm_pci_bs_txctl,
 	.bs_rxctl	= brcm_pci_bs_rxctl,
@@ -6350,6 +6356,7 @@ static const struct brcm_bus_ops brcm_pci_bus_ops = {
 	.bs_iovar_get	= brcm_pci_bs_iovar_get,
 	.bs_iovar_set	= brcm_pci_bs_iovar_set,
 	.bs_flowring_purge = brcm_pci_bs_flowring_purge,
+	.bs_wait_eapol_drain = brcm_pci_bs_wait_eapol_drain,
 	/* bs_pump_rx = NULL — msgbuf ISR delivers async without polling. */
 };
 

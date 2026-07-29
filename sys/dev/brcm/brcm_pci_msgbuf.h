@@ -519,6 +519,7 @@ struct brcm_pci_pktid {
 	uint16_t	 datalen;
 	uint16_t	 flowid;	/* local id */
 	bool		 inuse;
+	bool		 is_eapol;	/* mirrored into pending_eapol counter */
 };
 
 /*
@@ -607,6 +608,18 @@ struct brcm_pci_msgbuf {
 	struct mtx		 pktid_mtx;
 	uint32_t		 pktid_next_hint;
 	bus_dma_tag_t		 tx_mbuf_tag;
+
+	/*
+	 * Outstanding EAPOL TX pktids.  Bumped when an ethertype-0x888e
+	 * frame gets a pktid; decremented on TX_STATUS.  Cv is broadcast
+	 * every time the count reaches zero so brcm_fmop_set_key can gate
+	 * the wsec_key PTK install until the fw has finished sending any
+	 * outstanding M2/M4 — otherwise a WPAKEY DCMD can beat M4 into
+	 * the fw, PTK gets installed first, and the AP silently drops the
+	 * encrypted M4 (reason=6 deauth ~4 s later).
+	 */
+	uint32_t		 pending_eapol;
+	struct cv		 pending_eapol_cv;
 
 	/*
 	 * RXPOST slots + counters.  Pktid space for rxposts is disjoint
@@ -778,6 +791,14 @@ int	brcm_pci_msgbuf_send_mb_data(struct brcm_pci_softc *,
 	    uint32_t htod_val);
 int	brcm_pci_msgbuf_wait_mb_ack(struct brcm_pci_softc *,
 	    uint32_t expect, int timeout_ms);
+
+/*
+ * Block up to timeout_ms until every outstanding EAPOL TX pktid has
+ * had a TX_STATUS.  Returns 0 on drain, ETIMEDOUT if the deadline
+ * passes first.  Used from brcm_fmop_set_key on PTK install.
+ */
+int	brcm_pci_msgbuf_wait_eapol_drain(struct brcm_pci_softc *,
+	    int timeout_ms);
 
 /*
  * Synchronously send FLOW_RING_DELETE for a given local flowid and

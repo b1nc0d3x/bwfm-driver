@@ -117,6 +117,17 @@ struct brcm_bus_ops {
 	 * this NULL.
 	 */
 	void	(*bs_flowring_purge)(struct brcm_softc *);
+
+	/*
+	 * Block up to timeout_ms until every outstanding EAPOL TX frame
+	 * has been acked by the fw.  Returns 0 on drain, ETIMEDOUT on
+	 * deadline.  Called from brcm_fmop_set_key on PTK install so the
+	 * WPAKEY DCMD does not overtake M4 in the fw's processing order
+	 * (see project_brcm_m2_m4_dropped_on_air_2026_07_29 memory).
+	 * Transports without ordering hazard between DCMD and data TX
+	 * leave this NULL.
+	 */
+	int	(*bs_wait_eapol_drain)(struct brcm_softc *, int timeout_ms);
 };
 
 /*

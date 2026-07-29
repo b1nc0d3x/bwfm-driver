@@ -2817,7 +2817,26 @@ brcm_fmop_set_key(struct ieee80211com *ic, const struct ieee80211_key *k)
 		 * PRIMARY_KEY flag marks the group tx key, not the
 		 * pairwise; setting it on a pairwise key install makes
 		 * the chip drop broadcast RX after 4-way completes.
+		 *
+		 * Before issuing WPAKEY, wait for any in-flight EAPOL TX
+		 * to drain.  wpa_supplicant fires write(M4) then
+		 * SIOCS80211(WPAKEY, PTK) back-to-back from userspace, and
+		 * the WPAKEY DCMD can beat M4 through the fw's H2D queue
+		 * (DCMD ring services independently of TX flowrings).  If
+		 * fw installs PTK before M4 hits the air, M4 goes out
+		 * encrypted, the AP silently drops it (its PTK isn't
+		 * installed until it accepts M4), and it deauths reason=6
+		 * about 4 s later.  Typical drain is well under a
+		 * millisecond; 100 ms cap is a fw-pathology safety net.
 		 */
+		if (sc->sc_bus_ops != NULL &&
+		    sc->sc_bus_ops->bs_wait_eapol_drain != NULL) {
+			int wrc = sc->sc_bus_ops->bs_wait_eapol_drain(sc, 100);
+			if (wrc != 0)
+				DPRINTF(sc, 0,
+				    "fmop_set_key: PTK wait for EAPOL "
+				    "drain returned %d (proceeding)\n", wrc);
+		}
 		ea = (vap != NULL && vap->iv_bss != NULL) ?
 		    vap->iv_bss->ni_bssid : bcast;
 		return (brcm_set_key(sc, 0, algo, flags,
