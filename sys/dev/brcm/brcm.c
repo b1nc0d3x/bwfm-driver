@@ -2186,17 +2186,15 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 	DPRINTF(sc, 0, "host-EAPOL: DOWN\n");
 
 	/*
-	 * Purge every host-side flowring after WLC_DOWN.  Fw drops its
-	 * own flowring tables on WLC_DOWN, so a stale-OPEN host-side ring
-	 * would send M2 into a dead peer.  We send FLOW_RING_DELETE
-	 * synchronously and wait for CMPLT — each slot goes CLOSED so the
-	 * next TX creates a fresh ring.  Non-fatal on failure.  Only PCIe
-	 * transports install this op; USB/SDIO leave it NULL.
+	 * bs_flowring_purge hook disabled — regresses DHCP on freshly-
+	 * restarted AP (STA associates + 4-way appears to complete but
+	 * subsequent DHCPDISCOVER never lands with an OFFER, and hostapd
+	 * disassocs).  Standalone delete via dev.brcm_pci.N.delete_flowring
+	 * still works; the machinery is correct, the wire-in ordering is
+	 * wrong.  Root cause TBD — likely M4/M2 racing PTK install on the
+	 * fresh TID-7 ring.  Leave the hook wired in the bus_ops so future
+	 * work can flip this on with a smarter trigger point.
 	 */
-	if (sc->sc_bus_ops->bs_flowring_purge != NULL) {
-		sc->sc_bus_ops->bs_flowring_purge(sc);
-		DPRINTF(sc, 0, "host-EAPOL: flowring purge done\n");
-	}
 
 	v = htole32(1);
 	HOSTEAP_RC("SET_INFRA",
