@@ -88,6 +88,7 @@ static int brcm_pci_sysctl_dcmd_probe(SYSCTL_HANDLER_ARGS);
 static int brcm_pci_sysctl_flow_create(SYSCTL_HANDLER_ARGS);
 static int brcm_pci_sysctl_tx_probe(SYSCTL_HANDLER_ARGS);
 static int brcm_pci_sysctl_wlc_up(SYSCTL_HANDLER_ARGS);
+static int brcm_pci_sysctl_delete_flowring(SYSCTL_HANDLER_ARGS);
 static int brcm_pci_sysctl_wlc_down(SYSCTL_HANDLER_ARGS);
 static int brcm_pci_sysctl_set_infra(SYSCTL_HANDLER_ARGS);
 static int brcm_pci_sysctl_set_wsec(SYSCTL_HANDLER_ARGS);
@@ -5635,6 +5636,12 @@ brcm_pci_attach_sysctls(struct brcm_pci_softc *sc)
 	    "Write 1 to read fw shared struct, allocate 5 common rings + "
 	    "scratch buffers via bus_dma, and publish DMA addresses to "
 	    "fw.  Requires armcr4_release to have fired first.");
+	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "delete_flowring",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    brcm_pci_sysctl_delete_flowring, "I",
+	    "Write local flowid (>=0) to send FLOW_RING_DELETE + wait "
+	    "up to 2 s for CMPLT.  Marks the slot CLOSED on success.  "
+	    "Used to verify the delete protocol standalone.");
 	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "wlc_up",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
 	    brcm_pci_sysctl_wlc_up, "I",
@@ -6327,6 +6334,12 @@ brcm_pci_bs_iovar_set(struct brcm_softc *bsc, const char *name,
 	return (brcm_pci_msgbuf_dcmd_set_var(sc, name, buf, len));
 }
 
+static void
+brcm_pci_bs_flowring_purge(struct brcm_softc *bsc)
+{
+	brcm_pci_msgbuf_flowring_delete_all(SC_TO_PCI(bsc));
+}
+
 static const struct brcm_bus_ops brcm_pci_bus_ops = {
 	.bs_txctl	= brcm_pci_bs_txctl,
 	.bs_rxctl	= brcm_pci_bs_rxctl,
@@ -6336,6 +6349,7 @@ static const struct brcm_bus_ops brcm_pci_bus_ops = {
 	.bs_dcmd_set	= brcm_pci_bs_dcmd_set,
 	.bs_iovar_get	= brcm_pci_bs_iovar_get,
 	.bs_iovar_set	= brcm_pci_bs_iovar_set,
+	.bs_flowring_purge = brcm_pci_bs_flowring_purge,
 	/* bs_pump_rx = NULL — msgbuf ISR delivers async without polling. */
 };
 
@@ -7309,6 +7323,28 @@ brcm_pci_sysctl_wlc_up(SYSCTL_HANDLER_ARGS)
 	    error == 0 ? "ok" : "fail", error);
 	if (error == 0)
 		sc->bus_sc.sc_wlc_up = true;
+	return (0);
+}
+
+/*
+ * Sysctl: write a local flowid to trigger a synchronous
+ * FLOW_RING_DELETE + CMPLT round-trip.  Used for standalone
+ * verification of the delete protocol before wiring it into the
+ * join sequence — safer to test end-to-end at will than to trigger
+ * during a live association.
+ */
+static int
+brcm_pci_sysctl_delete_flowring(SYSCTL_HANDLER_ARGS)
+{
+	struct brcm_pci_softc *sc = arg1;
+	int flowid = -1, error;
+
+	error = sysctl_handle_int(oidp, &flowid, 0, req);
+	if (error != 0 || req->newptr == NULL || flowid < 0)
+		return (error);
+	error = brcm_pci_msgbuf_flowring_delete(sc, (uint16_t)flowid);
+	device_printf(sc->sc_dev,
+	    "delete_flowring: local_id=%d rc=%d\n", flowid, error);
 	return (0);
 }
 

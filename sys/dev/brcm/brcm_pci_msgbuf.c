@@ -1498,6 +1498,135 @@ msgbuf_process_flowring_create_cmplt(struct brcm_pci_msgbuf *mb, void *item)
 	    fw_id, local_id, status);
 }
 
+/*
+ * FLOW_RING_DELETE_CMPLT: fw acknowledges a FLOW_RING_DELETE.  Marks
+ * the local slot CLOSED so it can be reallocated on a subsequent
+ * create.  Called from msgbuf_process_ctrl_msg.
+ */
+static void
+msgbuf_process_flowring_delete_cmplt(struct brcm_pci_msgbuf *mb, void *item)
+{
+	struct msgbuf_flowring_delete_resp *resp = item;
+	uint16_t fw_id, local_id;
+	int16_t status;
+
+	fw_id = le16toh(resp->compl_hdr.flow_ring_id);
+	status = (int16_t)le16toh(resp->compl_hdr.status);
+	if (fw_id < BRCM_H2D_MSGRING_FLOWRING_IDSTART) {
+		device_printf(DEV(mb),
+		    "msgbuf: FLOW_DELETE_CMPLT weird fw_id=%u status=%d\n",
+		    fw_id, status);
+		return;
+	}
+	local_id = fw_id - BRCM_H2D_MSGRING_FLOWRING_IDSTART;
+	if (local_id >= mb->max_flowrings) {
+		device_printf(DEV(mb),
+		    "msgbuf: FLOW_DELETE_CMPLT local_id=%u out of range\n",
+		    local_id);
+		return;
+	}
+	mtx_lock(&mb->flow_mtx);
+	mb->flowrings[local_id].status = BRCM_FLOW_CLOSED;
+	memset(mb->flowrings[local_id].da, 0, 6);
+	memset(mb->flowrings[local_id].sa, 0, 6);
+	cv_broadcast(&mb->flow_cv);
+	mtx_unlock(&mb->flow_mtx);
+	MDPRINTF(mb, 0,
+	    "msgbuf: FLOW_DELETE_CMPLT fw_id=%u local=%u status=%d\n",
+	    fw_id, local_id, status);
+}
+
+/*
+ * Public API: synchronously delete a flowring.  Sends
+ * FLOW_RING_DELETE on H2D_CTRL_SUBMIT and waits up to 2 s for the
+ * fw's CMPLT (which marks the slot CLOSED so it can be reallocated).
+ * Callers must hold no locks that the msgbuf ISR path needs.
+ */
+int
+brcm_pci_msgbuf_flowring_delete(struct brcm_pci_softc *sc, uint16_t local_id)
+{
+	struct brcm_pci_msgbuf *mb = brcm_pci_msgbuf_state(sc);
+	struct brcm_pci_ring *ctl_ring;
+	struct msgbuf_tx_flowring_delete_req *req;
+	struct brcm_pci_flowring *fr;
+	uint16_t fw_id;
+	int error;
+
+	if (mb == NULL || !mb->attached || mb->flowrings == NULL)
+		return (ENXIO);
+	if (local_id >= mb->max_flowrings)
+		return (EINVAL);
+	fr = &mb->flowrings[local_id];
+
+	mtx_lock(&mb->flow_mtx);
+	if (fr->status != BRCM_FLOW_OPEN) {
+		mtx_unlock(&mb->flow_mtx);
+		return (0);	/* nothing to delete */
+	}
+	mtx_unlock(&mb->flow_mtx);
+
+	fw_id = local_id + BRCM_H2D_MSGRING_FLOWRING_IDSTART;
+	ctl_ring = &mb->rings[BRCM_H2D_MSGRING_CONTROL_SUBMIT];
+	mtx_lock(&ctl_ring->lock);
+	req = ring_reserve_for_write(ctl_ring);
+	if (req == NULL) {
+		mtx_unlock(&ctl_ring->lock);
+		return (ENOSPC);
+	}
+	memset(req, 0, sizeof(*req));
+	req->msg.msgtype = BRCM_MSGBUF_TYPE_FLOW_RING_DELETE;
+	req->msg.ifidx = fr->ifidx;
+	req->msg.request_id = 0;
+	req->flow_ring_id = htole16(fw_id);
+	req->reason = 0;
+	ring_write_complete(ctl_ring);
+	mtx_unlock(&ctl_ring->lock);
+
+	MDPRINTF(mb, 0, "msgbuf: FLOW_DELETE flow=%u sent\n", fw_id);
+
+	mtx_lock(&mb->flow_mtx);
+	while (fr->status == BRCM_FLOW_OPEN) {
+		error = cv_timedwait_sig(&mb->flow_cv, &mb->flow_mtx,
+		    hz * 2);
+		if (error == EWOULDBLOCK) {
+			mtx_unlock(&mb->flow_mtx);
+			device_printf(DEV(mb),
+			    "msgbuf: FLOW_DELETE flow=%u timeout\n", fw_id);
+			return (ETIMEDOUT);
+		}
+		if (error != 0) {
+			mtx_unlock(&mb->flow_mtx);
+			return (error);
+		}
+	}
+	mtx_unlock(&mb->flow_mtx);
+	return (0);
+}
+
+void
+brcm_pci_msgbuf_flowring_delete_all(struct brcm_pci_softc *sc)
+{
+	struct brcm_pci_msgbuf *mb = brcm_pci_msgbuf_state(sc);
+	uint16_t i;
+	int rc, ok = 0, fail = 0;
+
+	if (mb == NULL || !mb->attached || mb->flowrings == NULL)
+		return;
+	for (i = 0; i < mb->max_flowrings; i++) {
+		if (mb->flowrings[i].status != BRCM_FLOW_OPEN)
+			continue;
+		rc = brcm_pci_msgbuf_flowring_delete(sc, i);
+		if (rc == 0)
+			ok++;
+		else
+			fail++;
+	}
+	if (ok != 0 || fail != 0)
+		MDPRINTF(mb, 0,
+		    "msgbuf: flowring_delete_all: %d deleted, %d failed\n",
+		    ok, fail);
+}
+
 static void
 msgbuf_process_txstatus(struct brcm_pci_msgbuf *mb, void *item)
 {
@@ -2099,6 +2228,9 @@ msgbuf_process_ctrl_msg(struct brcm_pci_msgbuf *mb, void *item)
 		break;
 	case BRCM_MSGBUF_TYPE_FLOW_RING_CREATE_CMPLT:
 		msgbuf_process_flowring_create_cmplt(mb, item);
+		break;
+	case BRCM_MSGBUF_TYPE_FLOW_RING_DELETE_CMPLT:
+		msgbuf_process_flowring_delete_cmplt(mb, item);
 		break;
 	case BRCM_MSGBUF_TYPE_TX_STATUS:
 		msgbuf_process_txstatus(mb, item);

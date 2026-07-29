@@ -170,6 +170,8 @@ struct brcm_pci_event {
 #define	BRCM_MSGBUF_TYPE_RING_STATUS		0x2
 #define	BRCM_MSGBUF_TYPE_FLOW_RING_CREATE	0x3
 #define	BRCM_MSGBUF_TYPE_FLOW_RING_CREATE_CMPLT	0x4
+#define	BRCM_MSGBUF_TYPE_FLOW_RING_DELETE	0x5
+#define	BRCM_MSGBUF_TYPE_FLOW_RING_DELETE_CMPLT	0x6
 #define	BRCM_MSGBUF_TYPE_IOCTLPTR_REQ		0x9
 #define	BRCM_MSGBUF_TYPE_IOCTLPTR_REQ_ACK	0xA
 #define	BRCM_MSGBUF_TYPE_IOCTLRESP_BUF_POST	0xB
@@ -269,6 +271,24 @@ struct msgbuf_tx_flowring_create_req {
 
 /* Fw's ack of a create request (48 bytes on H2D ctrl completion ring). */
 struct msgbuf_flowring_create_resp {
+	struct msgbuf_common_hdr	msg;
+	struct msgbuf_completion_hdr	compl_hdr;
+	uint32_t			rsvd0[3];
+} __packed;
+
+/*
+ * FLOW_RING_DELETE request — sent on H2D_CTRL_SUBMIT.  Symmetric to
+ * FLOW_RING_CREATE but only carries flow_ring_id + reason.
+ */
+struct msgbuf_tx_flowring_delete_req {
+	struct msgbuf_common_hdr	msg;
+	uint16_t			flow_ring_id;
+	uint16_t			reason;
+	uint32_t			rsvd0[7];
+} __packed;
+
+/* Fw's ack of a delete request (D2H ctrl completion ring). */
+struct msgbuf_flowring_delete_resp {
 	struct msgbuf_common_hdr	msg;
 	struct msgbuf_completion_hdr	compl_hdr;
 	uint32_t			rsvd0[3];
@@ -758,6 +778,23 @@ int	brcm_pci_msgbuf_send_mb_data(struct brcm_pci_softc *,
 	    uint32_t htod_val);
 int	brcm_pci_msgbuf_wait_mb_ack(struct brcm_pci_softc *,
 	    uint32_t expect, int timeout_ms);
+
+/*
+ * Synchronously send FLOW_RING_DELETE for a given local flowid and
+ * wait up to 2 s for the CMPLT.  On success the slot is marked
+ * CLOSED so it can be reallocated on a subsequent create.  Returns
+ * ETIMEDOUT if fw doesn't ack, ENXIO if msgbuf is down.
+ */
+int	brcm_pci_msgbuf_flowring_delete(struct brcm_pci_softc *,
+	    uint16_t local_id);
+
+/*
+ * Iterate every host-side flowring in status BRCM_FLOW_OPEN and
+ * synchronously delete each one (see brcm_pci_msgbuf_flowring_delete).
+ * Slots are marked CLOSED on success; failures are logged and skipped
+ * so partial success is possible.
+ */
+void	brcm_pci_msgbuf_flowring_delete_all(struct brcm_pci_softc *);
 uint32_t	brcm_pci_msgbuf_rambase(struct brcm_pci_softc *);
 uint32_t	brcm_pci_msgbuf_ramsize(struct brcm_pci_softc *);
 struct brcm_pci_msgbuf	*brcm_pci_msgbuf_state(struct brcm_pci_softc *);

@@ -104,6 +104,19 @@ struct brcm_bus_ops {
 	 */
 	void	(*bs_pump_rx)(struct brcm_softc *, int max_ms,
 		    volatile int *until_clear);
+
+	/*
+	 * Synchronously tear down every host-side TX flowring the
+	 * transport is currently tracking.  For PCIe MSGBUF this fires
+	 * FLOW_RING_DELETE on each OPEN flowring and waits for the
+	 * fw CMPLT (marks the slot CLOSED so a subsequent TX allocates
+	 * a fresh ring).  Called from brcm_join_wpa2_host_eapol right
+	 * after WLC_DOWN so any prior-generation flowring is retired
+	 * before the fw rebuilds its ring tables during the new join.
+	 * Transports without a flowring model (USB/SDIO/BCDC) leave
+	 * this NULL.
+	 */
+	void	(*bs_flowring_purge)(struct brcm_softc *);
 };
 
 /*

@@ -2185,6 +2185,19 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 	(void)brcm_dcmd_set(sc, BRCM_C_DOWN, &v, sizeof(v));
 	DPRINTF(sc, 0, "host-EAPOL: DOWN\n");
 
+	/*
+	 * Purge every host-side flowring after WLC_DOWN.  Fw drops its
+	 * own flowring tables on WLC_DOWN, so a stale-OPEN host-side ring
+	 * would send M2 into a dead peer.  We send FLOW_RING_DELETE
+	 * synchronously and wait for CMPLT — each slot goes CLOSED so the
+	 * next TX creates a fresh ring.  Non-fatal on failure.  Only PCIe
+	 * transports install this op; USB/SDIO leave it NULL.
+	 */
+	if (sc->sc_bus_ops->bs_flowring_purge != NULL) {
+		sc->sc_bus_ops->bs_flowring_purge(sc);
+		DPRINTF(sc, 0, "host-EAPOL: flowring purge done\n");
+	}
+
 	v = htole32(1);
 	HOSTEAP_RC("SET_INFRA",
 	    brcm_dcmd_set(sc, BRCM_C_SET_INFRA, &v, sizeof(v)));
