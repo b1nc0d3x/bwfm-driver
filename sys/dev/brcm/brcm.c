@@ -1749,7 +1749,6 @@ brcm_parent_task(void *arg, int pending __unused)
 	int error;
 	bool want_up;
 
-	/* UP only — DOWN belongs in detach, not ic_parent. */
 	want_up = sc->sc_parent_want_up;
 	if (want_up && !sc->sc_wlc_up) {
 		v = htole32(1);
@@ -1757,6 +1756,34 @@ brcm_parent_task(void *arg, int pending __unused)
 		DPRINTF(sc, 0, "brcm_parent_task: BRCM_C_UP rc=%d\n", error);
 		if (error == 0)
 			sc->sc_wlc_up = true;
+	}
+	/*
+	 * `ifconfig wlan0 down` walks every vap to INIT.  Fire an explicit
+	 * WLC_DISASSOC so fw leaves the AP cleanly and drops its own
+	 * flowring tables — otherwise fw retains its assoc state, the next
+	 * `ifconfig up` + wpa_supplicant restart lands on a chip that
+	 * thinks it's still joined, and the hostapd 4-way times out in
+	 * ~4 s.  Skip when link is already down (chip-initiated disassoc
+	 * already tore things down) and when we're in the join blackout
+	 * (post-key-install, wpa_supplicant may bounce the vap through
+	 * INIT briefly).
+	 */
+	if (!want_up && sc->sc_link_up) {
+		struct brcm_scb_val_le sv;
+		time_t now = time_uptime;
+
+		if (sc->sc_last_key_ts != 0 &&
+		    now - sc->sc_last_key_ts < 5) {
+			DPRINTF(sc, 0, "brcm_parent_task: DOWN "
+			    "post-key blackout — skipping WLC_DISASSOC\n");
+			return;
+		}
+		memset(&sv, 0, sizeof(sv));
+		sv.val = htole32(3);	/* reason: unspecified */
+		error = brcm_dcmd_set(sc, BRCM_C_DISASSOC, &sv, sizeof(sv));
+		DPRINTF(sc, 0,
+		    "brcm_parent_task: WLC_DISASSOC rc=%d (vap→INIT)\n",
+		    error);
 	}
 }
 

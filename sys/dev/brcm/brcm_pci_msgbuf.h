@@ -95,6 +95,18 @@ struct brcm_pci_event {
 #define	BRCM_PCIE_SHARED_DMA_2B_IDX		0x00100000
 #define	BRCM_PCIE_SHARED_HOSTRDY_DB1		0x10000000
 
+/*
+ * D3 / D0 mailbox values written to htod_mb_data_addr in TCM and read
+ * from dtoh_mb_data_addr for fw ack.  Fires the SBMBX config-space
+ * doorbell (offset 0x98 in PCI config space) to notify fw.  Reference:
+ * brcmfmac pcie.c BRCMF_H2D_HOST_D3_INFORM / BRCMF_D2H_DEV_D3_ACK.
+ */
+#define	BRCM_H2D_HOST_D3_INFORM			0x00000001
+#define	BRCM_D2H_DEV_D3_ACK			0x00000001
+#define	BRCM_H2D_HOST_D0_INFORM_IN_USE		0x00000008
+#define	BRCM_H2D_HOST_D0_INFORM			0x00000010
+#define	BRCM_PCI_REG_SBMBX			0x98
+
 /* Ring-info struct offsets within the ringinfo TCM block. */
 #define	BRCM_RINGINFO_RINGMEM_OFFSET		0	/* u32 */
 #define	BRCM_RINGINFO_H2D_W_IDX_PTR_OFFSET	4	/* u32 */
@@ -734,6 +746,18 @@ bus_space_tag_t	brcm_pci_msgbuf_bar2_tag(struct brcm_pci_softc *);
 bus_space_handle_t brcm_pci_msgbuf_bar2_handle(struct brcm_pci_softc *);
 device_t	brcm_pci_msgbuf_dev(struct brcm_pci_softc *);
 int		brcm_pci_msgbuf_debug(struct brcm_pci_softc *);
+
+/*
+ * D3 / D0 mailbox helpers.  send_mb_data writes htod_val into the TCM
+ * htod slot and rings the SBMBX config-space doorbell; returns 0 if
+ * the fw's mailbox was clear (or cleared within 1 s).  wait_mb_ack
+ * polls the dtoh slot for `expect` for up to `timeout_ms` ms and
+ * returns 0 on match, ETIMEDOUT otherwise.
+ */
+int	brcm_pci_msgbuf_send_mb_data(struct brcm_pci_softc *,
+	    uint32_t htod_val);
+int	brcm_pci_msgbuf_wait_mb_ack(struct brcm_pci_softc *,
+	    uint32_t expect, int timeout_ms);
 uint32_t	brcm_pci_msgbuf_rambase(struct brcm_pci_softc *);
 uint32_t	brcm_pci_msgbuf_ramsize(struct brcm_pci_softc *);
 struct brcm_pci_msgbuf	*brcm_pci_msgbuf_state(struct brcm_pci_softc *);

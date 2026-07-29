@@ -191,7 +191,7 @@ struct brcm_pci_chip_info {
 
 static const struct brcm_pci_chip_info brcm_pci_chip_table[] = {
 	/*
-	 * BCM43602 (found on some Apple hardware).
+	 * BCM43602 - Apple A1398, MacBookPro 11,3 / 11,4 / 11,5 / 12,1.
 	 * The fully-tested target.
 	 */
 	{ .devid		= BRCM_PCI_DEVICE_BCM43602,
@@ -206,7 +206,7 @@ static const struct brcm_pci_chip_info brcm_pci_chip_table[] = {
 	 * BCM4360 (14e4:43a0) - Apple 3x3 802.11ac.  Ships on RockPro64
 	 * (armbsd) as a PCIe M.2 card with Apple subvendor 106b:0117.
 	 * Probe / core_walk / dstate_cycle work; bringup NOT implemented
-	 * (observed running 43602-specific PMU init).
+	 * (2026-07-19 wedged armbsd running 43602-specific PMU init).
 	 *
 	 * When implementing bringup:
 	 *   - Rambase: 0x0 (chip 4360 loads fw at rambase 0 —
@@ -501,7 +501,7 @@ struct brcm_pci_softc {
 /* ------------------------------------------------------------------
  * Apple platform unlock.
  *
- * On A1398-class tested Mac hardwares the BCM43602's PCIe link is held in
+ * On A1398-class MacBook Pros the BCM43602's PCIe link is held in
  * a clock-gated / disabled state at boot.  Even with bring-up to
  * D0 via PMCSR, BAR0 cycles return 0xffffffff because the chip's
  * PCIe controller isn't responding.  The DSDT exposes an `APPU`
@@ -779,7 +779,7 @@ brcm_pci_apple_ec_cycle(struct brcm_pci_softc *sc)
  * Reimplementation of the DSDT APPU method as native C.
  *
  * Decoded from the host DSDT via `iasl -da -e ssdt*.dat dsdt.dat`.
- * The macOS warm-up path on this the tested Mac hardware is:
+ * The macOS warm-up path on this <Mac model> is:
  *   RP03._PS0 -> ALPR(0) -> APPU()
  * APPU's inner loop:
  *   1. Write \_SB.PCI0.LPCB.EC.APWC = 0x01 (Apple EC APWC bit) -- our
@@ -1322,7 +1322,7 @@ eot:
 #define	BRCM_PCI_FW_VERSTRING_MAX	256
 
 /*
- * Minimal synthetic NVRAM for BCM43602.
+ * Minimal synthetic NVRAM for BCM43602 on Apple A1398 (<Mac model>).
  *
  * Apple's AirPortBrcmNIC kext carries per-board NVRAM tables keyed by
  * model — extracting our model's exact bytes is a few hours of Mach-O
@@ -2883,7 +2883,7 @@ brcm_pci_pmu_init_43602(struct brcm_pci_softc *sc)
 }
 
 /*
- * BCM4360 si_pmu_res_init port — reverse-engineering of Apple's older
+ * BCM4360 si_pmu_res_init port — Ghidra decomp of Apple's older
  * AirPortBrcm4360.kext shows:
  *
  *   _bcm4360_res_updown   (rev < 4) @ VA 0x3dc218, 1 entry (8 B)
@@ -2993,7 +2993,7 @@ brcm_pci_pmu_init_4360(struct brcm_pci_softc *sc)
 
 /*
  * PLL calibration writes captured from macOS AirPortBrcmNIC boot log
- * on the tested Mac hardware BCM43602:
+ * on <Mac model> BCM43602:
  *   ChangeVCO => vco:960, xtalF:40, frac: 98, ndivMode: 3, ndivint: 24
  *   PLL_CNTRL_ADDR2 = 0x00000c31
  *   PLL_CNTRL_ADDR3 (Fractional) = 0x0000100e
@@ -4171,7 +4171,7 @@ brcm_pci_bringup_sequence(struct brcm_pci_softc *sc)
 	} else if (sc->sc_devid == BRCM_PCI_DEVICE_BCM4360 ||
 	    sc->sc_devid == BRCM_PCI_DEVICE_BCM4360_2) {
 		/*
-		 * BCM4360 has its own PMU init (reverse-engineering of Apple's
+		 * BCM4360 has its own PMU init (Ghidra decomp of Apple's
 		 * older AirPortBrcm4360.kext).  Much smaller than 43602 —
 		 * just 1 res_updown entry + 2 pciewar dep_mask writes.
 		 */
@@ -6549,7 +6549,7 @@ brcm_pci_attach(device_t dev)
 			if (rc != 0) {
 				device_printf(dev,
 				    "attach: APPU warm failed rc=%d - chip "
-				    "likely unusable earlier work; sysctls "
+				    "likely unusable this session; sysctls "
 				    "still available for manual recovery.\n",
 				    rc);
 				goto attach_done;
@@ -7622,10 +7622,118 @@ brcm_pci_sysctl_disassoc(SYSCTL_HANDLER_ARGS)
 	return (0);
 }
 
+/*
+ * ACPI S3 / D3 suspend/resume.  Refused by default: on this fw the
+ * chip powers off in S3 and comes back cold — reviving it requires
+ * the full attach path (chip reset + fw upload + msgbuf attach) which
+ * is not yet wired into the resume hook.  Returning EOPNOTSUPP cancels
+ * the system suspend cleanly (user's laptop stays awake) instead of
+ * letting the kernel proceed and wedging on resume.
+ *
+ * Opt in by setting `hw.brcm_pci.pm_supported=1` in loader.conf — the
+ * best-effort path brings WLC down at suspend and tries a warm resume
+ * (chip retained state).  Cold resume is not supported and the driver
+ * must be kldunload+kldload to recover.  Full D3-mailbox handshake
+ * per Linux brcmfmac (BRCMF_H2D_HOST_D3_INFORM / D2H_DEV_D3_ACK) is
+ * follow-up work.
+ */
+static int brcm_pci_pm_supported = 0;
+SYSCTL_INT(_hw_brcm_pci, OID_AUTO, pm_supported, CTLFLAG_RDTUN,
+    &brcm_pci_pm_supported, 0,
+    "Allow S3/D3 suspend/resume attempts.  Default 0 = refuse suspend "
+    "(safe).  Set to 1 in loader.conf for best-effort warm-resume; "
+    "cold resume still requires kldunload+kldload.");
+
+static int
+brcm_pci_suspend(device_t dev)
+{
+	struct brcm_pci_softc *sc = device_get_softc(dev);
+	struct brcm_softc *bsc = &sc->bus_sc;
+	struct ieee80211vap *vap;
+	uint32_t v;
+
+	if (!brcm_pci_pm_supported) {
+		device_printf(dev,
+		    "suspend refused (hw.brcm_pci.pm_supported=0); "
+		    "set to 1 in loader.conf to opt into best-effort PM\n");
+		return (EOPNOTSUPP);
+	}
+
+	/*
+	 * Best-effort suspend: bring each vap back to INIT so net80211
+	 * flushes state cleanly, then send WLC_DOWN so the fw stops
+	 * autonomous DMA before the bus takes the chip's power away.
+	 */
+	if (bsc->sc_ic_attached) {
+		vap = TAILQ_FIRST(&bsc->sc_ic.ic_vaps);
+		if (vap != NULL)
+			(void)ieee80211_new_state(vap, IEEE80211_S_INIT, -1);
+	}
+	if (bsc->sc_wlc_up) {
+		v = htole32(0);
+		(void)brcm_dcmd_set(bsc, BRCM_C_DOWN, &v, sizeof(v));
+		bsc->sc_wlc_up = false;
+	}
+
+	/*
+	 * D3 mailbox handshake: send H2D_HOST_D3_INFORM and wait up to
+	 * 2 s for the fw to reply with D2H_DEV_D3_ACK.  Ack means fw has
+	 * quiesced its DMA and is ready for the bus to remove power;
+	 * silence past the timeout is not fatal — we still let ACPI
+	 * transition and cross fingers on resume.
+	 */
+	{
+		int rc = brcm_pci_msgbuf_send_mb_data(sc,
+		    BRCM_H2D_HOST_D3_INFORM);
+		if (rc == 0) {
+			rc = brcm_pci_msgbuf_wait_mb_ack(sc,
+			    BRCM_D2H_DEV_D3_ACK, 2000);
+			device_printf(dev,
+			    "suspend: D3_INFORM sent, D3_ACK rc=%d\n", rc);
+		} else {
+			device_printf(dev,
+			    "suspend: D3_INFORM send rc=%d — proceeding "
+			    "without ack\n", rc);
+		}
+	}
+	device_printf(dev, "suspend: WLC_DOWN + D3, awaiting resume\n");
+	return (0);
+}
+
+static int
+brcm_pci_resume(device_t dev)
+{
+	struct brcm_pci_softc *sc = device_get_softc(dev);
+	struct brcm_softc *bsc = &sc->bus_sc;
+	uint32_t v;
+
+	if (!brcm_pci_pm_supported)
+		return (0);
+
+	/*
+	 * Warm-resume: if the chip's ChipID still reads sanely the fw is
+	 * probably still alive and we can just re-issue WLC_UP.  A cold-
+	 * resumed chip (S3 power off) will fail the DCMD; leave it dead
+	 * and note that a kldunload+kldload is required to recover.
+	 */
+	v = htole32(1);
+	if (brcm_dcmd_set(bsc, BRCM_C_UP, &v, sizeof(v)) == 0) {
+		bsc->sc_wlc_up = true;
+		device_printf(dev, "resume: warm resume ok (chip retained)\n");
+		return (0);
+	}
+	device_printf(dev,
+	    "resume: chip cold — full re-init not implemented, "
+	    "kldunload+kldload to recover\n");
+	return (0);
+}
+
 static device_method_t brcm_pci_methods[] = {
 	DEVMETHOD(device_probe,		brcm_pci_probe),
 	DEVMETHOD(device_attach,	brcm_pci_attach),
 	DEVMETHOD(device_detach,	brcm_pci_detach),
+	DEVMETHOD(device_suspend,	brcm_pci_suspend),
+	DEVMETHOD(device_resume,	brcm_pci_resume),
 	DEVMETHOD_END
 };
 

@@ -1125,6 +1125,59 @@ find_free_local_flowid(struct brcm_pci_msgbuf *mb, uint16_t *out)
 	return (ENOSPC);
 }
 
+/*
+ * D3 / D0 mailbox helpers.  See brcm_pci_msgbuf.h banner.
+ */
+int
+brcm_pci_msgbuf_send_mb_data(struct brcm_pci_softc *sc, uint32_t htod_val)
+{
+	struct brcm_pci_msgbuf *mb = brcm_pci_msgbuf_state(sc);
+	device_t dev = brcm_pci_msgbuf_dev(sc);
+	uint32_t cur;
+	int i;
+
+	if (mb == NULL || !mb->attached || mb->htod_mb_data_addr == 0)
+		return (ENXIO);
+	cur = tcm_read32(mb, mb->htod_mb_data_addr);
+	for (i = 0; cur != 0 && i < 100; i++) {
+		DELAY(10000);
+		cur = tcm_read32(mb, mb->htod_mb_data_addr);
+	}
+	if (cur != 0) {
+		device_printf(dev,
+		    "mb_send: htod slot still 0x%x after 1 s\n", cur);
+		return (EBUSY);
+	}
+	tcm_write32(mb, mb->htod_mb_data_addr, htod_val);
+	pci_write_config(dev, BRCM_PCI_REG_SBMBX, 1, 4);
+	/* Hardware workaround: PCIe2 core rev <= 13 needs the doorbell
+	 * fired twice.  Always safe to double-tap. */
+	pci_write_config(dev, BRCM_PCI_REG_SBMBX, 1, 4);
+	return (0);
+}
+
+int
+brcm_pci_msgbuf_wait_mb_ack(struct brcm_pci_softc *sc, uint32_t expect,
+    int timeout_ms)
+{
+	struct brcm_pci_msgbuf *mb = brcm_pci_msgbuf_state(sc);
+	uint32_t val;
+	int elapsed;
+
+	if (mb == NULL || !mb->attached || mb->dtoh_mb_data_addr == 0)
+		return (ENXIO);
+	for (elapsed = 0; elapsed < timeout_ms; elapsed += 10) {
+		val = tcm_read32(mb, mb->dtoh_mb_data_addr);
+		if ((val & expect) == expect) {
+			/* clear so subsequent transactions see a fresh slot */
+			tcm_write32(mb, mb->dtoh_mb_data_addr, 0);
+			return (0);
+		}
+		DELAY(10000);
+	}
+	return (ETIMEDOUT);
+}
+
 uint16_t
 brcm_pci_msgbuf_flowring_lookup(struct brcm_pci_softc *sc,
     const uint8_t da[6], uint8_t prio)
