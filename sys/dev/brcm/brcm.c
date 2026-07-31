@@ -1833,7 +1833,19 @@ brcm_raw_xmit(struct ieee80211_node *ni, struct mbuf *m,
 static int
 brcm_dispatch_scan(struct brcm_softc *sc)
 {
-	struct brcm_escan_params_v0 params;
+	/*
+	 * Trailing SSID slot mirroring Linux brcmf_escan_prep's
+	 * variable-length ssid_le[] packed after channel_list[].  With
+	 * channel_num carrying `n_ssids << 16 | n_channels`, the fw
+	 * reads the packed SSID array right after the fixed struct
+	 * (n_channels=0 here means channel_list is empty, so ssid_le
+	 * starts at offsetof(scan_params, channel_list)).
+	 */
+	struct {
+		struct brcm_escan_params_v0	hdr;
+		struct brcm_ssid		ssid_le;
+	} __packed params;
+	size_t params_len;
 	int err;
 
 	/*
@@ -1853,9 +1865,9 @@ brcm_dispatch_scan(struct brcm_softc *sc)
 	sc->sc_scan_busy = 1;
 
 	memset(&params, 0, sizeof(params));
-	memset(params.scan_params.bssid, 0xff,
-	    sizeof(params.scan_params.bssid));
-	params.scan_params.bss_type = BRCM_DOT11_BSSTYPE_ANY;
+	memset(params.hdr.scan_params.bssid, 0xff,
+	    sizeof(params.hdr.scan_params.bssid));
+	params.hdr.scan_params.bss_type = BRCM_DOT11_BSSTYPE_ANY;
 	/*
 	 * Use SCANTYPE_ACTIVE for broadcast escan.  PASSIVE requires
 	 * fw-side channel dwelling setup we don't do -- on BCM43602
@@ -1863,18 +1875,39 @@ brcm_dispatch_scan(struct brcm_softc *sc)
 	 * no preflight wedges the host (fw hangs, subsequent MMIO
 	 * faults).
 	 */
-	params.scan_params.scan_type = BRCM_SCANTYPE_ACTIVE;
-	params.scan_params.nprobes = htole32((uint32_t)-1);
-	params.scan_params.active_time = htole32((uint32_t)-1);
-	params.scan_params.passive_time = htole32((uint32_t)-1);
-	params.scan_params.home_time = htole32((uint32_t)-1);
-	params.scan_params.channel_num = 0;	/* all channels */
+	params.hdr.scan_params.scan_type = BRCM_SCANTYPE_ACTIVE;
+	params.hdr.scan_params.nprobes = htole32((uint32_t)-1);
+	params.hdr.scan_params.active_time = htole32((uint32_t)-1);
+	params.hdr.scan_params.passive_time = htole32((uint32_t)-1);
+	params.hdr.scan_params.home_time = htole32((uint32_t)-1);
 
-	params.version = htole32(BRCM_ESCAN_REQ_VERSION);
-	params.action = htole16(BRCM_WL_ESCAN_ACTION_START);
-	params.sync_id = htole16(0x1234);
+	params.hdr.version = htole32(BRCM_ESCAN_REQ_VERSION);
+	params.hdr.action = htole16(BRCM_WL_ESCAN_ACTION_START);
+	params.hdr.sync_id = htole16(0x1234);
 
-	err = brcm_iovar_set(sc, "escan", &params, sizeof(params));
+	/*
+	 * If fmop_scan_start captured a target SSID, pack it as one
+	 * directed-probe entry in the trailing ssid_le slot and set
+	 * n_ssids=1 in channel_num.  Fw then sends probe requests with
+	 * that SSID on each channel and reports fresh PROBE_RESP IE
+	 * bytes back through ESCAN_RESULT, defeating any staleness in
+	 * the fw's own beacon cache.  With no target SSID, send only
+	 * the fixed struct — sizeof(hdr) — and the fw does the classic
+	 * broadcast escan with n_channels=0 (all channels).
+	 */
+	if (sc->sc_scan_ssid_len > 0) {
+		params.hdr.scan_params.channel_num =
+		    htole32((1u << 16) | 0);
+		params.ssid_le.len = htole32((uint32_t)sc->sc_scan_ssid_len);
+		memcpy(params.ssid_le.ssid, sc->sc_scan_ssid,
+		    sc->sc_scan_ssid_len);
+		params_len = sizeof(params);
+	} else {
+		params.hdr.scan_params.channel_num = 0;
+		params_len = sizeof(params.hdr);
+	}
+
+	err = brcm_iovar_set(sc, "escan", &params, params_len);
 	if (err != 0) {
 		sc->sc_scan_busy = 0;	/* fw rejected; nothing to wait for */
 		return (err);
@@ -2085,8 +2118,7 @@ brcm_scan_task(void *arg, int pending __unused)
  */
 static int
 brcm_fmop_scan_start(struct ieee80211com *ic,
-    const uint8_t *ssid __unused, size_t ssidlen __unused,
-    bool active __unused)
+    const uint8_t *ssid, size_t ssidlen, bool active __unused)
 {
 	struct brcm_softc *sc = ic->ic_softc;
 
@@ -2107,8 +2139,27 @@ brcm_fmop_scan_start(struct ieee80211com *ic,
 			return (0);
 		}
 	}
+	/*
+	 * Capture the caller's target SSID for brcm_dispatch_scan.  When
+	 * wpa_supplicant has a specific network configured (scan_ssid=1
+	 * or the ssid list on the trigger) net80211 passes it here.  We
+	 * hand it to the fw's escan iovar as a directed-probe SSID so
+	 * every ESCAN_RESULT for the target BSSID carries fresh IE bytes
+	 * from a PROBE_RESP rather than whatever's stale in the fw's own
+	 * beacon cache.  Same shape as Linux brcmfmac's brcmf_escan_prep
+	 * n_ssids handling.  Empty ssid means net80211 asked for a
+	 * broadcast scan; leave sc_scan_ssid_len 0 so dispatch keeps the
+	 * old channel-num=0 all-channel behaviour.
+	 */
+	if (ssid != NULL && ssidlen > 0 &&
+	    ssidlen <= sizeof(sc->sc_scan_ssid)) {
+		memcpy(sc->sc_scan_ssid, ssid, ssidlen);
+		sc->sc_scan_ssid_len = ssidlen;
+	} else {
+		sc->sc_scan_ssid_len = 0;
+	}
 	DPRINTF(sc, 0, "SCAN_DBG: fmop_scan_start active=%d "
-	    "→ queue task\n", active);
+	    "ssidlen=%zu → queue task\n", active, sc->sc_scan_ssid_len);
 	(void)taskqueue_enqueue(taskqueue_thread, &sc->sc_scan_task);
 	return (0);
 }

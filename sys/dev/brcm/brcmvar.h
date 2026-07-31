@@ -203,6 +203,15 @@ struct brcm_softc {
 	 * with no net80211 locks held.
 	 */
 	struct task			 sc_scan_task;
+	/*
+	 * SSID for the pending scan, captured in fmop_scan_start and
+	 * consumed by brcm_dispatch_scan.  Zero-length means "broadcast
+	 * scan"; non-zero triggers a directed probe request so the fw's
+	 * next ESCAN_RESULT for that BSSID carries the AP's current IE
+	 * bytes rather than whatever's in the fw's own beacon cache.
+	 */
+	uint8_t				 sc_scan_ssid[32];
+	size_t				 sc_scan_ssid_len;
 	struct task			 sc_link_task;
 	bool				 sc_link_up;
 
