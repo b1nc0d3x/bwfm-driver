@@ -2300,26 +2300,39 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 			rsn_ie = vap->iv_appie_wpa->ie_data;
 			rsn_ie_len = vap->iv_appie_wpa->ie_len;
 			/*
-			 * Sniff RSN caps for MFPC bit.  IE layout:
-			 *   30 LL 01 00 <gcs 4B> <pcnt 2B> <psuite 4B*n>
-			 *   <akmcnt 2B> <akm 4B*n> <cap 2B> ...
-			 * We can't robustly parse without knowing n, but the
-			 * cap byte with MFPC is the last 2 bytes of the "own
-			 * WPA IE default" (22-byte 1-AKM+1-pairwise form)
-			 * or 6 bytes back from end of the 30-byte
-			 * MFP-included form.  Cheapest heuristic: scan the
-			 * IE for any 2-byte pattern (cap word) that has
-			 * MFPC (0x80) or MFPR (0x40) set — but that's a
-			 * false-positive risk.  Since our own IE isn't
-			 * user-controlled and comes straight from
-			 * wpa_supplicant, either it wants MFP or it
-			 * doesn't; check by pattern-searching the RSN
-			 * capability offset when possible.  Fall back to
-			 * MFP_CAPABLE if length >= 28 (has room for
-			 * PMKID+GroupMgmt suffix).
+			 * Walk the RSN IE to find the RSN capabilities word
+			 * and translate MFPC (0x0080) / MFPR (0x0040) into
+			 * BRCM_MFP_CAPABLE / BRCM_MFP_REQUIRED.  Layout is
+			 * tag(1) len(1) ver(2) group(4) pcnt(2)
+			 * pcs(4*pcnt) akmcnt(2) akm(4*akmcnt) caps(2)
+			 * ... optional pmkid + group_mgmt after caps.  Send
+			 * REQUIRED when the caller's IE has MFPR set,
+			 * CAPABLE when only MFPC is set, otherwise NONE.
+			 * Fw uses the mfp iovar as its own required/optional
+			 * gate during 4-way; a MFP-required AP will reject
+			 * an assoc that only advertises MFP_CAPABLE.
 			 */
-			if (rsn_ie_len >= 28)
-				mfp = BRCM_MFP_CAPABLE;
+			if (rsn_ie_len >= 10) {
+				size_t pcnt = rsn_ie[8] |
+				    ((size_t)rsn_ie[9] << 8);
+				size_t off = 10 + 4 * pcnt;
+				if (off + 2 <= rsn_ie_len) {
+					size_t akmcnt = rsn_ie[off] |
+					    ((size_t)rsn_ie[off + 1] << 8);
+					off += 2 + 4 * akmcnt;
+					if (off + 2 <= rsn_ie_len) {
+						uint16_t caps = rsn_ie[off] |
+						    ((uint16_t)rsn_ie[off + 1]
+						    << 8);
+						if (caps & 0x0040)
+							mfp =
+							  BRCM_MFP_REQUIRED;
+						else if (caps & 0x0080)
+							mfp =
+							  BRCM_MFP_CAPABLE;
+					}
+				}
+			}
 		} else {
 			rsn_ie = wpa2_psk_ccmp_rsn_ie;
 			rsn_ie_len = sizeof(wpa2_psk_ccmp_rsn_ie);
