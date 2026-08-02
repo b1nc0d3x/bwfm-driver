@@ -1,0 +1,65 @@
+wpa_supplicant compares the beacon RSN IE (as cached from the on-air
+frame) against the AP's echo in M3 byte-exact.  On BCM43602 with
+Broadcom fw v7.35.177.61, the fw's beacon parser auto-expands the
+stored RSN IE with an implicit PMKID count + group_mgmt suffix when
+MFPC is set in RSN capabilities.  Beacon-cache ends up 32 bytes;
+M3 arrives verbatim from hostapd at 26 bytes; byte-exact compare
+fires WLAN_REASON_IE_IN_4WAY_DIFFERS (reason=17) locally-generated,
+and the 4-way handshake tears down right after the IGTK material
+has been received (i.e., at the last mile of full MFP bring-up).
+
+Add a semantic fallback in wpa_compare_rsn_ie: after the byte-exact
+try, parse both IEs and accept the mismatch if proto, pairwise
+cipher, group cipher, key_mgmt bitfield, RSN capabilities, and
+mgmt_group_cipher all agree.  The parser defaults mgmt_group_cipher
+to AES-128-CMAC when the suffix is absent, matching what the
+explicit suffix advertises, so the shortened IE ends up equivalent.
+
+Apply on target (FreeBSD 15.1 base tree):
+    sudo patch -p0 -d/ < wpa_supplicant-semantic-rsn-ie-compare.diff
+    cd /usr/src/usr.sbin/wpa && sudo make -j4
+    sudo install -o root -g wheel -m 555 \
+        /usr/obj/usr/src/$(uname -m).$(uname -m)/usr.sbin/wpa/wpa_supplicant/wpa_supplicant \
+        /usr/local/sbin/wpa_supplicant
+
+Verified live-fire on fbsdmac BCM43602 against Ubuntu hostapd v2.10
+in MFP-optional mode:
+    wpa_state=COMPLETED at t=2 s
+    key_mgmt=WPA2-PSK-SHA256   pmf=1
+    DHCPACK from 10.99.0.1, bound to 10.99.0.17
+    3/3 pings 1.5-8.7 ms
+    dmesg: fmop_set_key: IGTK idx=4 algo=4 rc=0
+
+--- /usr/src/contrib/wpa/src/common/wpa_common.c.orig
++++ /usr/src/contrib/wpa/src/common/wpa_common.c
+@@ -2868,6 +2868,29 @@
+ 	if (ie1len == ie2len && os_memcmp(ie1, ie2, ie1len) == 0)
+ 		return 0; /* identical IEs */
+
++	{
++		/*
++		 * Semantic-compare fallback: some fw beacon caches auto-
++		 * expand the parsed RSN IE with an implicit PMKID count +
++		 * group_mgmt suffix when MFPC is set in RSN caps.  A
++		 * strict byte-compare against the AP's echo in M3 then
++		 * mismatches even though the fields agree.  Accept the
++		 * mismatch if every parsed field is equivalent; the
++		 * parser defaults mgmt_group_cipher to AES-128-CMAC when
++		 * the suffix is absent, matching what the explicit suffix
++		 * would advertise.
++		 */
++		struct wpa_ie_data ie1d, ie2d;
++		if (wpa_parse_wpa_ie_rsn(ie1, ie1len, &ie1d) == 0 &&
++		    wpa_parse_wpa_ie_rsn(ie2, ie2len, &ie2d) == 0 &&
++		    ie1d.proto == ie2d.proto &&
++		    ie1d.pairwise_cipher == ie2d.pairwise_cipher &&
++		    ie1d.group_cipher == ie2d.group_cipher &&
++		    ie1d.key_mgmt == ie2d.key_mgmt &&
++		    ie1d.capabilities == ie2d.capabilities &&
++		    ie1d.mgmt_group_cipher == ie2d.mgmt_group_cipher)
++			return 0;
++	}
++
+ #ifdef CONFIG_IEEE80211R
+ 	if (ft_initial_assoc) {
+ 		struct wpa_ie_data ie1d, ie2d;
