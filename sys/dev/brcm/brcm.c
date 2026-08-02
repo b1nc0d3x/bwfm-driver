@@ -1820,6 +1820,22 @@ brcm_raw_xmit(struct ieee80211_node *ni, struct mbuf *m,
 	struct ieee80211com *ic = ni->ni_ic;
 	struct brcm_softc *sc = ic->ic_softc;
 
+	/*
+	 * Drop mgmt frames issued from within the net80211 state
+	 * machine.  sta_newstate calls ieee80211_send_mgmt (deauth or
+	 * probe req) during transitions like RUN -> INIT under
+	 * IEEE80211_LOCK, and our bs_txdata may sleep in
+	 * brcm_pci_msgbuf_flowring_create waiting for the fw's
+	 * FLOW_RING_CREATE_CMPLT.  Sleeping with IEEE80211_LOCK held
+	 * panics `sleeping thread holds <ic>_com_l`.  Any deauth we'd
+	 * send here is redundant with the fw-side disassoc dispatched
+	 * asynchronously by fmac_newstate's fmac_disassoc_task, so
+	 * dropping is safe: the chip will notify the AP itself.
+	 */
+	if (IEEE80211_IS_LOCKED(ic)) {
+		m_freem(m);
+		return (0);
+	}
 	return (sc->sc_bus_ops->bs_txdata(sc, m));
 }
 

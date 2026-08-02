@@ -25,6 +25,7 @@
 #include <sys/queue.h>
 #include <sys/socket.h>
 #include <sys/sysctl.h>
+#include <sys/taskqueue.h>
 
 #include <net/if.h>
 #include <net/if_var.h>
@@ -75,6 +76,20 @@ struct fmac_state {
 		    struct ieee80211_regdomain *,
 		    int, struct ieee80211_channel []);
 
+	/*
+	 * fmop_disassoc walks the fw through a synchronous DCMD, which
+	 * can sleep.  The RUN -> INIT newstate transition from
+	 * ifconfig-down runs with the driver's com lock held, so
+	 * calling fmop_disassoc directly from that callback panics
+	 * `sleeping thread holds <driver>_com_l`.  Instead we enqueue
+	 * this task on taskqueue_thread; it runs outside the newstate
+	 * lock and issues the DCMD there.  The state machine walks to
+	 * INIT immediately and the chip-side teardown happens shortly
+	 * after.
+	 */
+	struct task			    fs_disassoc_task;
+	int				    fs_disassoc_reason;
+
 	LIST_ENTRY(fmac_state)		    fs_link;
 };
 
@@ -113,6 +128,7 @@ static int	fmac_key_set(struct ieee80211vap *,
 		    const struct ieee80211_key *);
 static int	fmac_key_delete(struct ieee80211vap *,
 		    const struct ieee80211_key *);
+static void	fmac_disassoc_task(void *, int);
 
 /* ------------------------------------------------------------------
  * Attach / detach
@@ -148,6 +164,7 @@ ieee80211_fmac_attach(struct ieee80211com *ic,
 	fs->fs_ic   = ic;
 	fs->fs_ops  = ops;
 	fs->fs_caps = caps;
+	TASK_INIT(&fs->fs_disassoc_task, 0, fmac_disassoc_task, fs);
 
 	/*
 	 * Save and rewire ic-level scan dispatch.  Drivers therefore
@@ -193,6 +210,12 @@ ieee80211_fmac_detach(struct ieee80211com *ic)
 	fs = fmac_lookup(ic);
 	if (fs == NULL)
 		return;
+
+	/*
+	 * Drain any pending disassoc task before we free fs; the task
+	 * body dereferences fs->fs_ic and fs->fs_ops.
+	 */
+	taskqueue_drain(taskqueue_thread, &fs->fs_disassoc_task);
 
 	/* Restore saved ic slots. */
 	ic->ic_scan_start    = fs->fs_save_scan_start;
@@ -292,6 +315,24 @@ ieee80211_fmac_vap_attach(struct ieee80211vap *vap)
  * net80211 -> driver shims
  * ------------------------------------------------------------------ */
 
+/*
+ * Deferred fmop_disassoc.  fmac_newstate schedules this on
+ * taskqueue_thread when the vap walks RUN -> INIT so the DCMD sleep
+ * happens outside the driver's com lock (ifconfig-down holds that
+ * lock across the newstate callback).  The reason code was captured
+ * at schedule time so the fw sees the right byte on-air.
+ */
+static void
+fmac_disassoc_task(void *arg, int pending __unused)
+{
+	struct fmac_state *fs = arg;
+
+	if (fs == NULL || fs->fs_ops == NULL ||
+	    fs->fs_ops->fmop_disassoc == NULL)
+		return;
+	(void)fs->fs_ops->fmop_disassoc(fs->fs_ic, fs->fs_disassoc_reason);
+}
+
 static int
 fmac_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 {
@@ -331,24 +372,42 @@ fmac_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 		break;
 	}
 	case IEEE80211_S_INIT:
-		(void)fs->fs_ops->fmop_disassoc(ic,
-		    IEEE80211_REASON_AUTH_LEAVE);
+		/*
+		 * Defer the fw disassoc to taskqueue_thread.  The caller
+		 * here is often ifconfig-down which holds the driver's com
+		 * lock, and fmop_disassoc issues a synchronous DCMD that
+		 * sleeps.  Running the DCMD from the newstate callback
+		 * would panic `sleeping thread holds <drv>_com_l`.  The
+		 * state machine still walks to INIT immediately below;
+		 * the task fires shortly after and the chip receives its
+		 * teardown DCMD outside any net80211 lock.
+		 */
+		fs->fs_disassoc_reason = IEEE80211_REASON_AUTH_LEAVE;
+		taskqueue_enqueue(taskqueue_thread, &fs->fs_disassoc_task);
 		break;
 	default:
 		break;
 	}
 	/*
 	 * If the chip still has an active association and net80211 is
-	 * trying to walk the vap out of RUN into SCAN/AUTH/INIT (bg scan,
-	 * wpa_supplicant re-auth trigger, or bmiss timer), refuse the
+	 * trying to walk the vap RUN -> SCAN or RUN -> AUTH (bg scan,
+	 * bmiss timer, wpa_supplicant re-auth trigger), refuse the
 	 * transition.  Without this the ifp link state flaps DOWN/UP
 	 * every few seconds under a fresh association and dhclient
 	 * can't retain carrier long enough to receive the DHCP OFFER.
+	 *
+	 * RUN -> INIT is allowed here: with fmop_disassoc deferred onto
+	 * taskqueue_thread (S_INIT case above) the lock-ordering panic
+	 * is gone, and refusing INIT would wedge the vap at RUN so a
+	 * subsequent ifconfig-up + wpa_supplicant cycle never triggers
+	 * a fresh scan.  A LINK-down event from the fw will clear
+	 * fs_linked before this callback returns for the second cycle,
+	 * so the wedge only bites when the fw hasn't yet reported the
+	 * disassoc it's about to be told to do.
 	 */
 	if (fs->fs_linked && vap->iv_state == IEEE80211_S_RUN &&
 	    (nstate == IEEE80211_S_SCAN ||
-	     nstate == IEEE80211_S_AUTH ||
-	     nstate == IEEE80211_S_INIT)) {
+	     nstate == IEEE80211_S_AUTH)) {
 		printf("fmac: refuse vap RUN -> %d (chip still linked)\n",
 		    (int)nstate);
 		return (0);
