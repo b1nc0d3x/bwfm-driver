@@ -2078,6 +2078,7 @@ brcm_getradiocaps(struct ieee80211com *ic, int maxchans, int *nchans,
 	};
 	static const uint8_t unii_3[] = { 149, 153, 157, 161, 165 };
 	uint8_t bands[IEEE80211_MODE_BYTES];
+	int prev;
 
 	(void)ic;
 	memset(bands, 0, sizeof(bands));
@@ -2089,12 +2090,35 @@ brcm_getradiocaps(struct ieee80211com *ic, int maxchans, int *nchans,
 
 	memset(bands, 0, sizeof(bands));
 	setbit(bands, IEEE80211_MODE_11A);
+
+	/* U-NII-1 (36-48): no DFS. */
 	ieee80211_add_channel_list_5ghz(chans, maxchans, nchans,
 	    unii_1, nitems(unii_1), bands, 0);
+
+	/*
+	 * U-NII-2A (52-64) is DFS-required per FCC / ETSI.  Mark
+	 * IEEE80211_CHAN_DFS + IEEE80211_CHAN_PASSIVE on the newly-added
+	 * entries so net80211 refuses active probes and userspace tools
+	 * see them as radar-dependent.  BCM43602 fw does its own in-
+	 * firmware radar detection when operating on these channels; no
+	 * host-side CAC is required for STA-mode receive-only use.
+	 */
+	prev = *nchans;
 	ieee80211_add_channel_list_5ghz(chans, maxchans, nchans,
 	    unii_2, nitems(unii_2), bands, 0);
+	for (int i = prev; i < *nchans; i++)
+		chans[i].ic_flags |=
+		    IEEE80211_CHAN_DFS | IEEE80211_CHAN_PASSIVE;
+
+	/* U-NII-2C / 2E (100-140): also DFS. */
+	prev = *nchans;
 	ieee80211_add_channel_list_5ghz(chans, maxchans, nchans,
 	    unii_2_ext, nitems(unii_2_ext), bands, 0);
+	for (int i = prev; i < *nchans; i++)
+		chans[i].ic_flags |=
+		    IEEE80211_CHAN_DFS | IEEE80211_CHAN_PASSIVE;
+
+	/* U-NII-3 (149-165): no DFS. */
 	ieee80211_add_channel_list_5ghz(chans, maxchans, nchans,
 	    unii_3, nitems(unii_3), bands, 0);
 }
@@ -3075,7 +3099,8 @@ brcm_attach(struct brcm_softc *sc)
 	ic->ic_opmode = IEEE80211_M_STA;
 	ic->ic_caps =
 	    IEEE80211_C_STA |
-	    IEEE80211_C_WPA;
+	    IEEE80211_C_WPA |
+	    IEEE80211_C_DFS;	/* fw handles radar detect + CAC internally */
 
 	/*
 	 * Phase 10: advertise the WPA2 ciphers we can install on the chip
