@@ -83,6 +83,7 @@ static int brcm_pci_sysctl_srom_parse_self(SYSCTL_HANDLER_ARGS);
 static int brcm_pci_sysctl_net80211_attach(SYSCTL_HANDLER_ARGS);
 static int brcm_pci_sysctl_net80211_detach(SYSCTL_HANDLER_ARGS);
 static int brcm_pci_sysctl_msgbuf_attach(SYSCTL_HANDLER_ARGS);
+static void brcm_pci_preinit_dcmds(struct brcm_pci_softc *sc);
 static int brcm_pci_sysctl_dump_console(SYSCTL_HANDLER_ARGS);
 static int brcm_pci_sysctl_dcmd_probe(SYSCTL_HANDLER_ARGS);
 static int brcm_pci_sysctl_flow_create(SYSCTL_HANDLER_ARGS);
@@ -5401,6 +5402,119 @@ brcm_pci_sysctl_apple_dstate_cycle(SYSCTL_HANDLER_ARGS)
 }
 
 /*
+ * Cold-resume path: after S3 removes power to the chip the fw is dead
+ * and every DCMD hangs.  Rebuild the whole stack in-kernel:
+ *   1. Tear the stale msgbuf state down (DMA rings, ISR, mbufs).
+ *   2. DSDT APPU warm sequence via EC APWC (safe on cold chip).
+ *   3. PCIe D0→D3→D0 nudge.
+ *   4. Verify chip cfg-space liveness.
+ *   5. Re-point BAR0_WIN1 at CHIPCOMMON.
+ *   6. Full bringup — core_walk + PMU + PLL + ramsize + fw upload +
+ *      nvram inject + armcr4 release + wait_fw_ready.
+ *   7. msgbuf_attach — fresh DMA rings, rebind ISR, post rx bufs.
+ *   8. WLC_UP.
+ *   9. preinit dcmds — event_msgs, mpc, scan timers, txbf.
+ *
+ * net80211 is intentionally NOT touched.  wlan0 stays present as an
+ * ifnet, sc_ic_attached stays true; wpa_supplicant's SIOCS80211 fd
+ * survives.  The VAP's next iv_op after resume will find sc_wlc_up
+ * true again, the fw ready to accept SET_SSID, and re-associate
+ * naturally without needing userland to re-create the interface.
+ */
+static int
+brcm_pci_cold_reattach(struct brcm_pci_softc *sc)
+{
+	device_t dev = sc->sc_dev;
+	int rc;
+
+	device_printf(dev, "cold_reattach: starting full chip rebuild\n");
+
+	brcm_pci_msgbuf_detach(sc);
+	sc->bus_sc.sc_wlc_up = false;
+	sc->sc_chip_alive = false;
+
+	rc = brcm_pci_apple_appu_warm(sc);
+	if (rc != 0) {
+		device_printf(dev,
+		    "cold_reattach: APPU warm failed rc=%d\n", rc);
+		return (rc);
+	}
+
+	(void)brcm_pci_apple_dstate_cycle(sc);
+
+	if (!brcm_pci_chip_alive_cfg(sc)) {
+		device_printf(dev,
+		    "cold_reattach: chip still absent from cfg-space "
+		    "after APPU + dstate_cycle\n");
+		return (ENXIO);
+	}
+	sc->sc_chip_alive = true;
+
+	pci_write_config(dev, BRCM_PCI_BAR0_WINDOW, 0x18000000, 4);
+	(void)pci_read_config(dev, BRCM_PCI_BAR0_WINDOW, 4);
+
+	rc = brcm_pci_bringup_sequence(sc);
+	if (rc != 0) {
+		device_printf(dev,
+		    "cold_reattach: bringup_sequence rc=%d\n", rc);
+		return (rc);
+	}
+
+	rc = brcm_pci_msgbuf_attach(sc);
+	if (rc != 0) {
+		device_printf(dev,
+		    "cold_reattach: msgbuf_attach rc=%d\n", rc);
+		return (rc);
+	}
+
+	rc = brcm_pci_msgbuf_dcmd_set_int(sc, BRCM_C_UP, 0);
+	if (rc != 0) {
+		device_printf(dev,
+		    "cold_reattach: WLC_UP rc=%d\n", rc);
+		return (rc);
+	}
+	sc->bus_sc.sc_wlc_up = true;
+
+	brcm_pci_preinit_dcmds(sc);
+
+	/*
+	 * Chip is fully back but net80211's VAP still believes it's in
+	 * whatever state it was before the tear-down.  Force each vap to
+	 * INIT so the next userland scan/assoc request walks the state
+	 * machine cleanly against the fresh fw.  wpa_supplicant sees
+	 * SIOCG80211(SSID) come back empty, treats it as a link drop, and
+	 * reissues its own re-association without needing to be restarted.
+	 */
+	if (sc->bus_sc.sc_ic_attached) {
+		struct ieee80211vap *vap;
+		TAILQ_FOREACH(vap, &sc->bus_sc.sc_ic.ic_vaps, iv_next)
+			(void)ieee80211_new_state(vap, IEEE80211_S_INIT, -1);
+	}
+
+	device_printf(dev, "cold_reattach: SUCCESS\n");
+	return (0);
+}
+
+/*
+ * Diagnostic: force cold_reattach without going through ACPI S3.  Tears
+ * the running msgbuf state down and rebuilds — chip will drop the
+ * current association and reconnect once wpa_supplicant reissues its
+ * scan/assoc.  Safe to run on a working link, useful for iterating on
+ * item #4b without physical suspend cycles.
+ */
+static int
+brcm_pci_sysctl_cold_reattach(SYSCTL_HANDLER_ARGS)
+{
+	struct brcm_pci_softc *sc = arg1;
+	int trig = 0, error;
+
+	error = sysctl_handle_int(oidp, &trig, 0, req);
+	if (error != 0 || req->newptr == NULL || trig == 0)
+		return (error);
+	return (brcm_pci_cold_reattach(sc));
+}
+
+/*
  * Diagnostic: fire the D3 mailbox handshake (H2D_HOST_D3_INFORM →
  * wait for D2H_DEV_D3_ACK, 2s) and follow with H2D_HOST_D0_INFORM,
  * without touching WLC / net80211 / the PCIe bus D-state.  Lets us
@@ -5706,6 +5820,14 @@ brcm_pci_attach_sysctls(struct brcm_pci_softc *sc)
 	    "Fire mbdata H2D_HOST_D3_INFORM + wait 2s for D2H_DEV_D3_ACK "
 	    "+ H2D_HOST_D0_INFORM, without touching WLC/net80211/PCIe bus.  "
 	    "Diagnostic for the fw side of item #4 (D3 suspend/resume).");
+	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "cold_reattach",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    brcm_pci_sysctl_cold_reattach, "I",
+	    "Write 1 to force the ACPI-S3 cold-resume path: msgbuf_detach, "
+	    "APPU warm, dstate cycle, full bringup (fw reupload), msgbuf "
+	    "reattach, WLC_UP, preinit.  Chip drops current association "
+	    "and rebuilds; wpa_supplicant re-associates once fw is back.  "
+	    "For iterating on item #4b without needing physical S3 cycles.");
 
 	if (!brcm_pci_debug_sysctls)
 		return;
@@ -7804,20 +7926,37 @@ brcm_pci_resume(device_t dev)
 	(void)brcm_pci_msgbuf_send_mb_data(sc, BRCM_H2D_HOST_D0_INFORM);
 
 	/*
-	 * Warm-resume: if the chip's ChipID still reads sanely the fw is
-	 * probably still alive and we can just re-issue WLC_UP.  A cold-
-	 * resumed chip (S3 power off) will fail the DCMD; leave it dead
-	 * and note that a kldunload+kldload is required to recover.
+	 * Warm-resume: if cfg-space still reads the chip's vendor id then
+	 * PCIe link is up and fw likely still alive; re-issue WLC_UP and
+	 * that's all we need.  cfg-space is served by the root complex,
+	 * so this probe is safe even if the chip is fully cold — it just
+	 * returns 0xffff and we take the cold path.
 	 */
-	v = htole32(1);
-	if (brcm_dcmd_set(bsc, BRCM_C_UP, &v, sizeof(v)) == 0) {
-		bsc->sc_wlc_up = true;
-		device_printf(dev, "resume: warm resume ok (chip retained)\n");
-		return (0);
+	if (brcm_pci_chip_alive_cfg(sc)) {
+		v = htole32(1);
+		if (brcm_dcmd_set(bsc, BRCM_C_UP, &v, sizeof(v)) == 0) {
+			bsc->sc_wlc_up = true;
+			device_printf(dev,
+			    "resume: warm ok (chip retained)\n");
+			return (0);
+		}
+		device_printf(dev,
+		    "resume: warm WLC_UP failed — falling back to cold\n");
+	} else {
+		device_printf(dev,
+		    "resume: chip cfg absent — cold reattach\n");
 	}
-	device_printf(dev,
-	    "resume: chip cold — full re-init not implemented, "
-	    "kldunload+kldload to recover\n");
+
+	/*
+	 * Cold-resume: fw is gone.  Full rebuild — see
+	 * brcm_pci_cold_reattach banner.  net80211 stays attached; the
+	 * VAP re-associates naturally once fw is up.
+	 */
+	if (brcm_pci_cold_reattach(sc) != 0) {
+		device_printf(dev,
+		    "resume: cold reattach failed — kldunload+kldload "
+		    "to recover\n");
+	}
 	return (0);
 }
 
