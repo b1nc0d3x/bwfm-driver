@@ -57,9 +57,11 @@ FreeBSD 15.x's stock `net80211` rejects `IOC_WPAKEY` with `kid >= 4`,
 which blocks IGTK install and prevents MFP from completing.  Two
 options:
 
-1. Apply `docs/patches/net80211-igtk-support.diff` (mirrors Adrian Chadd's WIP D46668) that extends
-   the per-VAP key table to include IGTK slots 4/5, rebuild the
-   kernel + all wlan modules, and reboot.
+1. Apply the net80211 IGTK-slots patch (mirrors Adrian Chadd's WIP
+   D46668) that extends the per-VAP key table to include IGTK slots
+   4/5, rebuild the kernel + all wlan modules, and reboot.  Patch is
+   staged for freebsd-wireless / Adrian upstream — email us if you
+   want an early copy.
 2. Live without MFP — the driver still associates cleanly to non-MFP
    APs (`pmf=disable` on the AP or `pmf=0` in wpa_supplicant.conf).
 
