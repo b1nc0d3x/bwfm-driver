@@ -5401,6 +5401,38 @@ brcm_pci_sysctl_apple_dstate_cycle(SYSCTL_HANDLER_ARGS)
 }
 
 /*
+ * Diagnostic: fire the D3 mailbox handshake (H2D_HOST_D3_INFORM →
+ * wait for D2H_DEV_D3_ACK, 2s) and follow with H2D_HOST_D0_INFORM,
+ * without touching WLC / net80211 / the PCIe bus D-state.  Lets us
+ * verify the fw side of item #4 without needing an actual ACPI S3.
+ * Chip stays associated across the round-trip.
+ */
+static int
+brcm_pci_sysctl_d3_probe(SYSCTL_HANDLER_ARGS)
+{
+	struct brcm_pci_softc *sc = arg1;
+	int trig = 0, error, rc_send, rc_ack;
+
+	error = sysctl_handle_int(oidp, &trig, 0, req);
+	if (error != 0 || req->newptr == NULL || trig == 0)
+		return (error);
+
+	rc_send = brcm_pci_msgbuf_send_mb_data(sc, BRCM_H2D_HOST_D3_INFORM);
+	if (rc_send == 0) {
+		rc_ack = brcm_pci_msgbuf_wait_mb_ack(sc,
+		    BRCM_D2H_DEV_D3_ACK, 2000);
+		device_printf(sc->sc_dev,
+		    "d3_probe: D3_INFORM sent, D3_ACK rc=%d\n", rc_ack);
+	} else {
+		device_printf(sc->sc_dev,
+		    "d3_probe: D3_INFORM send rc=%d\n", rc_send);
+	}
+	(void)brcm_pci_msgbuf_send_mb_data(sc, BRCM_H2D_HOST_D0_INFORM);
+	device_printf(sc->sc_dev, "d3_probe: D0_INFORM sent\n");
+	return (0);
+}
+
+/*
  * One-shot warmup — safe path only (no dstate_cycle).
  *
  * dstate_cycle was found to HANG the kernel on cold BCM43602 (D3hot
@@ -5996,6 +6028,12 @@ brcm_pci_attach_sysctls(struct brcm_pci_softc *sc)
 	    "PCIe D0->D3hot->D0 transition via PMCSR.  Standard PCIe "
 	    "wakeup that may trigger chip ROM re-run when APWC-based "
 	    "warmup fails.  100ms dwell in D3hot.");
+	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "d3_probe",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    brcm_pci_sysctl_d3_probe, "I",
+	    "Fire mbdata H2D_HOST_D3_INFORM + wait 2s for D2H_DEV_D3_ACK "
+	    "+ H2D_HOST_D0_INFORM, without touching WLC/net80211/PCIe bus.  "
+	    "Diagnostic for the fw side of item #4 (D3 suspend/resume).");
 	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "warmup",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
 	    brcm_pci_sysctl_warmup, "I",
@@ -7666,19 +7704,21 @@ brcm_pci_sysctl_disassoc(SYSCTL_HANDLER_ARGS)
 }
 
 /*
- * ACPI S3 / D3 suspend/resume.  Refused by default: on this fw the
- * chip powers off in S3 and comes back cold — reviving it requires
- * the full attach path (chip reset + fw upload + msgbuf attach) which
- * is not yet wired into the resume hook.  Returning EOPNOTSUPP cancels
- * the system suspend cleanly (user's laptop stays awake) instead of
- * letting the kernel proceed and wedging on resume.
+ * ACPI S3 / D3 suspend/resume.  Refused by default (opt-in via
+ * `hw.brcm_pci.pm_supported=1`): warm-resume works when the platform
+ * keeps aux power to the chip, but cold resume (S3 → chip power off)
+ * still requires kldunload+kldload — the full attach path (chip reset
+ * + fw upload + msgbuf attach) is not yet wired into the resume hook.
  *
- * Opt in by setting `hw.brcm_pci.pm_supported=1` in loader.conf — the
- * best-effort path brings WLC down at suspend and tries a warm resume
- * (chip retained state).  Cold resume is not supported and the driver
- * must be kldunload+kldload to recover.  Full D3-mailbox handshake
- * per Linux brcmfmac (BRCMF_H2D_HOST_D3_INFORM / D2H_DEV_D3_ACK) is
- * follow-up work.
+ * What is wired:
+ *   - Suspend: brings VAPs to INIT, sends WLC_DOWN, then the mbdata
+ *     D3 handshake (H2D_HOST_D3_INFORM + wait for D2H_DEV_D3_ACK,
+ *     2 s timeout).  If the fw acks, DMA is quiesced before ACPI
+ *     removes power.
+ *   - Resume: sends H2D_HOST_D0_INFORM (no ack — fw does not ack D0),
+ *     then re-issues WLC_UP.  If WLC_UP succeeds the chip was warm
+ *     and net80211 is usable again; failure means cold, and the
+ *     driver logs the recovery hint.
  */
 static int brcm_pci_pm_supported = 0;
 SYSCTL_INT(_hw_brcm_pci, OID_AUTO, pm_supported, CTLFLAG_RDTUN,
@@ -7752,6 +7792,16 @@ brcm_pci_resume(device_t dev)
 
 	if (!brcm_pci_pm_supported)
 		return (0);
+
+	/*
+	 * D0 mailbox notify: after ACPI has restored bus power the
+	 * fw expects H2D_HOST_D0_INFORM before it will accept any
+	 * DMA / DCMD traffic again.  Silent send — fw does not ack
+	 * D0 the way it acks D3.  Send only if the D3 side went out
+	 * successfully in suspend; if not, the fw is not in a
+	 * D3-quiesced state and D0 is meaningless.
+	 */
+	(void)brcm_pci_msgbuf_send_mb_data(sc, BRCM_H2D_HOST_D0_INFORM);
 
 	/*
 	 * Warm-resume: if the chip's ChipID still reads sanely the fw is
