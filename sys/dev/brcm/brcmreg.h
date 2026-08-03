@@ -358,7 +358,10 @@ struct brcm_wsec_key {
 #define	BRCM_WPA_AUTH_WPA_PSK		(1u << 2)	/* WPA-PSK */
 #define	BRCM_WPA_AUTH_WPA2_UNSPEC	(1u << 6)	/* WPA2/802.1X */
 #define	BRCM_WPA_AUTH_WPA2_PSK		(1u << 7)	/* WPA2-PSK */
+#define	BRCM_WPA_AUTH_WPA2_1X_SHA256	0x1000		/* 802.1X SHA-256 */
 #define	BRCM_WPA_AUTH_WPA2_PSK_SHA256	(1u << 15)	/* WPA2-PSK-SHA256 (MFP) */
+#define	BRCM_WPA_AUTH_WPA2_FT		0x4000		/* Fast BSS Transition */
+#define	BRCM_WPA_AUTH_WPA3_SAE_PSK	0x40000		/* WPA3-SAE PSK */
 
 #define	BRCM_WSEC_MAX_PSK_LEN		32
 #define	BRCM_WSEC_PASSPHRASE		(1u << 0)
