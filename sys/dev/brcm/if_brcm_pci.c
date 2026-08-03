@@ -5700,6 +5700,12 @@ brcm_pci_attach_sysctls(struct brcm_pci_softc *sc)
 	    CTLTYPE_STRING | CTLFLAG_RD, sc, 0,
 	    brcm_pci_sysctl_mac_addr, "A",
 	    "Read chip's cur_etheraddr via GET_VAR (262).");
+	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "d3_probe",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    brcm_pci_sysctl_d3_probe, "I",
+	    "Fire mbdata H2D_HOST_D3_INFORM + wait 2s for D2H_DEV_D3_ACK "
+	    "+ H2D_HOST_D0_INFORM, without touching WLC/net80211/PCIe bus.  "
+	    "Diagnostic for the fw side of item #4 (D3 suspend/resume).");
 
 	if (!brcm_pci_debug_sysctls)
 		return;
@@ -6028,12 +6034,6 @@ brcm_pci_attach_sysctls(struct brcm_pci_softc *sc)
 	    "PCIe D0->D3hot->D0 transition via PMCSR.  Standard PCIe "
 	    "wakeup that may trigger chip ROM re-run when APWC-based "
 	    "warmup fails.  100ms dwell in D3hot.");
-	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "d3_probe",
-	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_pci_sysctl_d3_probe, "I",
-	    "Fire mbdata H2D_HOST_D3_INFORM + wait 2s for D2H_DEV_D3_ACK "
-	    "+ H2D_HOST_D0_INFORM, without touching WLC/net80211/PCIe bus.  "
-	    "Diagnostic for the fw side of item #4 (D3 suspend/resume).");
 	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "warmup",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
 	    brcm_pci_sysctl_warmup, "I",
