@@ -1942,10 +1942,20 @@ brcm_pci_msgbuf_dcmd(struct brcm_pci_softc *sc, uint32_t cmd, bool is_set,
 			static struct timeval _last;
 			static int _cnt;
 			mb->stat_dcmd_timeout++;
+			mb->stat_dcmd_timeout_consec++;
 			mtx_unlock(&mb->dcmd_mtx);
 			if (ppsratecheck(&_last, &_cnt, 1))
 				device_printf(DEV(mb),
-				    "msgbuf: dcmd cmd=0x%x timeout\n", cmd);
+				    "msgbuf: dcmd cmd=0x%x timeout "
+				    "(consec=%u)\n", cmd,
+				    mb->stat_dcmd_timeout_consec);
+			/*
+			 * fw crash auto-recovery (item #13).  Defer the
+			 * threshold check to if_brcm_pci.c where the full
+			 * brcm_pci_softc definition is visible; msgbuf.c
+			 * only has a forward decl of the containing softc.
+			 */
+			brcm_pci_maybe_queue_crash_recover(sc);
 			sx_xunlock(&mb->dcmd_sx);
 			return (ETIMEDOUT);
 		}
@@ -1965,6 +1975,9 @@ brcm_pci_msgbuf_dcmd(struct brcm_pci_softc *sc, uint32_t cmd, bool is_set,
 	}
 	if (fwerr != NULL)
 		*fwerr = mb->dcmd_resp_status;
+
+	/* fw responded — clear consecutive-timeout run (item #13). */
+	mb->stat_dcmd_timeout_consec = 0;
 
 	sx_xunlock(&mb->dcmd_sx);
 	return (0);

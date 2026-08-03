@@ -486,6 +486,21 @@ struct brcm_pci_softc {
 	bool			 sc_bar2_sized;
 
 	struct brcm_pci_msgbuf	 sc_msgbuf;
+
+	/*
+	 * fw crash auto-recovery (item #13).  DCMD path bumps
+	 * mb->stat_dcmd_timeout_consec on each timeout and resets it on
+	 * any success.  When it hits sc_crash_recover_threshold we
+	 * enqueue sc_crash_recover_task which runs brcm_pci_cold_reattach
+	 * from taskqueue_thread.  Threshold 0 disables auto-recovery
+	 * (opt-out).  Default 3 -- one transient timeout can happen
+	 * during scan or during heavy TX contention; three in a row
+	 * without an intervening success is fw-side dead.
+	 */
+	struct task		 sc_crash_recover_task;
+	uint32_t		 sc_crash_recover_threshold;
+	uint32_t		 sc_crash_recover_events;   /* count of triggers */
+	bool			 sc_crash_recover_pending;
 };
 
 #define	SC_TO_PCI(sc)	__containerof((sc), struct brcm_pci_softc, bus_sc)
@@ -5496,6 +5511,82 @@ brcm_pci_cold_reattach(struct brcm_pci_softc *sc)
 }
 
 /*
+ * Called from msgbuf.c on every DCMD timeout after it bumps
+ * mb->stat_dcmd_timeout_consec.  Checks the softc-level threshold
+ * and enqueues the crash-recover task at most once per burst.
+ * Idempotent: task body clears sc_crash_recover_pending on exit so a
+ * subsequent burst re-arms.
+ */
+void
+brcm_pci_maybe_queue_crash_recover(struct brcm_pci_softc *sc)
+{
+	uint32_t thresh = sc->sc_crash_recover_threshold;
+	uint32_t consec = sc->sc_msgbuf.stat_dcmd_timeout_consec;
+
+	if (thresh == 0 || consec < thresh || sc->sc_crash_recover_pending)
+		return;
+	sc->sc_crash_recover_pending = true;
+	sc->sc_crash_recover_events++;
+	device_printf(sc->sc_dev,
+	    "fw crash detected (dcmd timeout consec=%u >= %u); "
+	    "queueing cold_reattach (event #%u)\n",
+	    consec, thresh, sc->sc_crash_recover_events);
+	taskqueue_enqueue(taskqueue_thread, &sc->sc_crash_recover_task);
+}
+
+/*
+ * fw crash auto-recovery taskqueue callback (item #13).  Runs on
+ * taskqueue_thread after the DCMD timeout path bumps
+ * mb->stat_dcmd_timeout_consec past sc_crash_recover_threshold.  Body
+ * mirrors what the cold_reattach sysctl does; the pending flag is
+ * flipped back to false so a subsequent crash burst re-arms.
+ */
+static void
+brcm_pci_crash_recover_task(void *ctx, int pending __unused)
+{
+	struct brcm_pci_softc *sc = ctx;
+	int rc;
+
+	device_printf(sc->sc_dev,
+	    "crash_recover_task: running cold_reattach (event #%u)\n",
+	    sc->sc_crash_recover_events);
+	rc = brcm_pci_cold_reattach(sc);
+	device_printf(sc->sc_dev,
+	    "crash_recover_task: cold_reattach rc=%d\n", rc);
+	sc->sc_crash_recover_pending = false;
+}
+
+/*
+ * Diagnostic: manually trigger the crash-recover task without waiting
+ * for real DCMD timeouts.  Sets the pending flag and enqueues the task;
+ * task body then calls cold_reattach.  Same effect as
+ * `sysctl dev.brcm_pci.N.cold_reattach=1` but exercises the async
+ * taskqueue path that a real fw crash would take.
+ */
+static int
+brcm_pci_sysctl_crash_probe(SYSCTL_HANDLER_ARGS)
+{
+	struct brcm_pci_softc *sc = arg1;
+	int trig = 0, error;
+
+	error = sysctl_handle_int(oidp, &trig, 0, req);
+	if (error != 0 || req->newptr == NULL || trig == 0)
+		return (error);
+	if (sc->sc_crash_recover_pending) {
+		device_printf(sc->sc_dev,
+		    "crash_probe: already pending, ignored\n");
+		return (0);
+	}
+	sc->sc_crash_recover_pending = true;
+	sc->sc_crash_recover_events++;
+	device_printf(sc->sc_dev,
+	    "crash_probe: injecting event #%u, enqueueing task\n",
+	    sc->sc_crash_recover_events);
+	taskqueue_enqueue(taskqueue_thread, &sc->sc_crash_recover_task);
+	return (0);
+}
+
+/*
  * Diagnostic: force cold_reattach without going through ACPI S3.  Tears
  * the running msgbuf state down and rebuilds — chip will drop the
  * current association and reconnect once wpa_supplicant reissues its
@@ -5828,6 +5919,22 @@ brcm_pci_attach_sysctls(struct brcm_pci_softc *sc)
 	    "reattach, WLC_UP, preinit.  Chip drops current association "
 	    "and rebuilds; wpa_supplicant re-associates once fw is back.  "
 	    "For iterating on item #4b without needing physical S3 cycles.");
+	SYSCTL_ADD_UINT(ctx, list, OID_AUTO, "crash_recover_threshold",
+	    CTLFLAG_RW, &sc->sc_crash_recover_threshold, 0,
+	    "Consecutive DCMD-timeout count that triggers automatic "
+	    "cold_reattach.  Default 3.  Set to 0 to disable "
+	    "auto-recovery (item #13).");
+	SYSCTL_ADD_UINT(ctx, list, OID_AUTO, "crash_recover_events",
+	    CTLFLAG_RD, &sc->sc_crash_recover_events, 0,
+	    "Number of times the fw-crash auto-recovery task has been "
+	    "queued since attach (item #13).");
+	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "crash_probe",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    brcm_pci_sysctl_crash_probe, "I",
+	    "Write 1 to inject a fake crash event and exercise the "
+	    "async crash_recover task queue.  Behaviour equivalent to "
+	    "cold_reattach but goes through taskqueue_thread the same "
+	    "way a real DCMD-timeout burst would (item #13).");
 
 	if (!brcm_pci_debug_sysctls)
 		return;
@@ -6699,6 +6806,15 @@ brcm_pci_attach(device_t dev)
 	 * least one host.
 	 */
 	brcm_pci_attach_sysctls(sc);
+
+	/*
+	 * Wire the fw crash-recover taskqueue job (item #13).  Threshold
+	 * default 3 consecutive DCMD timeouts; sc_crash_recover_threshold
+	 * = 0 disables auto-recovery entirely.
+	 */
+	TASK_INIT(&sc->sc_crash_recover_task, 0,
+	    brcm_pci_crash_recover_task, sc);
+	sc->sc_crash_recover_threshold = 3;
 
 	/*
 	 * Run the DSDT APPU warm sequence NOW, before anyone touches BAR0.

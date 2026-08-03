@@ -659,6 +659,15 @@ struct brcm_pci_msgbuf {
 	uint64_t		 stat_dcmd_tx;
 	uint64_t		 stat_dcmd_rx;
 	uint64_t		 stat_dcmd_timeout;
+	/*
+	 * Consecutive DCMD timeouts, reset to 0 on any success.  When it
+	 * reaches sc_crash_recover_threshold (softc-level, default 3) we
+	 * treat the fw as crashed and queue a taskqueue job that runs
+	 * brcm_pci_cold_reattach() -- see item #13.  Kept here (rather
+	 * than in brcm_pci_softc) so DCMD paths that already touch mb can
+	 * bump it without another indirection.
+	 */
+	uint32_t		 stat_dcmd_timeout_consec;
 	uint64_t		 stat_isr_hits;
 	uint64_t		 stat_ctl_msgs;
 	uint64_t		 stat_flow_create_tx;
@@ -685,6 +694,7 @@ struct brcm_pci_msgbuf {
  * Idempotent — returns 0 if already attached.
  */
 int	brcm_pci_msgbuf_attach(struct brcm_pci_softc *);
+void	brcm_pci_maybe_queue_crash_recover(struct brcm_pci_softc *);
 
 /*
  * Detach: free all coherent buffers, remove ISR.  Must be called
