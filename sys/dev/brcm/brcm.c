@@ -2319,6 +2319,40 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 				if (off + 2 <= rsn_ie_len) {
 					size_t akmcnt = rsn_ie[off] |
 					    ((size_t)rsn_ie[off + 1] << 8);
+					size_t ai;
+					/*
+					 * Scan the AKM list for AKM=18 (OWE,
+					 * RFC 8110).  BCM43602 fw v7.35.177.61
+					 * predates RFC 8110 and has no OWE
+					 * support; if userspace tries to join
+					 * an OWE-only network the fw would
+					 * either reject the AKM or silently
+					 * fall back to open (unencrypted).
+					 * Log it here so the failure mode is
+					 * discoverable in dmesg instead of a
+					 * mystery post-assoc data-plane silence.
+					 */
+					for (ai = 0; ai < akmcnt &&
+					    off + 2 + 4 * (ai + 1) <=
+					    rsn_ie_len; ai++) {
+						const uint8_t *akm =
+						    &rsn_ie[off + 2 + 4 * ai];
+						if (akm[0] == 0x00 &&
+						    akm[1] == 0x0f &&
+						    akm[2] == 0xac &&
+						    akm[3] == 18) {
+							device_printf(
+							    sc->sc_dev,
+							    "wpaie: OWE AKM "
+							    "(00-0f-ac-18) in "
+							    "RSN — fw has no "
+							    "OWE support "
+							    "(BCM43602 fw "
+							    "predates RFC "
+							    "8110); assoc "
+							    "will fail\n");
+						}
+					}
 					off += 2 + 4 * akmcnt;
 					if (off + 2 <= rsn_ie_len) {
 						uint16_t caps = rsn_ie[off] |
@@ -3986,6 +4020,51 @@ brcm_sae_probe_sysctl(SYSCTL_HANDLER_ARGS)
 }
 
 /*
+ * OWE capability probe.  Attempts to set wpa_auth = WPA3_OWE
+ * (BRCM_WPA_AUTH_WPA3_OWE, speculative bit) and reports fw rc.  0 means
+ * the fw would accept the OWE AKM (necessary but not sufficient — chip
+ * also needs Diffie-Hellman crypto support).  BCME_UNSUPPORTED (-23)
+ * means this fw has no OWE at all — expected on BCM43602 v7.35.177.61
+ * (Nov 2015, two years pre-RFC 8110).
+ *
+ * Idempotent: probing does NOT persist wpa_auth — snapshot, probe,
+ * restore.  Safe to run any time.
+ */
+static int
+brcm_owe_probe_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct brcm_softc *sc = arg1;
+	uint32_t old, owe, restore;
+	int probe_rc, restore_rc, error;
+	char buf[64];
+
+	if (req->newptr == NULL) {
+		snprintf(buf, sizeof(buf), "run 'sysctl -w %s=1' to probe\n",
+		    "dev.brcm_pci.0.owe_probe");
+		return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
+	}
+
+	old = 0;
+	{
+		size_t l = sizeof(old);
+		(void)brcm_iovar_get(sc, "wpa_auth", &old, &l);
+	}
+	owe = htole32(BRCM_WPA_AUTH_WPA3_OWE);
+	probe_rc = brcm_iovar_set(sc, "wpa_auth", &owe, sizeof(owe));
+	restore = old;
+	restore_rc = brcm_iovar_set(sc, "wpa_auth", &restore, sizeof(restore));
+	device_printf(sc->sc_dev,
+	    "owe_probe: wpa_auth=0x%x probe_rc=%d, restored=0x%x rc=%d\n",
+	    BRCM_WPA_AUTH_WPA3_OWE, probe_rc, le32toh(old), restore_rc);
+
+	snprintf(buf, sizeof(buf),
+	    "owe_probe rc=%d (0=fw accepts OWE, -23=BCME_UNSUPPORTED)\n",
+	    probe_rc);
+	error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
+	return (error);
+}
+
+/*
  * Register the operator-facing sysctls that live on the brcm core.
  * Transports call this after brcm_attach() so the sysctl tree exists
  * and the softc is fully initialised.
@@ -4009,6 +4088,10 @@ brcm_sysctl_attach(struct brcm_softc *sc)
 	    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
 	    brcm_sae_probe_sysctl, "A",
 	    "Test whether firmware accepts WPA3-SAE wpa_auth (write 1)");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "owe_probe",
+	    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    brcm_owe_probe_sysctl, "A",
+	    "Test whether firmware accepts WPA3-OWE wpa_auth (write 1)");
 	SYSCTL_ADD_BOOL(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "sae_join",
 	    CTLFLAG_RW, &sc->sc_sae_join, 0,
 	    "Switch the next join to WPA3-SAE (fw offload).  Set the "

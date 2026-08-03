@@ -359,9 +359,19 @@ struct brcm_wsec_key {
 #define	BRCM_WPA_AUTH_WPA2_UNSPEC	(1u << 6)	/* WPA2/802.1X */
 #define	BRCM_WPA_AUTH_WPA2_PSK		(1u << 7)	/* WPA2-PSK */
 #define	BRCM_WPA_AUTH_WPA2_1X_SHA256	0x1000		/* 802.1X SHA-256 */
-#define	BRCM_WPA_AUTH_WPA2_PSK_SHA256	(1u << 15)	/* WPA2-PSK-SHA256 (MFP) */
 #define	BRCM_WPA_AUTH_WPA2_FT		0x4000		/* Fast BSS Transition */
+#define	BRCM_WPA_AUTH_WPA2_PSK_SHA256	(1u << 15)	/* WPA2-PSK-SHA256 (MFP) */
 #define	BRCM_WPA_AUTH_WPA3_SAE_PSK	0x40000		/* WPA3-SAE PSK */
+/*
+ * WPA3-OWE (Opportunistic Wireless Encryption, RFC 8110).  Speculative
+ * bit — no BCM43602 fw has ever implemented it (fw v7.35.177.61 is
+ * from Nov 2015, two years before RFC 8110).  Value chosen to sit in
+ * the wpa3-family band alongside SAE_PSK.  Real chip families that
+ * support OWE will publish their own constant; the sysctl probe
+ * brcm.brcm_owe_probe reports whether the currently-loaded fw accepts
+ * it.
+ */
+#define	BRCM_WPA_AUTH_WPA3_OWE		0x100000	/* WPA3-OWE (speculative) */
 
 #define	BRCM_WSEC_MAX_PSK_LEN		32
 #define	BRCM_WSEC_PASSPHRASE		(1u << 0)
