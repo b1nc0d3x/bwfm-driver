@@ -1,0 +1,130 @@
+From: Kyle Crenshaw <b1nc0d3x@gmail.com>
+To: freebsd-wireless@freebsd.org
+Cc: Adrian Chadd <adrian@FreeBSD.org>
+Subject: [PATCH] net80211: minimal IGTK slot support for 802.11w MFP,
+	aligned with D45887 / D46505 / D46668
+
+Hi Adrian, hi list,
+
+I hit the concrete instance of net80211's 802.11w gap while writing
+a native FreeBSD driver for the Broadcom BCM43602 PCIe wifi chip
+(brcm_pci, out-of-tree at github.com/b1nc0d3x/brcm-driver; 43602 is
+the last consumer BCM4 part with usable brcmfmac fw v7.35.177.61).
+
+The 43602 is FullMAC and the firmware does BIP-CMAC-128 integrity
+checking internally, so end-to-end MFP would work if net80211 could
+just route the IGTK from wpa_supplicant to the driver's iv_key_set
+hook.  It can't today: ieee80211_ioctl_setkey rejects any kid >=
+IEEE80211_WEP_NKID (4) at line 1206 with EINVAL, wpa_supplicant
+gives up with "Failed to configure IGTK to the driver," and the
+GROUP_HANDSHAKE tears the association down with reason 1.
+
+Before writing this I searched the review queue and found your three
+in-flight patches on exactly this area:
+
+  D45887 - net80211: add a placeholder check routine for whether a
+           key is an IGTK key                                     WIP
+  D46505 - net80211: add MMIC element ID (for management frame
+           protected group action frames)                        WIP
+  D46668 - net80211: add initial support for extending the global
+           key array to include IGTK keys                        WIP
+
+D46668 in particular is the same shape.  I've kept the naming
+(IEEE80211_MAX_NKID is the sum, ieee80211_is_key_igtk gets its
+D45887-shaped signature) so review of this patch is really review of
+the minimal subset of D46668 with the driver diffs (ath, rtwn)
+stripped out.
+
+Since your July 2025 note said "slowly working on it, it requires a
+lot of cleanup in net80211" and the three reviews are tagged WIP with
+D46668's commit message asking reviewers to hold off until you
+rewrite it, I don't want to front-run your larger key-flags cleanup.
+Two ways this could land:
+
+  1. You take this as the mechanical subset of D46668 that unblocks
+     FullMAC MFP now, and continue the driver-side auditing (ath,
+     rtwn), the MMIC-IE work (D46505), and the ieee80211_is_key_igtk
+     placeholder plumbing (D45887) at whatever pace the bigger
+     refactor allows.  This patch is designed to compose cleanly with
+     all three: same names, no overlapping fields.
+
+  2. You'd rather this wait for your full stack to land as a single
+     coherent series.  In that case just say the word and I'll keep
+     the patch out-of-tree in the brcm_pci docs/patches directory.
+
+What this patch touches, deliberately narrow:
+
+  - IEEE80211_IGTK_NKID (2), IEEE80211_IGTK_KID_BASE (4),
+    IEEE80211_MAX_NKID (6), and IEEE80211_KEY_IS_IGTK(kid).
+  - iv_nw_keys[] grows from WEP_NKID to MAX_NKID slots.  All the
+    existing pointer arithmetic against &vap->iv_nw_keys[0] stays
+    valid, no UB.
+  - Bound checks in setkey / getkey / delkey / delglobalkeys /
+    is_key_global / crypto_resetkey init / ddb dumper / resume-time
+    reinstall move from WEP_NKID to MAX_NKID.
+  - IEEE80211_IOC_WEPKEY, IEEE80211_IOC_WEPTXKEY, and
+    IEEE80211_IOC_NUMWEPKEYS stay at WEP_NKID; those paths carry
+    WEP semantics and slots 4/5 are not WEP.
+
+What this patch does NOT touch, yours to design:
+
+  - Software wlan_bip_cmac cipher module.  Only needed for softmac
+    drivers doing BIP in-host; FullMAC + fw-side BIP works without it.
+  - The MMIC element ID handling from D46505.
+  - Driver-side auditing (ath, rtwn key allocators skipping IGTK):
+    each maintainer's call once the ABI change lands.
+  - IGTK rekey / IPN replay counter validation semantics.
+  - The wpa_supplicant driver_bsd shim.  My initial cover letter said
+    it needed a dedicated IEEE80211_C_ PSK-SHA256 capability bit, but
+    the AKM selection in wpa_supplicant.c:1876 comes out of ie.key_mgmt
+    & ssid->key_mgmt (AP beacon intersected with the network block),
+    not capa.key_mgmt, and MFP gating in wpas_get_ssid_pmf is on
+    drv_enc & WPA_DRIVER_CAPA_ENC_BIP which unpatched driver_bsd
+    already sets from IEEE80211_CRYPTO_BIP_CMAC_128.  Once the driver
+    advertises BIP-CMAC-128 in ic_cryptocaps and the wpa_supplicant
+    network block lists WPA-PSK-SHA256 in key_mgmt, MFP works with no
+    shim change.
+
+ABI note.  sizeof(struct ieee80211_key) is 216 bytes on LP64, so
+iv_nw_keys[] grows by 432 bytes and struct ieee80211vap grows by
+432 bytes.  Modules that embed a full ieee80211vap must be rebuilt;
+ones that only carry a pointer are unaffected.  D46668 makes the
+same tradeoff.
+
+Testing on fbsdmac (MBP11,4, BCM43602 + fw v7.35.177.61) against
+Ubuntu hostapd v2.10 with `ieee80211w=1`,
+`wpa_key_mgmt=WPA-PSK WPA-PSK-SHA256`, `group_mgmt_cipher=AES-128-CMAC`:
+
+  wpa_state=COMPLETED at t=2 s from wpa_supplicant start
+  key_mgmt=WPA2-PSK-SHA256, pmf=1
+  DHCPACK from 10.99.0.1, bound 10.99.0.17
+  3/3 pings, 1.5-8.7 ms
+  brcm_pci0: wsec_key: idx=4 len=16 algo=4 flags=0x0 peer=00...
+  brcm_pci0: fmop_set_key: IGTK idx=4 algo=4 rc=0
+
+5/5 rapid `ifconfig wlan0 down/up` + `pkill wpa_supplicant` + restart
+cycles all complete in 3-4 s each, MFP renegotiated + IGTK
+re-installed on every cycle.  No panics, no wedges.
+
+One live-fire caveat that isn't fixed by this patch and doesn't
+belong in it, but is worth flagging: on BCM43602, the fw's beacon
+parser auto-expands the parsed RSN IE with an implicit PMKID+
+group_mgmt suffix when MFPC is set in RSN caps.  Cached beacon IE
+ends up 32 bytes; M3 arrives verbatim from hostapd at 26 bytes;
+wpa_supplicant's byte-exact wpa_compare_rsn_ie fires
+WLAN_REASON_IE_IN_4WAY_DIFFERS locally-generated right after
+receiving IGTK material.  A tiny wpa_supplicant fallback that
+accepts the mismatch when the parsed fields agree closes the loop --
+posting that separately.  Without it, IGTK arrives at
+ieee80211_ioctl_setkey but wpa_supplicant tears the assoc down at
+step 3/4 and never fires the SIOCS80211 WPAKEY that this patch
+exists to accept.
+
+Full driver context: https://github.com/b1nc0d3x/brcm-driver.git
+Companion wpa_supplicant patch:
+  docs/patches/wpa_supplicant-semantic-rsn-ie-compare.diff
+
+Happy to iterate on the shape.  Thanks for the ongoing net80211 work.
+
+Cheers,
+Kyle
