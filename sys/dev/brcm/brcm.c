@@ -1717,17 +1717,19 @@ brcm_vap_create(struct ieee80211com *ic, const char name[IFNAMSIZ],
 	 */
 	ieee80211_fmac_vap_attach(vap);
 
-	/* Media change/status callbacks.  On amd64 the standard net80211
-	 * helpers are exported and let ifconfig(8) render `list scan` etc.
-	 * Some older arm64 FreeBSD builds don't export these symbols, so
-	 * the stub build falls back to NULL (net80211 tolerates it but
-	 * ifconfig SIOCGIFMEDIA prints "Programming error"). */
-#ifdef __amd64__
+	/*
+	 * Media change/status callbacks — use the stock net80211 helpers
+	 * on every arch.  Historical note: this used to be gated
+	 * `#ifdef __amd64__` because a very old arm64 wlan.ko didn't
+	 * export the symbols.  Every currently-supported wlan.ko does
+	 * (verified live 2026-08-04 on FreeBSD 15.0 arm64: `nm -D` shows
+	 * both symbols as T).  Without the callbacks, SIOCGIFMEDIA prints
+	 * "ifm_status is NULL; please fix miibus/driver order" and
+	 * `ifconfig list scan` fails on the same ioctl -- fixing this
+	 * unblocks the whole userland scan/join UI on non-amd64.
+	 */
 	ieee80211_vap_attach(vap, ieee80211_media_change,
 	    ieee80211_media_status, mac);
-#else
-	ieee80211_vap_attach(vap, NULL, NULL, mac);
-#endif
 	ic->ic_opmode = opmode;
 	return (vap);
 }
