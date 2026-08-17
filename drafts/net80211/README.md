@@ -1,90 +1,95 @@
-# FullMAC adaptation layer (draft)
+# FullMAC helper layer (draft)
 
-This lives in `drafts/net80211/` and not in `/usr/src/sys/net80211/`
-because the API is open while at least one merged driver migrates
-onto it.  Once `brcm` switches its synthesised beacon, link-task, and
-`iv_newstate` intercept code over to these calls and the diff is
-bounded, `ieee80211_fullmac.h` + `ieee80211_fullmac.c` become an
-upstreamable patchset against `sys/net80211/`.
+This code lives in `drafts/net80211/` and not in
+`/usr/src/sys/net80211/`. The API is still being shaped while one
+driver moves onto it.
+
+Once `brcm` swaps its fake beacon, link task, and `iv_newstate`
+hook over to these calls, the diff will be small. Then
+`ieee80211_fullmac.h` and `ieee80211_fullmac.c` can go upstream
+as a patch to `sys/net80211/`.
 
 ## What net80211 needs from you
 
-One new field in `struct ieee80211com` so the framework can find its
-per-com state without colliding with existing slots:
+One new field in `struct ieee80211com`. This lets the framework
+store its own state without stepping on other slots:
 
 ```c
 /* sys/net80211/ieee80211_var.h, near the end of ieee80211com {} */
 void			*ic_fmac;	/* FullMAC framework state */
 ```
 
-That's the whole delta.  Everything else (`ic_scan_start`,
-`ic_scan_end`, `iv_newstate`, `iv_key_set`, `iv_key_delete`) is
-rewired in place by the framework and restored on detach, so existing
-SoftMAC drivers are unaffected.
+That is the whole change. All the other bits
+(`ic_scan_start`, `ic_scan_end`, `iv_newstate`, `iv_key_set`,
+`iv_key_delete`) get rewired by the framework and put back on
+detach. Old SoftMAC drivers are not touched.
 
-## Migration plan for `brcm`
+## Plan for moving `brcm` over
 
-Roughly seven hunks land:
+About seven changes land:
 
-1. Driver fills a `struct ieee80211_fullmac_ops` with existing
-   helpers (`brcm_scan_start_fw`, `brcm_assoc_now`, etc.).
+1. Driver fills a `struct ieee80211_fullmac_ops` with helpers it
+   already has (`brcm_scan_start_fw`, `brcm_assoc_now`, etc.).
 2. `brcm_attach()` calls `ieee80211_fmac_attach(ic, &brcm_fmops, ...)`
-   immediately before `ieee80211_ifattach()`.
+   right before `ieee80211_ifattach()`.
 3. `brcm_vap_create()` calls `ieee80211_fmac_vap_attach(vap)` after
-   the vap is created, before returning it.
-4. The ~80 lines of synthesised-beacon building in `brcm_rx_frame()`
-   collapse to one `ieee80211_fmac_scan_result()` call.
-5. `brcm_link_task()` (~40 lines of state-machine fast-forwarding)
-   becomes `ieee80211_fmac_link_up(ic, bssid)`.
-6. The disassoc / link-loss event handler becomes
+   making the vap, before returning it.
+4. The ~80 lines that build a fake beacon in `brcm_rx_frame()`
+   shrink to one `ieee80211_fmac_scan_result()` call.
+5. `brcm_link_task()` (~40 lines that fast-forward the state
+   machine) becomes `ieee80211_fmac_link_up(ic, bssid)`.
+6. The disassoc / link-loss handler becomes
    `ieee80211_fmac_link_down(ic, reason)`.
 7. `brcm_eapol_rx_forward()` becomes `ieee80211_fmac_eapol_rx()`.
 
-Estimated diff: about -400 / +60 in `brcm.c`.  The custom
-`brcm_sta_join_from_cache`, `brcm_link_task`, and beacon-synthesis
-helper all disappear; the framework owns them.
+Rough size: about -400 / +60 lines in `brcm.c`. The old
+`brcm_sta_join_from_cache`, `brcm_link_task`, and beacon-fake
+helper all go away. The framework owns them.
 
-## Open API questions while brcm migrates
+## Open API questions while brcm moves
 
-The RSN IE plumbing is the biggest one.  `fmop_assoc` currently takes
-`(wpa_auth, wsec, ies)`, but the driver is the one that knows the
-chip's wire format for those fields.  I don't know yet whether the
-framework should copy net80211's RSN IE verbatim and let the driver
-translate, or pre-decode to `(auth, cipher)` pairs.  brcm needs the
-verbatim IE for its `wpaie` iovar, so I'm leaning verbatim, but that
-leaves anything with a smaller IE grammar doing more work than it
-needs to.
+The RSN IE plumbing is the biggest one. `fmop_assoc` today takes
+`(wpa_auth, wsec, ies)`. But the driver is the one that knows the
+chip's wire format for those fields.
 
-Channel set: today net80211's regdomain pushes a channel list into
-`ic_channels[]`, but FullMAC chips have their own idea of available
-channels (firmware-dependent).  I think `fmop_set_country` should
-return the firmware-validated channel list so the framework can
-reconcile, but I want to see at least one non-brcm consumer first
-before I commit the ops table to that shape.
+I do not know yet what is better. The framework could copy
+net80211's RSN IE as-is and let the driver translate it. Or it
+could pre-decode to `(auth, cipher)` pairs. brcm needs the raw IE
+for its `wpaie` iovar, so I lean toward raw. But then chips with
+a smaller IE grammar do more work than they should.
 
-Scan parameters: `fmop_scan_start` takes one SSID, and net80211's scan
-API can do multi-SSID + per-channel dwell.  Defer until a driver
-actually uses those.
+Channel set. Today net80211's regdomain pushes a channel list
+into `ic_channels[]`. But FullMAC chips have their own idea of
+which channels work (based on firmware).
 
-Statistics: most FullMAC chips have rich stats (RSSI, TX retries) that
-net80211 wants via `ieee80211_node_stats`.  I'll add a
-`fmop_get_link_stats` op when there's a consumer.
+I think `fmop_set_country` should return the firmware-approved
+channel list so the framework can match them up. But I want to
+see at least one non-brcm driver first before locking the ops
+table into that shape.
 
-The TX path stays with the driver.  BCDC / IPC framing is bus-specific,
-so `fmop_tx_eapol` for symmetry would also need `fmop_tx_data`, and at
-that point the framework is re-implementing net80211's TX queue.  Not
-worth it.
+Scan parameters. `fmop_scan_start` takes one SSID. net80211's
+scan API can do multi-SSID and per-channel dwell. Wait until a
+driver actually needs those.
+
+Stats. Most FullMAC chips have rich stats (RSSI, TX retries) that
+net80211 wants via `ieee80211_node_stats`. I will add a
+`fmop_get_link_stats` op when there is a user for it.
+
+The TX path stays in the driver. BCDC / IPC framing is
+bus-specific. So `fmop_tx_eapol` for symmetry would also need
+`fmop_tx_data`. At that point the framework would be redoing
+net80211's TX queue. Not worth it.
 
 ## Test plan
 
-The framework is unit-testable only insofar as a real driver exercises
-it.  Acceptance:
+The framework can only be tested by a real driver using it.
+To ship:
 
-1. `brcm` migrated to the framework, builds clean with no warnings.
-2. Acceptance ladder from `STATUS.md` step 4+ passes identically on
-   patched vs unpatched `brcm`.
-3. `iwm` and `iwx`'s MVM-mode paths get an eyeball for the same
-   refactor opportunity.  No commitment, just look.
+1. `brcm` uses the framework, builds clean with no warnings.
+2. Steps 4 and up from `STATUS.md` pass the same on patched and
+   unpatched `brcm`.
+3. Give `iwm` and `iwx` MVM-mode paths a look for the same
+   refactor. No promise, just a look.
 
-The header and core compile cleanly against a hypothetical `ic_fmac`
-slot in `ieee80211_var.h`.  No in-tree consumer yet.
+The header and core build cleanly against a made-up `ic_fmac`
+slot in `ieee80211_var.h`. No in-tree user yet.

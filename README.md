@@ -1,41 +1,43 @@
 # brcm — FreeBSD FullMAC driver for Broadcom wifi
 
-Native FreeBSD driver supporting the three common bus attachments for
-Broadcom FullMAC wifi silicon:
+A native FreeBSD driver for Broadcom FullMAC wifi chips. It
+supports the three common ways these chips plug in:
 
-- **`brcm_pci`** — PCIe cards, notably BCM43602 (`14e4:43ba`)
-- **`brcm_usb`** — USB dongles (BCM43143, 43236b, 43242a, 4329, 4330,
-  4334, 4335 etc.)
-- **`brcm_sdio`** — SDIO chips common on ARM SBCs (BCM43143, 43241,
-  4329, 4330, 4334, 4335, 43362, 43430, 43455 etc.)
+- **`brcm_pci`** — PCIe cards, mainly BCM43602 (`14e4:43ba`)
+- **`brcm_usb`** — USB dongles (BCM43143, 43236b, 43242a, 4329,
+  4330, 4334, 4335 etc.)
+- **`brcm_sdio`** — SDIO chips found on ARM boards (BCM43143,
+  43241, 4329, 4330, 4334, 4335, 43362, 43430, 43455 etc.)
 
-The three bus bindings share the net80211 glue, chip-backplane walk,
-FullMAC shim, and register defs in a single `sys/dev/brcm/` tree; each
-loadable module builds only what it needs.
+The three bus bindings share the net80211 glue, the chip
+backplane walk, the FullMAC shim, and register defs. All in one
+`sys/dev/brcm/` tree. Each loadable module builds only the parts
+it needs.
 
 ## Status
 
-- **`brcm_pci`** on BCM43602 — STA mode, WPA2-PSK, WPA2-PSK-SHA256,
-  802.11w MFP (BIP-CMAC-128) all working end-to-end.  PTK/GTK/IGTK
-  install, DHCP completes, on-air captures confirm MFP protection is
-  active.
-- **`brcm_usb`** / **`brcm_sdio`** — attach + firmware upload + basic
-  net80211 registration.  Association paths reuse the same core but
-  are less battle-tested than the PCIe port.
+- **`brcm_pci`** on BCM43602 — STA mode, WPA2-PSK,
+  WPA2-PSK-SHA256, and 802.11w MFP (BIP-CMAC-128) all work
+  end-to-end. PTK, GTK, and IGTK install. DHCP finishes.
+  Over-the-air captures show MFP is on.
+- **`brcm_usb`** and **`brcm_sdio`** — attach, firmware upload,
+  and basic net80211 registration all work. They use the same
+  core join code but have had less testing than PCIe.
 
-## Verified capabilities
+## What is known to work
 
-- WPA2-PSK association + DHCP + data plane
-- WPA2-PSK-SHA256 + 802.11w MFP (BIP-CMAC-128) with IGTK install
-- Reassociation across different SSIDs (roundtrip)
-- Concurrent scan while associated (no wedge, connection stable)
-- On-air MFP verification: Atheros in monitor mode captures
-  protected Action frames from AP that our fw validates on RX
+- WPA2-PSK join + DHCP + real traffic
+- WPA2-PSK-SHA256 + 802.11w MFP (BIP-CMAC-128) with IGTK
+  install
+- Rejoining across different SSIDs (both ways)
+- Scanning while joined (no hang, link stays up)
+- Over-the-air MFP check: an Atheros card in monitor mode saw
+  protected Action frames from the AP that our chip accepted
 
 
 ## Build
 
-Each transport is an independent loadable module.  Build only what you
+Each transport is its own loadable module. Build only what you
 need:
 
 ```
@@ -48,22 +50,22 @@ cd sys/modules/brcm_usb  && SRCTOP=$(pwd)/../../.. make
 cd sys/modules/brcm_sdio && SRCTOP=$(pwd)/../../.. KERN_TREE=/path/to/freebsd-src make
 ```
 
-Install the resulting `.ko` under `/boot/modules/` and `kldload` the
-one you need.
+Put the `.ko` file under `/boot/modules/` and `kldload` the one
+you want.
 
-## Kernel prerequisites (802.11w / IGTK)
+## Kernel needs (802.11w / IGTK)
 
-FreeBSD 15.x's stock `net80211` rejects `IOC_WPAKEY` with `kid >= 4`,
-which blocks IGTK install and prevents MFP from completing.  Two
-options:
+FreeBSD 15.x's stock `net80211` says no to `IOC_WPAKEY` with
+`kid >= 4`. That stops the IGTK install and blocks MFP from
+finishing. You have two choices:
 
-1. Apply the net80211 IGTK-slots patch (mirrors Adrian Chadd's WIP
-   D46668) that extends the per-VAP key table to include IGTK slots
-   4/5, rebuild the kernel + all wlan modules, and reboot.  Patch is
-   staged for freebsd-wireless / Adrian upstream — email us if you
-   want an early copy.
-2. Live without MFP — the driver still associates cleanly to non-MFP
-   APs (`pmf=disable` on the AP or `pmf=0` in wpa_supplicant.conf).
+1. Apply the net80211 IGTK-slots patch. It mirrors Adrian
+   Chadd's WIP D46668 and adds IGTK slots 4/5 to the per-VAP
+   key table. Then rebuild the kernel plus all wlan modules and
+   reboot. The patch is queued for freebsd-wireless / Adrian
+   upstream. Email us if you want an early copy.
+2. Skip MFP. The driver still joins fine to non-MFP APs
+   (`pmf=disable` on the AP or `pmf=0` in wpa_supplicant.conf).
 
 ## Layout
 
@@ -91,4 +93,4 @@ sys/modules/
 
 ## License
 
-BSD-2-Clause.  See `LICENSE`.
+BSD-2-Clause. See `LICENSE`.

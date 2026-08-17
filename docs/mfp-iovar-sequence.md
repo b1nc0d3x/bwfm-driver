@@ -1,11 +1,12 @@
-# MFP-negotiated association: iovar sequence
+# MFP join: the order of iovar steps
 
-Reference iovar sequence for a WPA2-PSK + 802.11w association on a
-Broadcom FullMAC chip, as observed on `brcmfmac` (Linux) and mirrored
-in `brcm_join_wpa2_host_eapol` in `brcm.c`.  Any of the four
-`* NEW *` steps that get skipped will cause the fw to reject the join
-(SET_SSID FAIL / status=1) or drop the association during the group
-handshake.
+These are the steps to join a WPA2-PSK wifi with 802.11w turned on.
+It uses a Broadcom FullMAC chip. We watched `brcmfmac` on Linux and
+copied it in `brcm_join_wpa2_host_eapol` inside `brcm.c`.
+
+The four steps marked `* NEW *` are all needed. If you skip any one,
+the chip will say no (SET_SSID FAIL / status=1). Or it will drop the
+link during the group key step.
 
 ```
 DOWN                                                              # WLC_DOWN
@@ -24,8 +25,8 @@ join(brcm_ext_join_params, 70 bytes)      # bsscfg:join iovar     # * NEW *  NOT
   ^-- fw responds with AUTH → ASSOC → LINK → SET_SSID events
 ```
 
-Then userspace wpa_supplicant runs the 4-way handshake, driver
-forwards each derived key to fw via `wsec_key` iovar (164 bytes):
+Next, wpa_supplicant runs the 4-way handshake. The driver hands each
+key to the chip using the `wsec_key` iovar (164 bytes):
 
 ```
 wsec_key(idx=0, algo=AES_CCM, ea=AP_MAC,   flags=0)              # PTK
@@ -34,12 +35,12 @@ wsec_key(idx=4, algo=AES_CCM, ea=00:00…,   flags=0, rsc=IPN)     # IGTK (BIP)
 BRCMF_C_SET_SCB_AUTHORIZE(AP_MAC)                                 # dcmd 121
 ```
 
-Fw distinguishes IGTK from GTK by key index (>= 4).  BIP-CMAC-128
-integrity checking of protected mgmt frames runs entirely inside fw
-once the IGTK is installed.
+The chip knows IGTK from GTK by the key index (4 or higher).
+Once the IGTK is set, the chip itself checks BIP-CMAC-128 on
+protected management frames.
 
-## Prerequisites
+## What you need first
 
-For IGTK install to reach the driver, net80211 must accept
-`IOC_WPAKEY` with `kid >= 4`.  Stock FreeBSD 15.x rejects this — see
+For IGTK to reach the driver, net80211 must accept `IOC_WPAKEY`
+with `kid >= 4`. Stock FreeBSD 15.x says no. See
 `docs/patches/net80211-igtk-support.diff`.
