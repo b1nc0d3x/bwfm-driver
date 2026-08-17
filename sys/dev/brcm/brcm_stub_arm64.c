@@ -1,13 +1,12 @@
 /*
- * brcm_stub_arm64.c — Minimal stubs so brcm_pci.ko can build without
- * brcm.c + ieee80211_fullmac.c when the target's wlan.ko has
- * unresolvable symbols (observed on RockPro64 arm64
- * FreeBSD kernel).
+ * brcm_stub_arm64.c — Tiny fake versions so brcm_pci.ko can build
+ * without brcm.c and ieee80211_fullmac.c. Used when wlan.ko has
+ * missing symbols (seen on RockPro64 arm64 FreeBSD).
  *
- * With these stubs the driver attaches at PCI level, all chip-side
- * sysctls work, but net80211 integration is disabled — attempting
- * dev.brcm_pci.0.net80211_attach=1 returns ENOTSUP.  Enough for
- * chip probe / warmup / core walk / fw upload experiments.
+ * With these stubs the driver still attaches at the PCI level and
+ * all chip sysctls work. But Wi-Fi (net80211) is off. Setting
+ * dev.brcm_pci.0.net80211_attach=1 gives ENOTSUP. Good enough
+ * for chip probe, warmup, core walk, and firmware upload tests.
  */
 
 #include <sys/param.h>

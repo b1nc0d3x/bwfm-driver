@@ -1,5 +1,5 @@
-/* AUTO-GENERATED from Apple AirPortBrcmNIC.kext RE. */
-/* Do not edit — regenerate from apple_extract/pci_sromvars.bin. */
+/* AUTO-MADE from Apple AirPortBrcmNIC.kext RE. */
+/* Do not edit by hand. Rebuild from apple_extract/pci_sromvars.bin. */
 
 struct brcm_srom_var {
 	const char *name;
@@ -8,7 +8,7 @@ struct brcm_srom_var {
 	uint32_t   flags;  /* SRFL_* */
 };
 
-/* 133 entries valid for SROM rev 11 (BCM43602). */
+/* 133 rows for SROM rev 11 (BCM43602). */
 static const struct brcm_srom_var brcm_srom_rev11_main[] = {
 	{ "devid",	0x0030, 0xffff, 0x00000084 },
 	{ "boardrev",	0x0041, 0xffff, 0x00000004 },
@@ -146,7 +146,7 @@ static const struct brcm_srom_var brcm_srom_rev11_main[] = {
 };
 #define BRCM_SROM_REV11_MAIN_N nitems(brcm_srom_rev11_main)
 
-/* 16 per-chain entries — repeated for each chain (BCM43602 has 3). */
+/* 16 rows per chain, repeated for every chain (BCM43602 has 3). */
 static const struct brcm_srom_var brcm_srom_rev11_perpath[] = {
 	{ "maxp2ga",	0x0000, 0x00ff, 0x00000000 },
 	{ "pa2ga",	0x0001, 0xffff, 0x00000104 },
@@ -167,7 +167,7 @@ static const struct brcm_srom_var brcm_srom_rev11_perpath[] = {
 };
 #define BRCM_SROM_REV11_PERPATH_N nitems(brcm_srom_rev11_perpath)
 
-/* BCM43602 has 3 RF chains; perpath entries are emitted with suffix 0/1/2. */
+/* BCM43602 has 3 RF chains. Per-chain rows get suffix 0/1/2. */
 #define BRCM_43602_NPATH 3
-/* Per-chain block size in the SROM/OTP layout. */
+/* Size of one chain's block in SROM/OTP. */
 #define BRCM_SROM_REV11_PATH_STRIDE 0x10  /* bytes per chain */

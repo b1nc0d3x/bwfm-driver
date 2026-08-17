@@ -3,8 +3,8 @@
  *
  * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
  *
- * Broadcom FullMAC (brcm) wire-protocol register and structure
- * definitions.  This file covers:
+ * Broadcom FullMAC (brcm) wire-protocol register and struct
+ * definitions. This file covers:
  *
  *   - The BCM43xxx boot-ROM download protocol (DL_* opcodes, TRX
  *     envelope) used to push firmware to a chip that just enumerated.
@@ -13,9 +13,10 @@
  *   - The firmware-side iovar payload structs (scan params, join
  *     params, wsec keys, BSS info, etc.) needed for IOVAR get/set.
  *
- * Field offsets, opcode numbers and byte order trace back to OpenBSD's
- * brcm driver (Patrick Wildt et al.); re-expressed in FreeBSD style.
- * Layouts are __packed because the chip parses them by raw byte offset.
+ * Field offsets, opcode numbers, and byte order trace back to
+ * OpenBSD's brcm driver (Patrick Wildt et al.). Re-expressed in
+ * FreeBSD style. Layouts are __packed because the chip parses
+ * them by raw byte offset.
  */
 
 #ifndef _DEV_BRCM_BRCMREG_H_
@@ -25,9 +26,9 @@
 #include <sys/cdefs.h>
 
 /*
- * USB vendor + product IDs that ship a Broadcom boot ROM.  Kept here
- * (rather than in if_brcm_usb.c) so a future SDIO / PCIe attach can
- * still consume the chip table without dragging in USB headers.
+ * USB vendor + product IDs that ship with a Broadcom boot ROM.
+ * Kept here (not in if_brcm_usb.c) so a future SDIO / PCIe
+ * attach can still use the chip table without USB headers.
  */
 #define	BRCM_USB_VENDOR_BROADCOM	0x0a5c
 #define	BRCM_USB_PRODUCT_BCM43143	0xbd1e
@@ -37,8 +38,8 @@
 #define	BRCM_USB_PRODUCT_BCMFW		0x0bdc	/* post-download enumeration */
 
 /*
- * Vendor-defined bRequest values the boot ROM accepts on EP0
- * (bmRequestType 0x40 for host->device, 0xc0 for device->host).
+ * Vendor-defined bRequest values the boot ROM accepts on EP0.
+ * bmRequestType 0x40 for host->device, 0xc0 for device->host.
  * Borrowed from the Broadcom SDIO/USB shared bootloader.
  */
 #define	BRCM_DL_GETSTATE	0
@@ -63,10 +64,11 @@
 #define	BRCM_DL_IMAGE_TOOBIG	7
 
 /*
- * struct bootrom_id — what DL_GETVER hands back.  Little-endian over
- * the wire; chip + chiprev together pin down the silicon revision for
- * firmware selection.  Once firmware boots, DL_GETVER returns
- * BRCM_POSTBOOT_ID in the chip field to signal "out of boot ROM."
+ * struct bootrom_id. What DL_GETVER hands back. Little-endian
+ * on the wire. chip + chiprev together pin down the silicon
+ * revision so we can pick firmware. Once firmware boots,
+ * DL_GETVER returns BRCM_POSTBOOT_ID in the chip field to say
+ * "out of boot ROM."
  */
 #define	BRCM_POSTBOOT_ID	0xa123
 
@@ -80,10 +82,10 @@ struct brcm_bootrom_id {
 } __packed;
 
 /*
- * TRX firmware envelope.  Boot ROM consumes a TRX-wrapped image:
+ * TRX firmware envelope. Boot ROM eats a TRX-wrapped image:
  * 28-byte header (magic / total length / CRC32 / flag-version /
- * offsets[3]) followed by the payload.  Pushed verbatim via chunked
- * bulk OUT; the boot ROM parses header + offsets[] itself.
+ * offsets[3]) then the payload. Pushed as-is over chunked bulk
+ * OUT. The boot ROM parses header + offsets[] itself.
  */
 #define	BRCM_TRX_MAGIC		0x30524448	/* "HDR0" */
 #define	BRCM_TRX_UNCOMP_IMAGE	0x20		/* flag bit: uncompressed */
@@ -98,8 +100,9 @@ struct brcm_trx_header {
 } __packed;
 
 /*
- * Reply to DL_START / DL_GETSTATE.  state is one of BRCM_DL_*; bytes
- * is how many of our payload bytes the chip has accepted so far.
+ * Reply to DL_START / DL_GETSTATE. state is one of BRCM_DL_*.
+ * bytes is how many of our payload bytes the chip has taken so
+ * far.
  */
 struct brcm_rdl_state {
 	uint32_t	state;
@@ -107,10 +110,10 @@ struct brcm_rdl_state {
 } __packed;
 
 /*
- * Chip-info dispatch table.  Lookup is keyed on (chip, chiprev) read
- * from the boot ROM via DL_GETVER.  Resolves once at attach into the
- * firmware blob name + a human-readable description so callers never
- * have to inspect raw silicon IDs.  Reused by SDIO / PCIe attaches.
+ * Chip-info table. Look up by (chip, chiprev) read from the
+ * boot ROM via DL_GETVER. Resolves once at attach to the
+ * firmware blob name + a human description, so callers never
+ * touch raw silicon IDs. Reused by SDIO / PCIe attaches.
  */
 struct brcm_chip_info {
 	uint32_t	chip;
@@ -121,16 +124,16 @@ struct brcm_chip_info {
 };
 
 /*
- * BCDC (Broadcom Common Driver Code) — wire protocol between host and
- * running firmware.  Two flavours of message:
+ * BCDC (Broadcom Common Driver Code). Wire protocol between
+ * host and running firmware. Two kinds of message:
  *
- *   1. Control (dcmd) — get/set firmware variables ("iovars") and
- *      structured commands.  Travels over the USB control endpoint
- *      with vendor-class interface requests:
+ *   1. Control (dcmd). Get/set firmware variables ("iovars")
+ *      and structured commands. Travels over the USB control
+ *      endpoint with vendor-class interface requests:
  *        TX = bmRequestType 0x21, bRequest 0
  *        RX = bmRequestType 0xa1, bRequest 1
- *   2. Data — 802.11 frames.  Travels over bulk endpoints with a
- *      4-byte BCDC header prefix.
+ *   2. Data. 802.11 frames. Travels over bulk endpoints with a
+ *      4-byte BCDC header on the front.
  */
 
 /* Selected BCDC dcmd opcodes. */
@@ -161,9 +164,9 @@ struct brcm_chip_info {
 #define	BRCM_PM_FAST			2	/* fast power save */
 
 /*
- * Payload for DISASSOC dcmd.  Wire layout: {val=4, bssid[6], pad[2]} =
- * 12 bytes.  Explicit tail pad matches the on-wire alignment expected
- * by firmware.
+ * Payload for DISASSOC dcmd. Wire layout: {val=4, bssid[6],
+ * pad[2]} = 12 bytes. The tail pad matches the alignment the
+ * firmware expects on the wire.
  */
 struct brcm_scb_val_le {
 	uint32_t	val;		/* reason code (LE) */
@@ -179,10 +182,10 @@ _Static_assert(sizeof(struct brcm_scb_val_le) == 12,
 #define	BRCM_BAND_ALL			3
 
 /*
- * "escan" iovar request payload (v0 format used by older Broadcom
- * firmware images such as the 43236 blob).  Sent via SET_VAR with
- * the name "escan"; the firmware emits ESCAN_RESULT events as it
- * walks the channel list.
+ * "escan" iovar request payload. v0 format used by older
+ * Broadcom firmware images like the 43236 blob. Sent via
+ * SET_VAR with the name "escan". Firmware sends ESCAN_RESULT
+ * events as it walks the channel list.
  */
 #define	BRCM_MAX_SSID_LEN		32
 #define	BRCM_DOT11_BSSTYPE_ANY		2
@@ -216,9 +219,9 @@ struct brcm_escan_params_v0 {
 } __packed;
 
 /*
- * 4-byte BCDC data header prepended to every TX frame and present on
- * every RX frame.  Distinct from the dcmd header used on the control
- * endpoint; data frames travel over bulk, dcmd over EP0.
+ * 4-byte BCDC data header. On the front of every TX frame and
+ * every RX frame. Different from the dcmd header used on the
+ * control endpoint. Data frames go over bulk. dcmd goes over EP0.
  */
 struct brcm_bcdc_hdr {
 	uint8_t		flags;
@@ -234,12 +237,12 @@ struct brcm_bcdc_hdr {
 } __packed;
 
 /*
- * Broadcom-proprietary event encapsulation.  After the BCDC header
- * (+ optional data_offset padding) comes a synthetic Ethernet frame
- * whose ethertype is 0x886c — that signals to the host that the
- * remaining bytes are a BCM "BRCM" event message, not a real data
- * frame.  A real data frame has its own ethertype (0x0800 etc.) and
- * gets handed to net80211 instead.
+ * Broadcom-only event wrap. After the BCDC header (plus optional
+ * data_offset padding) comes a fake Ethernet frame with
+ * ethertype 0x886c. That tells the host the rest of the bytes
+ * are a BCM "BRCM" event message, not a real data frame. A
+ * real data frame has its own ethertype (0x0800 etc.) and goes
+ * to net80211 instead.
  */
 #define	BRCM_ETHERTYPE_BRCM	0x886c
 
@@ -308,13 +311,13 @@ struct brcm_event_msg {
  * Broadcom WLC key install (BRCM_C_SET_KEY = opcode 45).
  *
  * struct brcm_wsec_key matches the legacy `wl_wsec_key_t` layout.
- * Total = 164 bytes; padding fields exist to preserve the historical
- * offsets the chip's BCDC dispatcher expects.
+ * Total = 164 bytes. The padding fields keep the historical
+ * offsets the chip's BCDC dispatcher wants.
  *
  *   index   0           pairwise (PTK) slot
  *           1, 2, 3     group (GTK) slots
  *   len     0           clear the key
- *           16, 32      AES-CCM PTK / GTK material
+ *           16, 32      AES-CCM PTK / GTK bytes
  *   algo    BRCM_CRYPTO_ALGO_AES_CCM = 4 (WPA2 CCMP)
  *           BRCM_CRYPTO_ALGO_TKIP = 2   (WPA1 / GTK)
  *           BRCM_CRYPTO_ALGO_OFF = 0    (delete)
@@ -363,13 +366,13 @@ struct brcm_wsec_key {
 #define	BRCM_WPA_AUTH_WPA2_PSK_SHA256	(1u << 15)	/* WPA2-PSK-SHA256 (MFP) */
 #define	BRCM_WPA_AUTH_WPA3_SAE_PSK	0x40000		/* WPA3-SAE PSK */
 /*
- * WPA3-OWE (Opportunistic Wireless Encryption, RFC 8110).  Speculative
- * bit — no BCM43602 fw has ever implemented it (fw v7.35.177.61 is
- * from Nov 2015, two years before RFC 8110).  Value chosen to sit in
- * the wpa3-family band alongside SAE_PSK.  Real chip families that
- * support OWE will publish their own constant; the sysctl probe
- * brcm.brcm_owe_probe reports whether the currently-loaded fw accepts
- * it.
+ * WPA3-OWE (Opportunistic Wireless Encryption, RFC 8110). This
+ * is a guess bit. No BCM43602 fw has ever done OWE (fw
+ * v7.35.177.61 is from Nov 2015, two years before RFC 8110).
+ * Value chosen to sit in the WPA3 family band next to SAE_PSK.
+ * Real chip families that do OWE will publish their own
+ * constant. The sysctl probe brcm.brcm_owe_probe reports
+ * whether the loaded fw accepts it.
  */
 #define	BRCM_WPA_AUTH_WPA3_OWE		0x100000	/* WPA3-OWE (speculative) */
 
@@ -377,10 +380,11 @@ struct brcm_wsec_key {
 #define	BRCM_WSEC_PASSPHRASE		(1u << 0)
 
 /*
- * "mfp" iovar values for Management Frame Protection negotiation.
- * When set to CAPABLE, fw includes MFPC in RSN caps and negotiates BIP
- * with MFPC-advertising APs; REQUIRED refuses to associate without MFP.
- * Linux brcmfmac sets this per-connection from the M2 RSN cap bits.
+ * "mfp" iovar values for Management Frame Protection.
+ * CAPABLE: fw includes MFPC in RSN caps and negotiates BIP
+ * with APs that advertise MFPC. REQUIRED: refuse to associate
+ * without MFP. Linux brcmfmac sets this per-connection from
+ * the M2 RSN cap bits.
  */
 #define	BRCM_MFP_NONE			0
 #define	BRCM_MFP_CAPABLE		1
@@ -388,9 +392,9 @@ struct brcm_wsec_key {
 
 /*
  * CLM (Country Locale Matrix) blob upload via "clmload" iovar.
- * Without it the chip's regulatory data restricts TX: PROBERESP
- * frames come back from the AP but the chip never transmits AUTH
- * because the operation is forbidden on that channel.
+ * Without it, the chip's regulatory data blocks TX. PROBERESP
+ * frames come back from the AP, but the chip never sends AUTH
+ * because that op is forbidden on that channel.
  */
 #define	BRCM_DL_BEGIN			0x0002
 #define	BRCM_DL_END			0x0004
@@ -408,11 +412,11 @@ struct brcm_dload_data {
 } __packed;
 
 /*
- * Wire-format key install via "wsec_key" iovar (164 bytes).  Used in
- * place of BRCM_C_SET_KEY=45 dcmd, which BCM43455 fw 7.45.x rejects
- * with the 37-byte legacy struct.  Fires for both PTK (index=0,
- * ea=AP MAC, PRIMARY_KEY flag) and GTK (index=1+, ea=bcast) after
- * the 4-way handshake completes.
+ * Wire-format key install via "wsec_key" iovar (164 bytes).
+ * Used instead of BRCM_C_SET_KEY=45 dcmd, which BCM43455 fw
+ * 7.45.x rejects with the 37-byte legacy struct. Fires for
+ * both PTK (index=0, ea=AP MAC, PRIMARY_KEY flag) and GTK
+ * (index=1+, ea=bcast) after the 4-way handshake finishes.
  */
 #define	BRCM_WLAN_MAX_KEY_LEN	32
 
@@ -429,7 +433,7 @@ struct brcm_wsec_key_le {
 	struct {
 		uint32_t hi;
 		uint16_t lo;
-	} rxiv;					/* compiler pads lo→4 (8 B) */
+	} rxiv;					/* compiler pads lo to 4 (8 B) */
 	uint32_t	pad_4[2];
 	uint8_t		ea[6];			/* compiler pads to align (8 B) */
 };
@@ -439,12 +443,12 @@ _Static_assert(sizeof(struct brcm_wsec_key_le) == 164,
     "brcm_wsec_key_le wire size != 164");
 
 /*
- * 37 bytes total (2 + 2 + 33).  This is the wire layout that
- * BCM43455 fw 7.45.x actually accepts: passing the larger 132-byte
- * SAE-capable form makes the fw return BCME_BADARG (-2) on opcode
- * 268.  With the 37-byte shape + flags=BRCM_WSEC_PASSPHRASE the
- * chip's on-chip PBKDF2 derives the PMK and tries the 4-way
- * handshake.
+ * 37 bytes total (2 + 2 + 33). This is the wire layout that
+ * BCM43455 fw 7.45.x actually accepts. Sending the bigger
+ * 132-byte SAE-capable form makes the fw return BCME_BADARG
+ * (-2) on opcode 268. With the 37-byte shape and flags =
+ * BRCM_WSEC_PASSPHRASE, the chip's on-chip PBKDF2 derives the
+ * PMK and tries the 4-way handshake.
  */
 struct brcm_wsec_pmk {
 	uint16_t	key_len;
@@ -453,11 +457,12 @@ struct brcm_wsec_pmk {
 } __packed;
 
 /*
- * 132-byte SAE-capable form of the wsec_pmk struct.  Required by
- * BCM43602 fw v7.35.x when performing MFP-negotiated associations:
- * even in host-EAPOL mode the fw needs the raw PMK / passphrase to
- * derive MFP key material for management-frame protection.  Layout
- * matches Linux brcmfmac's `brcmf_wsec_pmk_le` in fwil_types.h.
+ * 132-byte SAE-capable form of the wsec_pmk struct. Required
+ * by BCM43602 fw v7.35.x for MFP-negotiated associations.
+ * Even in host-EAPOL mode the fw needs the raw PMK / passphrase
+ * to derive MFP key material for management-frame protection.
+ * Layout matches Linux brcmfmac's `brcmf_wsec_pmk_le` in
+ * fwil_types.h.
  */
 #define	BRCM_WSEC_MAX_SAE_PASSWORD_LEN	128
 struct brcm_wsec_pmk_le {
@@ -469,8 +474,8 @@ _Static_assert(sizeof(struct brcm_wsec_pmk_le) == 132,
     "brcm_wsec_pmk_le wire size != 132");
 
 /*
- * join_pref iovar entry.  Fixed 4 bytes; typically 2 entries are sent
- * (RSSI + optional band boost).  Mirrors Linux brcmfmac's
+ * join_pref iovar entry. Fixed 4 bytes. Usually 2 entries are
+ * sent (RSSI + optional band boost). Mirrors Linux brcmfmac's
  * `struct brcmf_join_pref_params`.
  */
 #define	BRCM_JOIN_PREF_RSSI		1
@@ -500,9 +505,11 @@ struct brcm_join_params {
 } __packed;
 
 /*
- * Send length when caller has 0 chanspecs (chip auto-scans for SSID):
+ * Send length when caller passes 0 chanspecs (chip scans for
+ * the SSID on its own):
  *   sizeof(ssid) + offsetof(assoc, chanspec_list)
- * vs when caller passes 1 chanspec (chip parks on that channel):
+ * Send length when caller passes 1 chanspec (chip parks on
+ * that channel):
  *   sizeof(ssid) + offsetof(assoc, chanspec_list) + sizeof(u16)
  */
 #define	BRCM_JOIN_PARAMS_FIXED_SIZE \
@@ -510,10 +517,10 @@ struct brcm_join_params {
 	 offsetof(struct brcm_assoc_params, chanspec_list))
 
 /*
- * Extended join (bsscfg:join) -- preferred over BRCM_C_SET_SSID on
- * recent firmware because it bundles the scan params + chanspec_list
- * in one shot so the chip can park the radio on the target channel
- * before issuing AUTH.
+ * Extended join (bsscfg:join). Preferred over BRCM_C_SET_SSID
+ * on recent firmware because it packs the scan params and
+ * chanspec_list in one shot. That lets the chip park the radio
+ * on the target channel before sending AUTH.
  */
 struct brcm_join_scan_params {
 	uint8_t		scan_type;	/* 0 = use default */
@@ -539,7 +546,7 @@ struct brcm_ext_join_params {
 
 /*
  * BSS info payload that follows the event_msg inside an
- * ESCAN_RESULT event.  Outer wrapper carries the BSS count.
+ * ESCAN_RESULT event. The outer wrapper carries the BSS count.
  */
 #define	BRCM_MCSSET_LEN			16
 
@@ -593,9 +600,10 @@ struct brcm_escan_results {
 #define	BRCM_BCDC_DCMD_ID_MASK		0xffffu
 
 /*
- * BCDC dcmd header — 16 bytes on the wire, little-endian.  Variable-
- * length payload follows.  When sending an iovar GET, the payload is
- * the NUL-terminated iovar name followed by the response output area.
+ * BCDC dcmd header. 16 bytes on the wire, little-endian.
+ * Variable-length payload follows. For an iovar GET, the
+ * payload is the NUL-terminated iovar name followed by the
+ * response output area.
  */
 struct brcm_bcdc_dcmd {
 	uint32_t	cmd;

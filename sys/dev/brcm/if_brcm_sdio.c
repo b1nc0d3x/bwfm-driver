@@ -3,39 +3,42 @@
  *
  * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
  *
- * Broadcom FullMAC SDIO transport glue for brcm.  Targets the
- * BCM43xxx family that the Raspberry Pi 4 carries on its internal
+ * Broadcom FullMAC SDIO transport glue for brcm. Targets the
+ * BCM43xxx family that the Raspberry Pi 4 has on its internal
  * SDIO bus (BCM43430 / CYW43436 / BCM43455).
  *
- * Lifecycle:
- *   1. sdio0 enumerates I/O functions and creates one newbus child per
- *      function (sdio_func.c).  Each child carries manfid/prodid/class
- *      ivars exposed via SDIO_ACCESSOR().
- *   2. probe() matches on (manfid, prodid) being the Broadcom WLAN
- *      function (manfid=0x02d0, prodid in the BCM43xxx table) AND
- *      func_num == 1 — the WLAN function.  Functions 2 & 3 are vendor
- *      management interfaces we don't drive yet.
- *   3. attach() captures the parent sdio bus device so the bus_ops
- *      can issue CMD52/CMD53 via sdio_read_byte() / sdio_write_byte().
- *      Records the chip identity for logging.  Does NOT yet pull
- *      firmware or call brcm_attach() — those need the
- *      backplane-window CMD53 path plus per-chip si_pmu init that
- *      lives ahead in the work queue.
+ * Life cycle:
+ *   1. sdio0 lists I/O functions and creates one newbus child
+ *      per function (sdio_func.c). Each child carries
+ *      manfid/prodid/class ivars via SDIO_ACCESSOR().
+ *   2. probe() matches on (manfid, prodid) being the Broadcom
+ *      WLAN function (manfid=0x02d0, prodid in the BCM43xxx
+ *      table) AND func_num == 1, the WLAN function. Functions
+ *      2 and 3 are vendor management interfaces we do not
+ *      drive yet.
+ *   3. attach() grabs the parent sdio bus device so the bus_ops
+ *      can send CMD52/CMD53 via sdio_read_byte() /
+ *      sdio_write_byte(). Records the chip identity for
+ *      logging. Does NOT yet pull firmware or call
+ *      brcm_attach(). Those need the backplane-window CMD53
+ *      path plus per-chip si_pmu init, still on the todo list.
  *   4. detach() releases the child.
  *
  * What this scaffold proves:
- *   - The sdio function bus + per-function CIS parser produce
- *     correctly-keyed children
- *   - newbus binds brcm_sdio to func 1
- *   - The bus_ops vtable plumbs to SDIO without dragging in brcm.c yet
+ *   - The sdio function bus + per-function CIS parser make
+ *     correctly-keyed children.
+ *   - newbus binds brcm_sdio to func 1.
+ *   - The bus_ops table plumbs to SDIO without dragging in
+ *     brcm.c yet.
  *
- * What's deliberately stubbed:
- *   - bs_txctl / bs_rxctl / bs_txdata return ENOTSUP — there's no
- *     firmware running yet, so there's nothing to talk to.
+ * What is stubbed on purpose:
+ *   - bs_txctl / bs_rxctl / bs_txdata return ENOTSUP. There is
+ *     no firmware running yet, so there is nothing to talk to.
  *   - bs_stop is a no-op.
- *   - No brcm_attach() call: net80211 would try to bring up the
- *     interface and panic on missing firmware.  Wire that in the next
- *     phase, after CMD53 + backplane window + firmware upload land.
+ *   - No brcm_attach() call. net80211 would try to bring up
+ *     the interface and panic on missing firmware. Wire it up
+ *     in the next phase, after CMD53 + backplane window +
+ *     firmware upload land.
  */
 
 #include <sys/param.h>

@@ -3,9 +3,9 @@
  *
  * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
  *
- * Userland-facing protocol for /dev/brcm0.  Exposes raw SDIO
- * CMD52/CMD53 + backplane-window operations so userspace (and a TCP
- * bridge) can drive brcm_sdio's chip without going through sysctls.
+ * Rules for talking to /dev/brcm0 from user programs. Lets
+ * programs (and a TCP bridge) send raw SDIO CMD52/CMD53 and
+ * backplane-window commands without using sysctls.
  */
 
 #ifndef _DEV_BRCM_IF_BRCM_SDIO_CDEV_H_
@@ -65,12 +65,11 @@ struct brcm_chipid {
 #define BRCM_IOC_GET_CHIPID	_IOR('B', 6, struct brcm_chipid)
 
 /*
- * Card-init shim for the virtual MMC host bridge (Linux brcmfmac
- * driving the chip via TCP).  The chip is already CMD0/CMD5/CMD7'd by
- * FreeBSD's sdio_attach when brcm_sdio.ko loaded, so re-issuing those
- * to the chip is risky.  The kernel responds to these ioctls with the
- * cached RCA/OCR it remembers from sdio_attach, so the guest's
- * mmc-core init dance succeeds without re-touching the chip.
+ * Fake card setup for the virtual MMC bridge (Linux brcmfmac
+ * driving the chip over TCP). FreeBSD's sdio_attach already sent
+ * CMD0/CMD5/CMD7 when brcm_sdio.ko loaded. Doing it again is
+ * risky. So the kernel returns the saved RCA/OCR from sdio_attach.
+ * The guest's mmc-core setup works without touching the chip again.
  */
 struct brcm_card_info {
 	uint32_t	ocr;		/* SDIO operating conditions */
@@ -82,10 +81,10 @@ struct brcm_card_info {
 #define BRCM_IOC_CARD_INFO	_IOR('B', 7, struct brcm_card_info)
 
 /*
- * EROM core enumeration.  Kernel runs the EROM walker on demand and
- * fills core[] with up to 16 (id, rev, base, wrap) triplets.
- * brcm_drive uses this to locate non-CR4 cores (D11, SOCRAM) it must
- * touch for the Linux-equivalent set_passive sequence.
+ * List cores from EROM. Kernel walks EROM when asked and fills
+ * core[] with up to 16 (id, rev, base, wrap) entries. brcm_drive
+ * uses this to find non-CR4 cores (D11, SOCRAM) it must touch
+ * for the same set_passive steps Linux uses.
  */
 struct brcm_core_entry {
 	uint16_t	core_id;

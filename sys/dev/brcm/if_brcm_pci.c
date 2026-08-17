@@ -5,25 +5,27 @@
  *
  * Broadcom FullMAC PCIe transport glue for brcm.
  *
- * Step 1 scaffold — what's here today:
- *   1. PCI ID match for the BCM43602 / BCM4360 / BCM43xx family used
- *      in Apple, Intel, and various consumer wireless modules.
- *   2. BAR0 (chip control / register window) + BAR2 (chip RAM / shared
- *      memory window) resource allocation.
- *   3. MSI/MSI-X allocation — single vector for the skeleton, will
- *      expand to MSGBUF doorbell vectors in step 2.
- *   4. Read of the PCI config-space class / revision + a sanity-check
- *      read from BAR0 offset 0 so we know the BAR window is alive.
- *   5. bus_ops vtable wired up but mostly stubbed — bs_stop and noop
- *      placeholders so brcm_attach has something to embed against.
- *      bs_dcmd_get/set + bs_iovar_get/set arrive in step 2 with the
- *      MSGBUF protocol layer.
+ * Step 1 scaffold. What is here today:
+ *   1. PCI ID match for the BCM43602 / BCM4360 / BCM43xx
+ *      family used in Apple, Intel, and various consumer
+ *      wireless modules.
+ *   2. BAR0 (chip control / register window) + BAR2 (chip RAM
+ *      / shared memory window) resource allocation.
+ *   3. MSI/MSI-X allocation. One vector for the skeleton. Will
+ *      grow to MSGBUF doorbell vectors in step 2.
+ *   4. Read of the PCI config-space class / revision + a sanity
+ *      read from BAR0 offset 0, so we know the BAR window is
+ *      alive.
+ *   5. bus_ops table wired up but mostly stubbed. bs_stop and
+ *      noop placeholders so brcm_attach has something to embed
+ *      against. bs_dcmd_get/set + bs_iovar_get/set arrive in
+ *      step 2 with the MSGBUF protocol layer.
  *
- * Step 2 (next) will add: backplane-core walking + chip ID/rev read
- * via the chipcommon core, firmware download (BAR2-mapped chip RAM
- * + ARM reset/release), pciedev_shared_t handshake, MSGBUF SUBMIT /
- * COMPLETE ring init, doorbell IRQ handling, and the bs_dcmd_* /
- * bs_iovar_* implementations against the SUBMIT ring.
+ * Step 2 (next) will add: backplane-core walk + chip ID/rev
+ * read via the chipcommon core, firmware download (BAR2-mapped
+ * chip RAM + ARM reset/release), pciedev_shared_t handshake,
+ * MSGBUF SUBMIT / COMPLETE ring init, doorbell IRQ handling,
+ * and the bs_dcmd_* / bs_iovar_* code against the SUBMIT ring.
  */
 
 #include <sys/param.h>

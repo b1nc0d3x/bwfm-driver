@@ -3,20 +3,20 @@
  *
  * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
  *
- * Broadcom FullMAC (brcm) bus-agnostic core.
+ * Broadcom FullMAC (brcm) bus-neutral core.
  *
- * This module is the layer above the transport (USB, SDIO, PCIe).  It
- * owns the chip-info dispatch table, the BCDC dcmd / iovar request
- * machinery, and the net80211 attachment surface (ieee80211_ifattach,
- * vap_create, scan/assoc/key stubs).  Bus transports call into here
- * via brcm_attach() and the bus_ops vtable; we call back through
- * sc->sc_bus_ops to push BCDC frames out to the chip.
+ * This module sits above the transport (USB, SDIO, PCIe). It
+ * owns the chip-info table, the BCDC dcmd / iovar request
+ * engine, and the net80211 attach surface (ieee80211_ifattach,
+ * vap_create, scan/assoc/key stubs). Bus transports call in
+ * here via brcm_attach() and the bus_ops table. We call back
+ * through sc->sc_bus_ops to push BCDC frames out to the chip.
  *
- * Design reference: OpenBSD sys/dev/ic/brcm.c.  No source lines are
- * carried over; the protocol-level structure mirrors Patrick Wildt's
- * 2016-2017 work but the FreeBSD-native shape (taskqueue(9),
- * mtx + sx locks, ieee80211vap clone tracking, firmware(9) loader,
- * malloc(9) M_BRCM region) is original.
+ * Design reference: OpenBSD sys/dev/ic/brcm.c. No source lines
+ * are copied. The protocol-level structure follows Patrick
+ * Wildt's 2016-2017 work. The FreeBSD-native shape (taskqueue(9),
+ * mtx + sx locks, ieee80211vap clone tracking, firmware(9)
+ * loader, malloc(9) M_BRCM region) is original.
  */
 
 #include <sys/param.h>
@@ -50,11 +50,11 @@
 MALLOC_DEFINE(M_BRCM, "brcm", "Broadcom FullMAC scratch");
 
 /*
- * Cached chanspec from the last ESCAN_RESULT for a given BSSID --
- * lets the join path send the chip's preferred wire-format
- * chanspec (40MHz / VHT etc.) rather than our minimal 20MHz
- * recomputation that misses the AP's actual bandwidth.  Single
- * entry is enough for our STA-only single-vap usage.
+ * Cached chanspec from the last ESCAN_RESULT for a given BSSID.
+ * Lets the join path send the chip's preferred wire-format
+ * chanspec (40MHz / VHT etc.) instead of our minimal 20MHz
+ * guess, which misses the AP's real bandwidth. One entry is
+ * enough for our STA-only single-vap use.
  */
 static uint8_t  brcm_join_chanspec_bssid[6];
 static uint16_t brcm_join_chanspec_cached;
@@ -75,15 +75,18 @@ brcm_lookup_bssid_chanspec(const uint8_t bssid[6])
 }
 
 /*
- * Acquire sc_join_busy with stale-timeout recovery.  If a prior join
- * dispatch wedged (chip silently never emitted LINK/SET_SSID/DISASSOC),
- * sc_join_busy stays set forever and blocks every subsequent attempt.
+ * Take sc_join_busy with stale-timeout recovery. If an earlier
+ * join dispatch wedged (chip silently never sent
+ * LINK/SET_SSID/DISASSOC), sc_join_busy stays set forever and
+ * blocks every later attempt.
  *
- * Caller pattern: `if (brcm_join_busy_acquire(sc, "open")) return EAGAIN;`
- * Returns 0 on success (busy now claimed) or 1 if another join is
- * legitimately in flight (less than BRCM_JOIN_BUSY_TIMEOUT_S old).
+ * Caller pattern:
+ *   `if (brcm_join_busy_acquire(sc, "open")) return EAGAIN;`
+ * Returns 0 on success (busy is now taken) or 1 if another
+ * join is really in flight (younger than
+ * BRCM_JOIN_BUSY_TIMEOUT_S).
  *
- * 15s matches the firmware's join-event timeout.
+ * 15 s matches the firmware's join-event timeout.
  */
 #define	BRCM_JOIN_BUSY_TIMEOUT_S	15
 
@@ -110,10 +113,10 @@ brcm_join_busy_acquire(struct brcm_softc *sc, const char *who)
 }
 
 /*
- * Chip dispatch table.  Lookup is keyed on (chip silicon ID, chiprev)
- * returned by DL_GETVER.  fwname is the firmware(9) name (no .bin
- * suffix; firmware(9) handles resolution).  Adding a row makes a new
- * chip recognized across all transports.
+ * Chip dispatch table. Look up by (chip silicon ID, chiprev)
+ * returned by DL_GETVER. fwname is the firmware(9) name (no
+ * .bin suffix. firmware(9) resolves it). Add a row to
+ * recognize a new chip across all transports.
  */
 const struct brcm_chip_info brcm_chip_table[] = {
 	{ 0xa9a6, 0,  0xff, "brcmfmac43143",  "BCM43143"        },
@@ -141,8 +144,8 @@ brcm_chip_lookup(uint32_t chip, uint32_t chiprev)
 }
 
 /*
- * Pack a BCDC dcmd request into a host buffer for bs_txctl.  Returns
- * the number of bytes written.  The layout is:
+ * Pack a BCDC dcmd request into a host buffer for bs_txctl.
+ * Returns the number of bytes written. Layout:
  *
  *     +-----------+----- 16 bytes ------+
  *     |  cmd (LE) | len | flags | status |
@@ -150,8 +153,8 @@ brcm_chip_lookup(uint32_t chip, uint32_t chiprev)
  *     |  payload (payload_len bytes)   |
  *     +--------------------------------+
  *
- * reqid is packed into the high 16 bits of flags so the rxctl side
- * can demultiplex replies vs. unrelated events.
+ * reqid goes in the high 16 bits of flags, so the rxctl side
+ * can tell replies from unrelated events.
  */
 size_t
 brcm_proto_bcdc_pack(uint16_t reqid, uint32_t cmd, uint32_t flags,
@@ -177,14 +180,15 @@ brcm_proto_bcdc_pack(uint16_t reqid, uint32_t cmd, uint32_t flags,
 }
 
 /*
- * Issue a BCDC GET dcmd and wait for the matching reply.  The reply
- * payload (after the 16-byte BCDC header the firmware echoes) is
- * copied into buf; *lenp updates to the actual length.  Returns 0 on
- * success or an errno on failure.
+ * Send a BCDC GET dcmd and wait for the matching reply. The
+ * reply payload (after the 16-byte BCDC header the firmware
+ * echoes) is copied into buf. *lenp updates to the real length.
+ * Returns 0 on success, errno on failure.
  *
- * The reply demultiplex happens in the bus transport: it parses
- * incoming control packets, looks them up by reqid in sc_ctl_pending,
- * and copies the payload into the matching req's reply_buf.
+ * The reply matching happens in the bus transport. It parses
+ * incoming control packets, looks them up by reqid in
+ * sc_ctl_pending, and copies the payload into the matching
+ * req's reply_buf.
  */
 int
 brcm_dcmd_get(struct brcm_softc *sc, uint32_t cmd, void *buf, size_t *lenp)
@@ -197,11 +201,11 @@ brcm_dcmd_get(struct brcm_softc *sc, uint32_t cmd, void *buf, size_t *lenp)
 	int error;
 
 	/*
-	 * Transports that own their own command protocol (PCIe MSGBUF
-	 * for the BCM4360 / BCM43602 / BCM4366 family) install a
-	 * bs_dcmd_get hook on the bus_ops vtable and bypass the
-	 * BCDC + sc_ctl_pending machinery below.  USB leaves the slot
-	 * NULL and uses the in-core BCDC path.
+	 * Transports with their own command protocol (PCIe MSGBUF
+	 * for BCM4360 / BCM43602 / BCM4366) install a bs_dcmd_get
+	 * hook on the bus_ops table and skip the BCDC +
+	 * sc_ctl_pending code below. USB leaves the slot NULL and
+	 * uses the in-core BCDC path.
 	 */
 	if (sc->sc_bus_ops->bs_dcmd_get != NULL)
 		return (sc->sc_bus_ops->bs_dcmd_get(sc, cmd, buf, lenp));
@@ -239,11 +243,12 @@ brcm_dcmd_get(struct brcm_softc *sc, uint32_t cmd, void *buf, size_t *lenp)
 		goto out;
 
 	/*
-	 * Wait for the rxctl path to mark req.done.  Timeout is generous
-	 * (2 seconds) since dcmd round-trips on USB are usually < 50 ms
-	 * but can stall during firmware boot.  Detach wakes every entry
-	 * on sc_ctl_pending so a dying transport breaks the sleep
-	 * immediately rather than running out the 2 s timeout.
+	 * Wait for the rxctl path to mark req.done. Timeout is
+	 * generous (2 seconds) since dcmd round-trips on USB are
+	 * usually < 50 ms, but can stall during firmware boot.
+	 * Detach wakes every entry on sc_ctl_pending so a dying
+	 * transport breaks the sleep right away instead of running
+	 * out the 2 s timeout.
 	 */
 	mtx_lock(&sc->sc_ctl_mtx);
 	while (!req.done && !sc->sc_dying) {
@@ -282,7 +287,7 @@ brcm_dcmd_set(struct brcm_softc *sc, uint32_t cmd, const void *buf, size_t len)
 	size_t framelen;
 	int error;
 
-	/* See banner on brcm_dcmd_get for the rationale. */
+	/* See banner on brcm_dcmd_get for the reason. */
 	if (sc->sc_bus_ops->bs_dcmd_set != NULL)
 		return (sc->sc_bus_ops->bs_dcmd_set(sc, cmd, buf, len));
 
@@ -339,8 +344,8 @@ out:
 }
 
 /*
- * IOVAR get/set are convenience wrappers around dcmd GET_VAR /
- * SET_VAR (262 / 263).  Payload layout is NUL-terminated iovar name
+ * IOVAR get/set are wrappers around dcmd GET_VAR / SET_VAR
+ * (262 / 263). Payload is the NUL-terminated iovar name
  * followed by the value.
  */
 int
@@ -354,11 +359,11 @@ brcm_iovar_get(struct brcm_softc *sc, const char *name, void *buf, size_t *lenp)
 		return (EINVAL);
 
 	/*
-	 * MSGBUF chips have no chip-side iovar string table; the
-	 * transport translates `name` to a numeric ID against its own
-	 * fwil-style table.  ENOENT means "name not in my table" and
-	 * lets us fall through to the BCDC dcmd-shaped path below
-	 * (still useful for iovars we haven't catalogued numerically).
+	 * MSGBUF chips have no chip-side iovar string table. The
+	 * transport turns `name` into a numeric ID with its own
+	 * fwil-style table. ENOENT means "name not in my table"
+	 * and lets us fall through to the BCDC dcmd-shaped path
+	 * below (still handy for iovars we have not numbered yet).
 	 */
 	if (sc->sc_bus_ops->bs_iovar_get != NULL) {
 		error = sc->sc_bus_ops->bs_iovar_get(sc, name, buf, lenp);
@@ -395,7 +400,7 @@ brcm_iovar_set(struct brcm_softc *sc, const char *name, const void *buf,
 	if (name == NULL)
 		return (EINVAL);
 
-	/* See banner on brcm_iovar_get for the fallback rationale. */
+	/* See banner on brcm_iovar_get for the fallback reason. */
 	if (sc->sc_bus_ops->bs_iovar_set != NULL) {
 		error = sc->sc_bus_ops->bs_iovar_set(sc, name, buf, len);
 		if (error != ENOENT)
@@ -415,11 +420,12 @@ brcm_iovar_set(struct brcm_softc *sc, const char *name, const void *buf,
 }
 
 /*
- * Variant of brcm_iovar_get that lets the caller append `plen` bytes
- * of params after the iovar name, then fetches up to `*lenp` bytes of
- * reply.  Used by sup_dump (and any other patched iovar that wants
- * input params): the chip's iovar dispatcher only forwards bytes
- * AFTER the name into the handler's params buffer.
+ * Variant of brcm_iovar_get. Lets the caller append `plen`
+ * bytes of params after the iovar name, then fetches up to
+ * `*lenp` bytes of reply. Used by sup_dump (and any other
+ * patched iovar that wants input params). The chip's iovar
+ * dispatcher only forwards bytes AFTER the name into the
+ * handler's params buffer.
  */
 int
 brcm_iovar_get_with_params(struct brcm_softc *sc, const char *name,
@@ -454,11 +460,11 @@ brcm_iovar_get_with_params(struct brcm_softc *sc, const char *name,
 }
 
 /*
- * RXCTL dispatch.  Called by the transport when a BCDC control reply
- * arrives.  Strips the dcmd header, matches reqid, copies payload to
- * the waiting request and wakes the caller.  Replies that do not
- * match an outstanding reqid are silently dropped (they're typically
- * events the transport is routing through the wrong path).
+ * RXCTL dispatch. The transport calls this when a BCDC control
+ * reply arrives. Strips the dcmd header, matches reqid, copies
+ * payload to the waiting request, and wakes the caller. Replies
+ * that do not match an open reqid are silently dropped. Usually
+ * they are events the transport routed through the wrong path.
  */
 void
 brcm_rxctl(struct brcm_softc *sc, const void *buf, size_t len)
@@ -477,9 +483,10 @@ brcm_rxctl(struct brcm_softc *sc, const void *buf, size_t len)
 	payload_len = len - sizeof(hdr);
 
 	/*
-	 * reqid 0 is reserved for async events (firmware emits them with
-	 * id 0 in this slot).  Refusing to match it keeps our first dcmd
-	 * (id 1) from ever colliding with an event that races in at boot.
+	 * reqid 0 is reserved for async events (firmware sends
+	 * them with id 0 in this slot). Refusing to match it keeps
+	 * our first dcmd (id 1) from ever hitting an event that
+	 * races in at boot.
 	 */
 	if (reqid == 0)
 		return;
@@ -505,16 +512,18 @@ brcm_rxctl(struct brcm_softc *sc, const void *buf, size_t len)
 }
 
 /*
- * Walk a firmware-supplied IE blob and populate the IE-pointer fields
- * of an ieee80211_scanparams.  Same shape as ieee80211_parse_beacon's
- * IE switch, but operates on a raw byte range — no mbuf, no node, no
- * IEEE80211_DISCARD logging.  Caller must zero `sp` first.
+ * Walk a firmware-supplied IE blob and fill the IE-pointer
+ * fields of an ieee80211_scanparams. Same shape as
+ * ieee80211_parse_beacon's IE switch, but works on a raw byte
+ * range. No mbuf, no node, no IEEE80211_DISCARD logging. The
+ * caller must zero `sp` first.
  *
- * Stack budget on aarch64 is ~16 KB.  Going through ieee80211_input ->
- * sta_recv_mgmt -> ieee80211_parse_beacon costs ~3 frames and ~1 KB
- * of locals per call.  We're invoked once per BSS inside a per-event
- * loop, so trimming that fat is required for sustained scans not to
- * overflow the kthread stack.  See project_brcm_net80211_phase1c.
+ * Stack budget on aarch64 is ~16 KB. Going through
+ * ieee80211_input -> sta_recv_mgmt -> ieee80211_parse_beacon
+ * costs ~3 frames and ~1 KB of locals per call. We are called
+ * once per BSS in a per-event loop, so trimming that fat is
+ * needed to keep long scans from overflowing the kthread
+ * stack. See project_brcm_net80211_phase1c.
  */
 static void
 brcm_walk_ies(const uint8_t *ies, size_t ies_len,

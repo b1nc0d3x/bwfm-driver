@@ -3,7 +3,7 @@
  *
  * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
  *
- * Broadcom PCIe MSGBUF protocol implementation.  Native FreeBSD.
+ * Broadcom PCIe MSGBUF protocol code. Native FreeBSD.
  *
  * First-light scope (DCMD round-trip only):
  *   - init_share_ram_info (read shared struct in TCM)
@@ -11,14 +11,15 @@
  *   - init_scratchbuffers (D2H scratch + ringupd)
  *   - post 1 IOCTLRESP_BUF into H2D_CONTROL_SUBMIT
  *   - DCMD tx: IOCTLPTR_REQ into H2D_CONTROL_SUBMIT + doorbell
- *   - ISR: read MAILBOXINT, drain D2H_CONTROL_COMPLETE, wake DCMD waiter
+ *   - ISR: read MAILBOXINT, drain D2H_CONTROL_COMPLETE, wake
+ *     the DCMD waiter
  *
  * Deferred (not in this file yet):
  *   - flowrings (TX path)
  *   - RXPOST_SUBMIT / RX_COMPLETE (data-plane RX)
  *   - Event dispatch (WL_EVENT)
  *   - Console log reader
- *   - DMA index optimization (using TCM indices for first light)
+ *   - DMA index optimization (uses TCM indices for first light)
  */
 
 #include <sys/param.h>
@@ -56,8 +57,9 @@
 #define	BAR2H(mb)	brcm_pci_msgbuf_bar2_handle((mb)->sc)
 
 /*
- * Silent-by-default trace print.  Gated on the shared sc_debug just
- * like DPRINTF() in brcmvar.h.  level==0 fires when sc_debug > 0.
+ * Silent-by-default trace print. Gated on the shared sc_debug
+ * just like DPRINTF() in brcmvar.h. level==0 fires when
+ * sc_debug > 0.
  */
 #define	MDPRINTF(mb, level, ...)	do {				\
 	if (DBG(mb) > (level))						\
@@ -67,7 +69,7 @@
 #define	MSGBUF_IOCTL_RESP_TIMEOUT_MS	2000
 
 /* -----------------------------------------------------------------
- * TCM (BAR2) helpers — no window movement needed (BAR2 is direct).
+ * TCM (BAR2) helpers. No window movement needed (BAR2 is direct).
  * ----------------------------------------------------------------- */
 static inline uint8_t
 tcm_read8(struct brcm_pci_msgbuf *mb, uint32_t off)
