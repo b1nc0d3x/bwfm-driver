@@ -5,25 +5,27 @@
  *
  * Broadcom FullMAC USB transport glue for brcm.
  *
- * Life cycle (BCM43236 example):
- *   1. uhub matches us via STRUCT_USB_HOST_ID. probe accepts iface 0.
- *   2. attach() finds the bulk-IN / bulk-OUT endpoints, sets up
- *      the usb_xfer slots, then sends DL_GETVER to read the
- *      boot ROM.
- *   3. If the chip reports BRCM_POSTBOOT_ID, firmware is
- *      already running. We jump right to brcm_attach() to wire
- *      up net80211.
- *   4. Otherwise we look up the chip in brcm_chip_table, fetch
- *      the firmware(9) blob, push it through DL_START / chunked
- *      bulk-OUT / DL_GO, then poll DL_GETVER until
- *      BRCM_POSTBOOT_ID shows up. Finally we call brcm_attach().
+ * Lifecycle (BCM43236 example):
+ *   1. uhub matches us via STRUCT_USB_HOST_ID; probe accepts iface 0.
+ *   2. attach() discovers bulk-IN / bulk-OUT endpoints, sets up the
+ *      usb_xfer slots, then issues DL_GETVER to read the boot ROM.
+ *   3. If the chip reports BRCM_POSTBOOT_ID, firmware already runs and
+ *      we jump straight to brcm_attach() to wire net80211.
+ *   4. Otherwise we look up the chip in brcm_chip_table, fetch the
+ *      firmware(9) blob, push it through DL_START / chunked bulk-OUT /
+ *      DL_GO, then poll DL_GETVER until BRCM_POSTBOOT_ID appears.
+ *      Finally we call brcm_attach().
  *
  * Bus ops:
  *   bs_txctl   USB vendor-class control OUT (bmReq 0x21, bReq 0)
- *   bs_rxctl   Drained by the dedicated EP0-pump kthread. The
- *              core owns the wakeup/match logic via brcm_rxctl().
+ *   bs_rxctl   Drained by the dedicated EP0-pump kthread; the core
+ *              owns the wakeup/match logic via brcm_rxctl().
  *   bs_txdata  Bulk-OUT pipe (post-boot data path).
  *   bs_stop    Wakes the kthread, then unsets transfers.
+ *
+ * The download protocol and the control-pipe requests follow OpenBSD's
+ * sys/dev/usb/if_bwfm_usb.c (Patrick Wildt) and Linux brcmfmac usb.c
+ * (Broadcom); the code was written for this driver.
  */
 
 #include <sys/param.h>
@@ -63,11 +65,11 @@
 /*
  * USB transfer slots.
  *
- * BRCM_BULK_DL_OUT is used only during firmware download. Once
- * the chip is running, it is basically idle. BRCM_BULK_TX_OUT
- * carries post-boot data frames. BRCM_BULK_RX_IN feeds events
- * + data frames into brcm_rx_frame(). BRCM_INT_IN is
- * informational dongle status (8 bytes). We count and ignore.
+ * BRCM_BULK_DL_OUT is used during the firmware download phase only;
+ * once the chip is running it's effectively idle.  BRCM_BULK_TX_OUT
+ * carries post-boot data frames.  BRCM_BULK_RX_IN feeds events +
+ * data frames into brcm_rx_frame().  BRCM_INT_IN is informational
+ * dongle status (8 bytes); we count + ignore.
  */
 enum {
 	BRCM_BULK_DL_OUT,
@@ -81,33 +83,33 @@ enum {
 #define	BRCM_CTL_REPLY_MAX	4096
 
 /*
- * Per-mbuf TX queue node. The caller's mbufs are wrapped in
- * one of these so the bulk-OUT callback can dequeue, ship, and
- * free them in its own context without touching the original
- * net80211 caller.
+ * Per-mbuf TX queue node.  Caller-provided mbufs are wrapped into one
+ * of these so the bulk-OUT callback can dequeue + ship + free in its
+ * own context without referencing the original net80211 caller.
  */
 struct brcm_tx_pending {
-	STAILQ_ENTRY(brcm_tx_pending)	link;
-	struct mbuf			*m;
+	STAILQ_ENTRY(brcm_tx_pending)	link;	/* queue linkage */
+	struct mbuf			*m;	/* the frame to send */
 };
 STAILQ_HEAD(brcm_tx_queue, brcm_tx_pending);
 
 /*
- * Per-USB-attach state. Puts a brcm_softc as its first member,
- * so the core can find us with container_of-style casts. The
- * core itself only sees a struct brcm_softc *.
+ * Per-USB-attach state.  Embeds a brcm_softc as its first member so
+ * the core can recover us via container_of-style casts (the core
+ * itself only sees a struct brcm_softc *).
  */
 struct brcm_usb_softc {
-	struct brcm_softc	 bus_sc;
-	struct usb_device	*sc_udev;
-	struct usb_xfer		*sc_xfer[BRCM_N_XFER];
-	struct proc		*sc_ctlrx_proc;
-	uint8_t			 sc_iface_index;
-	uint8_t			 sc_rx_ep;
-	uint8_t			 sc_tx_ep;
+	struct brcm_softc	 bus_sc;	/* shared core state (first member) */
+	struct usb_device	*sc_udev;	/* USB device handle */
+	struct usb_xfer		*sc_xfer[BRCM_N_XFER];	/* USB transfer slots */
+	struct proc		*sc_ctlrx_proc;	/* control-read thread */
+	u_int			 sc_ctl_want;	/* sent, reply not yet read */
+	uint8_t			 sc_iface_index;	/* USB interface number */
+	uint8_t			 sc_rx_ep;	/* bulk-in endpoint */
+	uint8_t			 sc_tx_ep;	/* bulk-out endpoint */
 
-	struct brcm_tx_queue	 sc_tx_q;
-	bool			 sc_tx_running;
+	struct brcm_tx_queue	 sc_tx_q;	/* frames waiting to send */
+	bool			 sc_tx_running;	/* true while the tx pipe is busy */
 
 	/* Firmware download cursor (DL phase only). */
 	const uint8_t		*sc_dl_buf;
@@ -200,11 +202,11 @@ static const struct usb_config brcm_usb_config[BRCM_N_XFER] = {
 };
 
 /*
- * Endpoint discovery. The boot-ROM-mode interface has 2 bulk
- * endpoints (one IN, one OUT). After firmware boot, the same
- * two endpoints carry post-boot data. Some images show 4
- * endpoints (separate RX/TX for data vs. firmware download).
- * We treat the first matching pair as the main bulk pipes.
+ * Endpoint discovery.  The boot-ROM-mode interface has 2 bulk
+ * endpoints (one IN, one OUT); after firmware boot the same two
+ * endpoints carry post-boot data.  Some images expose 4 endpoints
+ * (separate RX/TX for data vs. firmware download); we treat the
+ * first matching pair as the canonical bulk pipes.
  */
 static int
 brcm_usb_enumerate_endpoints(struct brcm_usb_softc *sc,
@@ -213,13 +215,13 @@ brcm_usb_enumerate_endpoints(struct brcm_usb_softc *sc,
 	struct usb_endpoint_descriptor *ed;
 
 	/*
-	 * Walk every endpoint descriptor in the interface and
-	 * record the first bulk-IN and bulk-OUT addresses.
+	 * Walk every endpoint descriptor in the interface and record
+	 * the first bulk-IN and bulk-OUT addresses.
 	 *
-	 * usbd_find_descriptor's subtype filter checks offset-2 of
-	 * the descriptor. For endpoint descriptors that byte is
-	 * bEndpointAddress, not bmAttributes. So we cannot filter
-	 * by transfer type via the subtype mask. Skip the filter
+	 * usbd_find_descriptor's subtype filter compares offset-2 of
+	 * the descriptor — for endpoint descriptors that byte is
+	 * bEndpointAddress, not bmAttributes — so we cannot filter
+	 * by transfer type via the subtype mask.  Skip the filter
 	 * and check bmAttributes ourselves.
 	 */
 	ed = NULL;
@@ -245,10 +247,9 @@ brcm_usb_enumerate_endpoints(struct brcm_usb_softc *sc,
 }
 
 /*
- * Vendor-defined boot-ROM control request. All boot-ROM
- * commands share this shape: bmRequestType = 0xc0
- * (device->host vendor iface), bRequest = cmd, payload of
- * `len` bytes. Synchronous.
+ * Vendor-defined boot-ROM control request.  All boot-ROM commands
+ * share this shape: bmRequestType = 0xc0 (device->host vendor iface),
+ * bRequest = cmd, payload of `len` bytes.  Synchronous.
  */
 static int
 brcm_usb_dl_cmd(struct brcm_usb_softc *sc, uint8_t cmd, void *buf, int len)
@@ -275,10 +276,9 @@ brcm_usb_dl_cmd(struct brcm_usb_softc *sc, uint8_t cmd, void *buf, int len)
 }
 
 /*
- * DL bulk-OUT callback. Drives the firmware download cursor.
- * Each SETUP pulls the next chunk from sc->sc_dl_buf. When
- * the last chunk has been sent, we set sc_dl_done and wake
- * the loader.
+ * DL bulk-OUT callback.  Drives the firmware download cursor: each
+ * SETUP transition pulls the next chunk from sc->sc_dl_buf; when the
+ * last chunk has been sent we set sc_dl_done and wake the loader.
  */
 static void
 brcm_usb_dl_cb(struct usb_xfer *xfer, usb_error_t error)
@@ -319,9 +319,9 @@ brcm_usb_dl_cb(struct usb_xfer *xfer, usb_error_t error)
 /*
  * Push a TRX-wrapped firmware image into the boot ROM:
  *   1. DL_START -> chip enters DL_WAITING
- *   2. chunked bulk-OUT writes until the image is in
+ *   2. chunked bulk-OUT writes until image is in
  *   3. DL_GETSTATE confirms DL_RUNNABLE
- *   4. DL_GO hands control to the loaded image
+ *   4. DL_GO transfers control to the loaded image
  */
 static int
 brcm_usb_load_firmware(struct brcm_usb_softc *sc, const uint8_t *ucode,
@@ -382,6 +382,7 @@ brcm_usb_load_firmware(struct brcm_usb_softc *sc, const uint8_t *ucode,
 	return (brcm_usb_dl_cmd(sc, BRCM_DL_GO, &state, sizeof(state)));
 }
 
+/* read the boot ROM version from the chip */
 static int
 brcm_usb_read_bootrom(struct brcm_usb_softc *sc)
 {
@@ -391,15 +392,15 @@ brcm_usb_read_bootrom(struct brcm_usb_softc *sc)
 }
 
 /*
- * Bulk-IN callback. Pulls full frames out of the pipe and
- * hands them to the brcm core via brcm_rx_frame(). Resubmits
- * every time so the pipe keeps draining.
+ * Bulk-IN callback.  Pulls full frames out of the pipe and hands them
+ * to the brcm core via brcm_rx_frame().  Resubmits unconditionally so
+ * the pipe keeps draining.
  *
- * The USB framework calls us with sc_mtx held. brcm_rx_frame
- * may call ieee80211_input_all, which takes net80211 locks and
- * can re-enter the driver. Drop sc_mtx for the duration of the
- * input call (run(4) pattern) and re-acquire before falling
- * through to usbd_transfer_submit.
+ * The USB framework invokes us with sc_mtx held; brcm_rx_frame may
+ * call ieee80211_input_all which takes net80211 locks and can
+ * re-enter the driver.  Drop sc_mtx for the duration of the input
+ * call (run(4) pattern) and re-acquire before falling through to
+ * usbd_transfer_submit.
  */
 static void
 brcm_usb_bulk_rx_cb(struct usb_xfer *xfer, usb_error_t error)
@@ -440,11 +441,11 @@ resubmit:
 }
 
 /*
- * Bulk-OUT data callback. bs_txdata enqueues mbufs on sc_tx_q
- * and kicks the xfer. On each callback we dequeue one mbuf,
- * put the 4-byte BCDC data header on the front, copy the mbuf
- * payload in, submit, and free the mbuf. sc_mtx protects it,
- * held by the USB framework when the callback fires.
+ * Bulk-OUT data callback.  bs_txdata enqueues mbufs onto sc_tx_q and
+ * kicks the xfer; on each callback we dequeue one mbuf, prepend the
+ * 4-byte BCDC data header, copy the mbuf payload in, submit, and
+ * free the mbuf.  Synchronisation is via sc_mtx, which the USB
+ * framework holds when the callback fires.
  */
 static void
 brcm_usb_bulk_tx_cb(struct usb_xfer *xfer, usb_error_t error)
@@ -503,6 +504,7 @@ tr_setup_tx:
 	}
 }
 
+/* count status pulses on the interrupt endpoint */
 static void
 brcm_usb_int_in_cb(struct usb_xfer *xfer, usb_error_t error)
 {
@@ -524,12 +526,11 @@ brcm_usb_int_in_cb(struct usb_xfer *xfer, usb_error_t error)
 }
 
 /*
- * EP0 control-IN pump. Loops on UT_READ_CLASS_INTERFACE
- * bRequest 1 pulls (the way the chip sends BCDC replies on
- * USB) and passes each response into brcm_rxctl() for reqid
- * matching. Exits on sc_dying. Clears sc_ctlrx_proc and wakes
- * anyone waiting for the thread to exit (the detach / fail
- * teardown path).
+ * EP0 control-IN pump.  Loops on UT_READ_CLASS_INTERFACE bRequest 1
+ * pulls (the way the chip emits BCDC replies on USB) and shuttles
+ * each response into brcm_rxctl() for reqid demultiplex.  Exits on
+ * sc_dying; clears sc_ctlrx_proc and wakes anyone waiting for the
+ * thread to exit (the detach / fail teardown path).
  */
 static void
 brcm_usb_ctlrx_thread(void *arg)
@@ -541,6 +542,27 @@ brcm_usb_ctlrx_thread(void *arg)
 	usb_error_t err;
 
 	while (!sc->bus_sc.sc_dying) {
+		/*
+		 * Read only while a sent command is waiting for its reply.
+		 * A read kept pending on the control pipe holds the
+		 * device's control lock, so each command's control write
+		 * queues behind it, often for several rounds.  That makes
+		 * a dcmd take seconds and the join sequence long enough
+		 * for wpa_supplicant's 10 s authentication timeout to
+		 * expire before the firmware joins.
+		 */
+		mtx_lock(&sc->bus_sc.sc_ctl_mtx);
+		while (sc->sc_ctl_want == 0 && !sc->bus_sc.sc_dying)
+			mtx_sleep(&sc->sc_ctl_want, &sc->bus_sc.sc_ctl_mtx,
+			    0, "brcmcti", hz / 2);
+		if (TAILQ_EMPTY(&sc->bus_sc.sc_ctl_pending))
+			sc->sc_ctl_want = 0;	/* waiter gave up */
+		mtx_unlock(&sc->bus_sc.sc_ctl_mtx);
+		if (sc->bus_sc.sc_dying)
+			break;
+		if (sc->sc_ctl_want == 0)
+			continue;
+
 		req.bmRequestType = UT_READ_CLASS_INTERFACE;
 		req.bRequest = 1;
 		USETW(req.wValue, 0);
@@ -557,8 +579,13 @@ brcm_usb_ctlrx_thread(void *arg)
 			pause("brcmctl", hz / 10);
 			continue;
 		}
-		if (actlen >= sizeof(struct brcm_bcdc_dcmd))
+		if (actlen >= sizeof(struct brcm_bcdc_dcmd)) {
 			brcm_rxctl(&sc->bus_sc, buf, actlen);
+			mtx_lock(&sc->bus_sc.sc_ctl_mtx);
+			if (sc->sc_ctl_want > 0)
+				sc->sc_ctl_want--;
+			mtx_unlock(&sc->bus_sc.sc_ctl_mtx);
+		}
 	}
 
 	mtx_lock(&sc->bus_sc.sc_mtx);
@@ -589,20 +616,24 @@ brcm_usb_bs_txctl(struct brcm_softc *bsc, const void *buf, size_t len)
 		DPRINTF(bsc, 0, "txctl failed: %s\n", usbd_errstr(err));
 		return (EIO);
 	}
+	mtx_lock(&bsc->sc_ctl_mtx);
+	sc->sc_ctl_want++;
+	wakeup(&sc->sc_ctl_want);
+	mtx_unlock(&bsc->sc_ctl_mtx);
 	return (0);
 }
 
+/* unused: replies arrive via the control-read thread */
 static int
 brcm_usb_bs_rxctl(struct brcm_softc *bsc, void *buf, size_t *lenp,
     int timeout_ms)
 {
 	/*
-	 * Not used by the core today. The ctlrx kthread
-	 * (brcm_usb_ctlrx_thread) calls brcm_rxctl() directly with
-	 * each incoming reply, and brcm_dcmd_get() waits on the
-	 * per-request sleep channel. Stub kept so the vtable shape
-	 * does not change if a future SDIO / PCIe transport wants
-	 * caller-pulled rxctl.
+	 * Not used by the core: the ctlrx kthread
+	 * (brcm_usb_ctlrx_thread) calls brcm_rxctl() directly with each
+	 * incoming reply, and brcm_dcmd_get() waits on the per-request
+	 * sleep channel.  The stub keeps the vtable shape the same for
+	 * transports that prefer a caller-pulled rxctl.
 	 */
 	(void)bsc;
 	(void)buf;
@@ -611,12 +642,20 @@ brcm_usb_bs_rxctl(struct brcm_softc *bsc, void *buf, size_t *lenp,
 	return (ENOTSUP);
 }
 
+/* queue a data frame to send */
 static int
 brcm_usb_bs_txdata(struct brcm_softc *bsc, struct mbuf *m)
 {
 	struct brcm_usb_softc *sc = SC_TO_USB(bsc);
 	struct brcm_tx_pending *p;
+	int err;
 
+	/* 802.11 from net80211 -> 802.3 for the firmware; see brcm.c. */
+	if ((err = brcm_deencap_80211(&m)) != 0) {
+		if (m != NULL)
+			m_freem(m);
+		return (err == EAGAIN ? 0 : err);	/* EAGAIN: mgmt, dropped */
+	}
 	p = malloc(sizeof(*p), M_BRCM, M_NOWAIT);
 	if (p == NULL) {
 		m_freem(m);
@@ -639,25 +678,24 @@ brcm_usb_bs_txdata(struct brcm_softc *bsc, struct mbuf *m)
 }
 
 /*
- * Shared teardown. Called from the attach `fail:` label after
- * kproc_create has succeeded, and from device_detach. Both
- * paths see the same half-set-up state on entry, so the same
- * unwind order walks them safely:
+ * Shared teardown.  Called from the attach `fail:` label after
+ * kproc_create has succeeded and from device_detach.  Both paths see
+ * the same partially-initialised state on entry, so the same unwind
+ * sequence walks them safely:
  *
- *   1. Set sc_dying so the ctlrx thread breaks out of its read
- *      loop and dcmd callers stop starting new requests.
- *   2. Wake every sleeper on sc_ctl_pending so dcmd waiters
- *      exit with a harmless error instead of hanging on a
- *      mutex we are about to destroy.
- *   3. Wait (msleep, not pause-poll) for the ctlrx thread to
- *      set sc_ctlrx_proc = NULL and wake us.
- *   4. usbd_transfer_unsetup drains bulk-RX / bulk-TX / INT
- *      callbacks. After it returns, no more callbacks fire, so
- *      it is safe to drain any tasks they queued.
+ *   1. Set sc_dying so the ctlrx thread breaks out of its read loop
+ *      and so dcmd callers stop arming new requests.
+ *   2. Wake every sleeper on sc_ctl_pending so dcmd waiters exit with
+ *      a benign error instead of dangling on a mutex we're about to
+ *      destroy.
+ *   3. Wait (msleep, not pause-poll) for the ctlrx thread to set
+ *      sc_ctlrx_proc = NULL and wake us.
+ *   4. usbd_transfer_unsetup drains bulk-RX / bulk-TX / INT callbacks
+ *      — once it returns, no more callbacks will fire so it is safe
+ *      to drain any tasks they enqueued.
  *   5. taskqueue_drain scan_done + link.
- *   6. ieee80211_ifdetach after callbacks + tasks are quiet.
- *      Same order as run(4) / rsu(4): kill the wire first,
- *      then net80211.
+ *   6. ieee80211_ifdetach after callbacks + tasks are quiesced; this
+ *      mirrors run(4) / rsu(4): kill the wire first, then net80211.
  *   7. mtx_destroy after all sleepers are gone.
  */
 static void
@@ -665,25 +703,18 @@ brcm_usb_teardown(struct brcm_usb_softc *sc)
 {
 	struct brcm_softc *bsc = &sc->bus_sc;
 
-	bsc->sc_dying = true;
+	/*
+	 * Common prologue, shared with SDIO and PCIe in brcm.c: set
+	 * sc_dying, wake ctl_pending waiters, drain in_flight_dcmd,
+	 * drain the scan_done and link tasks, ieee80211_ifdetach.
+	 */
+	brcm_transport_teardown(bsc);
 
-	if (mtx_initialized(&bsc->sc_ctl_mtx)) {
-		struct brcm_ctl_req *r;
-
-		mtx_lock(&bsc->sc_ctl_mtx);
-		TAILQ_FOREACH(r, &bsc->sc_ctl_pending, link)
-			wakeup(r);
-		/*
-		 * Wait for sysctl handlers etc. that are blocked
-		 * inside a dcmd to bail through the sc_dying check
-		 * before we destroy the mutex they sleep on.
-		 */
-		while (bsc->sc_in_flight_dcmd != 0)
-			(void)mtx_sleep(&bsc->sc_in_flight_dcmd,
-			    &bsc->sc_ctl_mtx, 0, "brcmdcd", hz);
-		mtx_unlock(&bsc->sc_ctl_mtx);
-	}
-
+	/*
+	 * USB-specific: drain the control-RX ithread proc that owns
+	 * the bulk-in xfer.  Must run before usbd_transfer_unsetup so
+	 * we don't tear the xfer out from under an in-flight callback.
+	 */
 	if (mtx_initialized(&bsc->sc_mtx)) {
 		mtx_lock(&bsc->sc_mtx);
 		while (sc->sc_ctlrx_proc != NULL)
@@ -695,15 +726,7 @@ brcm_usb_teardown(struct brcm_usb_softc *sc)
 	if (sc->sc_xfer[0] != NULL)
 		usbd_transfer_unsetup(sc->sc_xfer, BRCM_N_XFER);
 
-	taskqueue_drain(taskqueue_thread, &bsc->sc_scan_done_task);
-	taskqueue_drain(taskqueue_thread, &bsc->sc_link_task);
-
-	if (bsc->sc_ic_attached) {
-		ieee80211_ifdetach(&bsc->sc_ic);
-		bsc->sc_ic_attached = false;
-	}
-
-	/* Free any TX mbufs still queued. xfer is already shut down. */
+	/* Drain any TX mbufs still queued; xfer is already shut down. */
 	while (!STAILQ_EMPTY(&sc->sc_tx_q)) {
 		struct brcm_tx_pending *p = STAILQ_FIRST(&sc->sc_tx_q);
 
@@ -718,6 +741,7 @@ brcm_usb_teardown(struct brcm_usb_softc *sc)
 		mtx_destroy(&bsc->sc_mtx);
 }
 
+/* stop the device */
 static void
 brcm_usb_bs_stop(struct brcm_softc *bsc)
 {
@@ -742,6 +766,7 @@ brcm_usb_probe(device_t dev)
 	    sizeof(brcm_usb_devs), uaa));
 }
 
+/* set up the USB device and load firmware */
 static int
 brcm_usb_attach(device_t dev)
 {
@@ -762,10 +787,10 @@ brcm_usb_attach(device_t dev)
 	TAILQ_INIT(&bsc->sc_ctl_pending);
 	STAILQ_INIT(&sc->sc_tx_q);
 	/*
-	 * Start reqid at 1 so a fresh event frame with id 0 cannot
-	 * match our first open dcmd. Broadcom async events on EP0
-	 * usually carry id 0. A reqid-0 dcmd reply would otherwise
-	 * look the same as an event.
+	 * Start reqid at 1 so a freshly-arrived event frame with id 0
+	 * cannot be matched against our first outstanding dcmd.  Broadcom
+	 * async events on EP0 generally carry id 0; a reqid-0 dcmd reply
+	 * would otherwise be indistinguishable from an event.
 	 */
 	bsc->sc_bcdc_reqid = 1;
 
@@ -814,6 +839,13 @@ brcm_usb_attach(device_t dev)
 		device_printf(dev, "%s (chip 0x%04x rev %u)\n",
 		    bsc->sc_chip->desc, chip, chiprev);
 
+		/*
+		 * Record the firmware basename so brcm_runtime_iovars
+		 * can look up the matching CLM.
+		 */
+		strlcpy(bsc->sc_fw_basename, bsc->sc_chip->fwname,
+		    sizeof(bsc->sc_fw_basename));
+
 		fw = firmware_get(bsc->sc_chip->fwname);
 		if (fw == NULL) {
 			device_printf(dev,
@@ -827,7 +859,7 @@ brcm_usb_attach(device_t dev)
 		if (error != 0)
 			goto fail;
 
-		/* Poll for the post-boot marker. */
+		/* Poll for the post-boot sentinel. */
 		for (int i = 0; i < 20; i++) {
 			pause_sbt("brcmpb", SBT_1MS * 50, 0, 0);
 			memset(&bsc->sc_brom, 0, sizeof(bsc->sc_brom));
@@ -864,14 +896,42 @@ brcm_usb_attach(device_t dev)
 	mtx_unlock(&bsc->sc_mtx);
 
 	/*
-	 * Read MAC from the firmware before brcm_attach() uses it
-	 * for ieee80211_ifattach(). TODO: handle iovar failure
-	 * (needs live HW).
+	 * Read MAC out of the firmware before brcm_attach() consumes it
+	 * for ieee80211_ifattach().  iovar failure leaves bsc_macaddr as
+	 * zeros, which ieee80211_ifattach will treat as "device didn't
+	 * report" — acceptable degradation.
 	 */
 	{
 		size_t maclen = sizeof(bsc->sc_macaddr);
 		(void)brcm_iovar_get(bsc, "cur_etheraddr", bsc->sc_macaddr,
 		    &maclen);
+	}
+
+	/*
+	 * A chip that was already running firmware (the module reloaded
+	 * without a power cycle) skipped the bootrom lookup above, which
+	 * left sc_chip NULL and made the join encode chanspecs as D11AC.
+	 * The BCM43236 rejects those with BCME_BADCHAN.  Ask the
+	 * running firmware which chip it is: in brcmf_rev_info_le,
+	 * chiprev is word 3 and chipnum word 11.
+	 */
+	if (bsc->sc_chip == NULL) {
+		uint32_t rev[17];
+		size_t rlen = sizeof(rev);
+
+		memset(rev, 0, sizeof(rev));
+		if (brcm_dcmd_get(bsc, BRCM_C_GET_REVINFO, rev, &rlen) == 0 &&
+		    rlen >= 12 * sizeof(uint32_t)) {
+			chip = le32toh(rev[11]);
+			chiprev = le32toh(rev[3]);
+			bsc->sc_chip = brcm_chip_lookup(chip, chiprev);
+		}
+		device_printf(dev, "running firmware reports chip 0x%04x "
+		    "rev %u: %s\n", chip, chiprev,
+		    bsc->sc_chip != NULL ? bsc->sc_chip->desc : "unknown");
+		if (bsc->sc_chip != NULL)
+			strlcpy(bsc->sc_fw_basename, bsc->sc_chip->fwname,
+			    sizeof(bsc->sc_fw_basename));
 	}
 
 	error = brcm_attach(bsc);
@@ -887,6 +947,7 @@ fail:
 	return (error);
 }
 
+/* tear down the USB device */
 static int
 brcm_usb_detach(device_t dev)
 {

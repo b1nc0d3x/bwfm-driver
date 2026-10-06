@@ -1,6 +1,6 @@
-/* $FreeBSD$ */
-/* Adapted from NetBSD if_bwfm_sdio.c v1.30 (BSD/ISC licensed). */
-/*
+/*-
+ * SPDX-License-Identifier: ISC
+ *
  * Copyright (c) 2010-2016 Broadcom Corporation
  * Copyright (c) 2018 Patrick Wildt <patrick@blueri.se>
  *
@@ -18,31 +18,19 @@
  */
 
 /*
- * SDPCM (SDIO Packet Common Multiplexer) frame TX/RX for
- * Broadcom fullmac firmware. Sits between the iovar/BCDC layer
- * above and the raw SDIO CMD53 transport below.
+ * SDPCM, the framing Broadcom FullMAC firmware speaks over SDIO function 2.
+ * The frame structures come from NetBSD/OpenBSD if_bwfm_sdio.h (see
+ * brcm_sdpcm.h); the implementation was written for this driver.
  *
- * Where this port is at:
- *
- *  - Framing: hwhdr+swhdr build/parse, padding, seqnr. DONE.
- *  - F2 transport: STUB (brcm_sdpcm_f2_xfer). Wire to a CMD53
- *    helper that uses sdio_cmd53_byte with fn=2 once the F2
- *    sibling device_t plumbing is decided. See TODO in
- *    brcm_sdpcm_f2_xfer.
- *  - Control-response queue: small mbuf chain. Locks via sp_lock.
- *  - Event channel and data channel: NOT YET DONE. rx_frames
- *    parses swhdr->chanflag, but only the CONTROL channel has
- *    a real sink. EVENT and DATA frames are logged and dropped.
- *
- * Next chunks (best value first):
- *   1. Wire brcm_sdpcm_f2_xfer to the F2 sibling sdio_func
- *      device_t. Smoke-test by sending a hardcoded
- *      `cur_etheraddr` BCDC iovar and watching for a CONTROL
- *      response.
- *   2. Implement EVENT channel dispatch (forward to net80211
- *      once we have a net80211 binding).
- *   3. Implement DATA channel (mbuf in -> BCDC unwrap ->
- *      net80211 input).
+ * Every frame starts with a 4-byte hardware header (length and its
+ * complement) and an 8-byte software header (sequence number, channel,
+ * data offset, and the firmware's transmit credit).  Transmit builds
+ * control frames for dcmds and data frames with a BDC header, numbers
+ * them, and pads them to the F2 block rules.  Receive reads each frame in
+ * whole 32-bit words, takes the credit from it, and sorts it by channel:
+ * control replies onto a queue for the waiting dcmd, events to the event
+ * callback, data to the receive callback, and superframes (glom) split
+ * into their sub-frames.
  */
 
 #include <sys/cdefs.h>
@@ -61,7 +49,7 @@
 #include <sys/module.h>
 #include <sys/mutex.h>
 #include <sys/queue.h>
-#include <sys/socket.h>		/* struct sockaddr. pulled in by net/if.h */
+#include <sys/socket.h>		/* struct sockaddr — pulled by net/if.h */
 
 #include <net/if.h>
 #include <net/if_var.h>
@@ -77,23 +65,20 @@
 /* Forward to the existing softc layout. */
 struct brcm_sdio_softc;
 
-/*
- * Framing helpers
- * ---------------
- */
+/* Framing helpers. */
 
 /*
- * Compute the wire-padded length for a frame. SDPCM framing
- * rules (Linux brcmfmac sdio.c:2419):
- *   - if frame > programmed F2 blksize and not already a
- *     multiple, round up to a blksize multiple (block-mode
- *     CMD53 chunking)
- *   - else round up to 4 bytes (byte-mode CMD53)
+ * Compute the wire-padded length for a frame, following the SDPCM
+ * framing rule in Linux brcmfmac sdio.c:2419: a frame longer than the
+ * F2 block size that is not already a multiple of it is rounded up to
+ * a whole number of blocks (block-mode CMD53); anything else is rounded
+ * up to 4 bytes (byte-mode CMD53).
  *
- * blksize is per-state because Linux programs different values
- * for different chips (BCM43455 uses 256, BCM4356 uses 512).
- * Default 64 is set in brcm_sdpcm_alloc, but the caller should
- * override after the chip-specific F2 block size is programmed.
+ * The block size is per-state because Linux programs different values
+ * for different chips (256 for BCM4354/4356/4359, the 512 default for
+ * BCM43455; this driver uses 256 on BCM43455).  brcm_sdpcm_alloc sets
+ * a default of 64, which the caller overrides once the chip's F2 block
+ * size is programmed.
  */
 static __inline size_t
 brcm_sdpcm_padded_len(size_t len, uint16_t blksize)
@@ -104,12 +89,11 @@ brcm_sdpcm_padded_len(size_t len, uint16_t blksize)
 }
 
 /*
- * Build a CONTROL-channel frame in `buf` from `payload` of
- * length `len`. `buf` must hold at least
- * `brcm_sdpcm_padded_len(hdrlen + len)` bytes. Returns the
- * padded length written.
+ * Build a CONTROL-channel frame in `buf` from `payload` of length `len`.
+ * `buf` must hold at least `brcm_sdpcm_padded_len(hdrlen + len)` bytes.
+ * Returns the padded length written.
  *
- * Caller bumps tx_seq under sp_lock.
+ * Caller increments tx_seq under sp_lock.
  */
 static size_t
 brcm_sdpcm_build_ctrl(uint8_t *buf, size_t bufsz,
@@ -148,18 +132,16 @@ brcm_sdpcm_build_ctrl(uint8_t *buf, size_t bufsz,
 }
 
 /*
- * Validate the inbound hwhdr+swhdr. Returns 0 on success and
- * fills the out parameters.
+ * Validate the inbound hwhdr+swhdr.  Returns 0 on success and fills
+ * the out parameters.
  *
- * End-of-stream:
- *   - Linux/NetBSD chips send (frmlen=0, cksum=0). Checked
- *     FIRST (before the XOR check), because that pair fails
- *     XOR validation and would return EINVAL otherwise.
+ * The chip marks end-of-stream with frmlen=0, cksum=0 (ENOENT).  That
+ * pair fails the complement check, so it is recognised first.
  *
- * Header errors return EINVAL. Caller should drop + resync the
- * F2 stream. `buflen` is the size of the bounce buffer. We
- * treat framelen > buflen as broken, since rx_frames already
- * set up a frame-sized read.
+ * Header errors return EINVAL; the caller should drop the frame and
+ * resync the F2 stream.  `buflen` is the size of the bounce buffer; a
+ * framelen larger than that is malformed, since rx_frames already
+ * arranged for a frame-sized read.
  */
 static int
 brcm_sdpcm_parse_headers(const uint8_t *buf, size_t buflen,
@@ -177,11 +159,11 @@ brcm_sdpcm_parse_headers(const uint8_t *buf, size_t buflen,
 	framelen = le16toh(hwhdr->frmlen);
 	cksum    = le16toh(hwhdr->cksum);
 
-	/* End-of-stream: real chips send (0, 0). */
+	/* End-of-stream: the chip publishes (0, 0). */
 	if (framelen == 0 && cksum == 0)
 		return (ENOENT);
 
-	/* Quick check: frmlen ^ cksum should be 0xFFFF. */
+	/* Cheap sanity: frmlen ^ cksum should be 0xFFFF. */
 	if ((uint16_t)(framelen ^ cksum) != 0xffffu)
 		return (EINVAL);
 
@@ -200,16 +182,16 @@ brcm_sdpcm_parse_headers(const uint8_t *buf, size_t buflen,
 }
 
 /*
- * F2 transport. Direct CMD53 against the F2 sdio_func device_t.
- * Both TX and RX of SDPCM frames go through SDIO function 2.
- * The brcm_sdio_f2 sibling driver in if_brcm_sdio.c plumbs the
- * F2 device_t. The caller passes it in.
+ * F2 transport: CMD53 directly against the F2 sdio_func device_t.
+ * SDPCM frames go both ways through SDIO function 2.  The F2 device_t
+ * comes from the brcm_sdio_f2 sibling driver in if_brcm_sdio.c and is
+ * passed in by the caller.
  *
- * F2 is a fixed-address FIFO. CMD53 must use incr=false (Linux
- * brcmfmac/bcmsdh.c:347 explicitly skips addr-increment for
- * func != 1). If you pass incr=true, FreeBSD's sdio_write_multi
- * steps `addr` by 512 per chunk, and the chip-side router reads
- * that as separate backplane offsets, so the frame is lost.
+ * F2 is a fixed-address FIFO, so CMD53 must use incr=false (Linux
+ * brcmfmac/bcmsdh.c:347 skips address increment for func != 1).  With
+ * incr=true, FreeBSD's sdio_write_multi steps `addr` by 512 per chunk,
+ * the chip treats each chunk as a separate backplane offset, and the
+ * frame is lost.
  */
 static int
 brcm_sdpcm_f2_xfer(device_t f2_dev, uint32_t addr,
@@ -222,23 +204,19 @@ brcm_sdpcm_f2_xfer(device_t f2_dev, uint32_t addr,
 	return (sdio_read_multi(f2_dev, addr, buf, len, false));
 }
 
-/*
- * Public API
- * ----------
- */
+/* Public API. */
 
 static MALLOC_DEFINE(M_BRCM_SDPCM, "brcm_sdpcm", "Broadcom SDPCM state");
 
 /*
- * Allocate a fresh brcm_sdpcm_state with mtx_init'd lock and
- * zeroed sequence counters. Never returns NULL (M_WAITOK). The
- * caller must call brcm_sdpcm_free at detach.
+ * Allocate a fresh brcm_sdpcm_state with mtx_init'd lock and zeroed
+ * sequence counters.  Never returns NULL (M_WAITOK).  Caller is
+ * responsible for calling brcm_sdpcm_free at detach.
  *
- * f2_addr is the SDIO function-2 byte address used in CMD53
- * (usually 0x8000: backplane offset 0 with
- * SBSDIO_SB_ACCESS_2_4B_FLAG). f2_blksize is the F2 block size
- * programmed in CCCR, used by the padding rule. Pass 0 to use
- * the safe 64-byte default.
+ * f2_addr is the SDIO function-2 byte address used in CMD53 (typically
+ * 0x8000 — backplane offset 0 with SBSDIO_SB_ACCESS_2_4B_FLAG).
+ * f2_blksize is the F2 block size programmed in CCCR (used for the
+ * padding rule); pass 0 to use the safe 64-byte default.
  */
 struct brcm_sdpcm_state *
 brcm_sdpcm_alloc(uint32_t f2_addr, uint16_t f2_blksize)
@@ -249,17 +227,23 @@ brcm_sdpcm_alloc(uint32_t f2_addr, uint16_t f2_blksize)
 	mtx_init(&st->sp_lock, "brcm_sdpcm", NULL, MTX_DEF);
 	st->f2_addr = f2_addr;
 	st->f2_blksize = f2_blksize ? f2_blksize : 64u;
-	st->bcdc_reqid = 0;
+	/*
+	 * Seed to 1, not 0.  reqid 0 is reserved for events: brcm_rxctl
+	 * in brcm.c drops responses with reqid 0.  Every ++bcdc_reqid
+	 * site must also skip 0 on wrap, or every 65,536th request would
+	 * have its reply dropped and time out.  The USB transport seeds
+	 * the same way at attach.
+	 */
+	st->bcdc_reqid = 1;
 	st->dying = 0;
 	return (st);
 }
 
 /*
- * Install (or remove with cb=NULL) the EVENT-channel callback.
- * The lock is not really needed today: the only writer is
- * attach-time, and the only reader is rx_frames, which runs
- * single-threaded. Take sp_lock anyway so future callers do
- * not have to think about memory ordering.
+ * Install (or remove with cb=NULL) the EVENT-channel callback.  The
+ * only writer is attach and the only reader is rx_frames, which runs
+ * single-threaded, but take sp_lock anyway so callers need not reason
+ * about memory ordering.
  */
 void
 brcm_sdpcm_set_event_handler(struct brcm_sdpcm_state *st,
@@ -273,6 +257,7 @@ brcm_sdpcm_set_event_handler(struct brcm_sdpcm_state *st,
 	mtx_unlock(&st->sp_lock);
 }
 
+/* Install the raw-payload event callback. */
 void
 brcm_sdpcm_set_event_rx(struct brcm_sdpcm_state *st,
     brcm_sdpcm_event_rx_cb_t cb, void *arg)
@@ -285,6 +270,7 @@ brcm_sdpcm_set_event_rx(struct brcm_sdpcm_state *st,
 	mtx_unlock(&st->sp_lock);
 }
 
+/* Free the SDPCM state and wake any waiters. */
 void
 brcm_sdpcm_free(struct brcm_sdpcm_state *st)
 {
@@ -307,9 +293,8 @@ brcm_sdpcm_free(struct brcm_sdpcm_state *st)
 /*
  * Send a CONTROL-channel frame (BCDC iovar request).
  *
- * Wraps payload+len in hwhdr+swhdr, pads, CMD53-writes to F2.
- * Caller supplies a kernel-space buffer of `len` bytes with
- * the BCDC request body.
+ * Wraps the `len`-byte BCDC request body in hwhdr+swhdr, pads it and
+ * writes it to F2 with CMD53.
  */
 int
 brcm_sdpcm_tx_ctrlframe(struct brcm_sdpcm_state *st, device_t f2_dev,
@@ -346,15 +331,12 @@ brcm_sdpcm_tx_ctrlframe(struct brcm_sdpcm_state *st, device_t f2_dev,
 }
 
 /*
- * Send a DATA-channel frame. Same shape as tx_ctrlframe but
- * chanflag=DATA. `payload` is a full 802.3 ether frame
- * (dst + src + ethertype + body). Caller hands us the mbuf
- * chain. We m_freem on success or failure.
+ * Send a DATA-channel frame.  Same shape as tx_ctrlframe, but on the
+ * DATA channel and carrying a complete 802.3 frame from the mbuf
+ * chain, which is freed on success or failure.
  *
- * We do NOT put a BCDC dcmd header on the front. That is only
- * for the CONTROL channel. Linux brcmfmac wraps DATA frames in
- * only the SDPCM hwhdr+swhdr + the 802.3 frame. The chip's
- * DATA path strips swhdr and sends the bytes over the air.
+ * There is no BCDC dcmd header; that belongs to the CONTROL channel.
+ * Data frames carry the 4-byte BDC header instead (see below).
  */
 int
 brcm_sdpcm_tx_dataframe(struct brcm_sdpcm_state *st, device_t f2_dev,
@@ -375,7 +357,15 @@ brcm_sdpcm_tx_dataframe(struct brcm_sdpcm_state *st, device_t f2_dev,
 		return (EINVAL);
 	}
 
-	framelen = sizeof(*hwhdr) + sizeof(*swhdr) + mlen;
+	/*
+	 * Data frames carry a 4-byte BDC header between the SDPCM headers
+	 * and the 802.3 frame (Linux brcmf_proto_bcdc_hdrpush; the USB
+	 * transport sends the same struct brcm_bcdc_hdr).  Without it the
+	 * firmware reads the first four bytes of the destination MAC as
+	 * the header.
+	 */
+	framelen = sizeof(*hwhdr) + sizeof(*swhdr) +
+	    sizeof(struct brcm_bcdc_hdr) + mlen;
 	padded = brcm_sdpcm_padded_len(framelen, st->f2_blksize);
 
 	bounce = malloc(padded, M_BRCM_SDPCM, M_NOWAIT | M_ZERO);
@@ -385,6 +375,13 @@ brcm_sdpcm_tx_dataframe(struct brcm_sdpcm_state *st, device_t f2_dev,
 	}
 
 	mtx_lock(&st->sp_lock);
+	{
+		uint8_t room = (uint8_t)(st->max_seq - st->tx_seq);
+
+		if (st->credit_seen && (room == 0 || (room & 0x80) != 0))
+			st->window_violations++;
+	}
+	st->data_tx++;
 	tx_seq = st->tx_seq++;
 	mtx_unlock(&st->sp_lock);
 
@@ -401,7 +398,22 @@ brcm_sdpcm_tx_dataframe(struct brcm_sdpcm_state *st, device_t f2_dev,
 	swhdr->maxseqnr = 0;
 	swhdr->res0     = 0;
 
-	m_copydata(m, 0, mlen, (caddr_t)(swhdr + 1));
+	{
+		struct brcm_bcdc_hdr *bdc = (struct brcm_bcdc_hdr *)(swhdr + 1);
+		uint8_t etb[2] = { 0, 0 };
+
+		memset(bdc, 0, sizeof(*bdc));
+		bdc->flags = BRCM_BCDC_FLAG_VER(BRCM_BCDC_FLAG_PROTO_VER);
+		/*
+		 * EAPOL rides priority 7, as on our PCI path.  (Linux
+		 * brcmfmac has no EAPOL override; it leaves priority to
+		 * cfg80211_classify8021d.)
+		 */
+		if (mlen >= ETHER_HDR_LEN)
+			m_copydata(m, 12, 2, (caddr_t)etb);
+		bdc->priority = (etb[0] == 0x88 && etb[1] == 0x8e) ? 7 : 0;
+		m_copydata(m, 0, mlen, (caddr_t)(bdc + 1));
+	}
 	m_freem(m);
 
 	err = brcm_sdpcm_f2_xfer(f2_dev, st->f2_addr, bounce, padded, true);
@@ -411,28 +423,26 @@ brcm_sdpcm_tx_dataframe(struct brcm_sdpcm_state *st, device_t f2_dev,
 }
 
 /*
- * Drain the F2 RX FIFO. Reads frames one at a time until we
- * get an end-of-stream marker (length-zero hwhdr). Dispatches
- * by channel:
- *   - CONTROL: enqueue payload mbuf on ctrl_resp, wake waiter.
- *   - EVENT:   TODO forward to event handler (today: logged + dropped).
- *   - DATA:    TODO forward to net80211 input (today: logged + dropped).
+ * Drain the F2 RX FIFO.  Reads frames one at a time until an
+ * end-of-stream marker (length-zero hwhdr) and dispatches them by
+ * channel: CONTROL payloads are queued on ctrl_resp for the waiting
+ * dcmd, EVENT frames go to brcm_sdpcm_dispatch_event, DATA frames to
+ * the event_rx callback, and GLOM superframes are split into their
+ * sub-frames.
  *
- * Memory: each call mallocs a fresh bounce up to 2 KB. Fine
- * for a control-message round-trip. Data-path traffic will
- * need a pre-allocated per-sc buffer. Do not hold sp_lock
- * across the F2 read.
+ * Each call mallocs a bounce buffer of up to 2 KB; a pre-allocated
+ * per-softc buffer would suit heavy data traffic better.  sp_lock is
+ * not held across the F2 read.
  */
 #define BRCM_SDPCM_RX_BOUNCE_MAX	2048u
 
 /*
- * Check the BRCM event wrap (ether_header + brcm OUI +
- * usr_subtype) at `body`. Byte-swap event_msg into host order.
- * Then call the registered callback. `paylen` is the SDPCM
- * body size (already trimmed past hwhdr+swhdr+dataoff). Frames
- * that do not match the BRCM EVENT signature are quietly
- * dropped. That includes data-plane RX frames that share the
- * EVENT channel until net80211 is wired in.
+ * Validate the BRCM event encapsulation (ether_header + brcm OUI +
+ * usr_subtype) at `body`, byte-swap the event_msg into host order,
+ * and invoke the registered callback.  `paylen` is the SDPCM body
+ * size (already trimmed past hwhdr+swhdr+dataoff).  Frames that don't
+ * match the BRCM event signature are not decoded, though they have
+ * already been passed to the raw event_rx callback.
  */
 static void
 brcm_sdpcm_dispatch_event(struct brcm_sdpcm_state *st,
@@ -448,19 +458,18 @@ brcm_sdpcm_dispatch_event(struct brcm_sdpcm_state *st,
 	size_t datalen, bcdc_skip;
 
 	/*
-	 * Hand the raw BCDC-prefixed body off first so the driver
-	 * can wrap it in an mbuf and route through brcm_rx_frame
-	 * (scan cache, link state, etc.) before we do the in-layer
-	 * decode.
+	 * Hand the raw BCDC-prefixed body off first so the driver can
+	 * wrap it in an mbuf and route it through brcm_rx_frame (scan
+	 * cache, link state, etc.) before the in-layer decode.
 	 */
 	if (st->event_rx_cb != NULL)
 		st->event_rx_cb(st->event_rx_arg, body, paylen);
 
 	/*
-	 * Sub-frames on the EVENT/DATA channels carry a 4-byte
-	 * BCDC data header, then maybe `data_offset` 32-bit words
-	 * of extra metadata (FWS / flow control), then the
-	 * Ethernet frame. Peel BCDC + metadata before checking
+	 * Sub-frames on the EVENT/DATA channels carry a 4-byte BCDC
+	 * data header, optionally followed by `data_offset` 32-bit
+	 * words of extra metadata (FWS / flow control), then the
+	 * Ethernet frame.  Peel BCDC + metadata before validating
 	 * the BRCM event signature.
 	 */
 	if (paylen < sizeof(*bcdc))
@@ -502,6 +511,23 @@ brcm_sdpcm_dispatch_event(struct brcm_sdpcm_state *st,
 		st->event_cb(st->event_arg, &msg, body + hdr_total, datalen);
 }
 
+bool
+brcm_sdpcm_tx_credit(struct brcm_sdpcm_state *st)
+{
+	uint8_t room;
+	bool ok;
+
+	if (st == NULL)
+		return (false);
+	mtx_lock(&st->sp_lock);
+	room = (uint8_t)(st->max_seq - st->tx_seq);
+	ok = !st->fc_off && (!st->credit_seen ||
+	    (room != 0 && (room & 0x80) == 0));
+	mtx_unlock(&st->sp_lock);
+	return (ok);
+}
+
+/* Read and sort incoming frames from the chip. */
 int
 brcm_sdpcm_rx_frames(struct brcm_sdpcm_state *st, device_t f2_dev)
 {
@@ -522,11 +548,11 @@ brcm_sdpcm_rx_frames(struct brcm_sdpcm_state *st, device_t f2_dev)
 
 	for (;;) {
 		/*
-		 * Read hwhdr only. Learn the frame length, then drain
-		 * the body. Linux brcmfmac does the same (sdio.c
-		 * brcmf_sdio_readframes). Peeking the 4-byte hwhdr
-		 * lets us right-size the body read and spot (0,0)
-		 * end-of-stream right away.
+		 * Read only the hwhdr to learn the frame length, then the
+		 * body.  Linux brcmf_sdio_readframes reads a 64-byte first
+		 * chunk (BRCMF_FIRSTREAD) instead; peeking only the 4-byte
+		 * hwhdr right-sizes the body read and spots the (0,0)
+		 * end-of-stream marker at once.
 		 */
 		err = brcm_sdpcm_f2_xfer(f2_dev, st->f2_addr, &hwhdr,
 		    sizeof(hwhdr), false);
@@ -542,16 +568,25 @@ brcm_sdpcm_rx_frames(struct brcm_sdpcm_state *st, device_t f2_dev)
 		}
 		if ((uint16_t)(framelen ^ fcksum) != 0xffffu ||
 		    framelen < sizeof(hwhdr) + sizeof(struct brcm_sdpcm_swhdr) ||
-		    framelen > BRCM_SDPCM_RX_BOUNCE_MAX) {
+		    roundup2((size_t)framelen, 4) > BRCM_SDPCM_RX_BOUNCE_MAX) {
 			err = EINVAL;
 			break;
 		}
 
-		/* Body = framelen - 4 (hwhdr already drained). */
+		/*
+		 * Body = framelen - 4 (hwhdr already drained), read rounded
+		 * up to a whole 32-bit word.  (Linux brcmf_sdio_pad rounds
+		 * to head_align, 4 or 8 on 64-bit DMA platforms, or to the
+		 * block size.)  The host controller moves the FIFO in words,
+		 * and the tail of a read whose length is not a multiple of 4
+		 * comes back as garbage, which corrupts the end of EAPOL
+		 * frames and breaks the 4-way handshake.  The firmware pads
+		 * frames in the FIFO, so the extra bytes are its own.
+		 */
 		memcpy(bounce, &hwhdr, sizeof(hwhdr));
 		err = brcm_sdpcm_f2_xfer(f2_dev, st->f2_addr,
 		    bounce + sizeof(hwhdr),
-		    (size_t)framelen - sizeof(hwhdr), false);
+		    roundup2((size_t)framelen - sizeof(hwhdr), 4), false);
 		if (err != 0)
 			break;
 
@@ -567,14 +602,38 @@ brcm_sdpcm_rx_frames(struct brcm_sdpcm_state *st, device_t f2_dev)
 		frames++;
 
 		/*
-		 * BCM43455 quirk. fw replies to BCDC dcmd requests
-		 * (SET_VAR, GET_VAR, BRCM_C_*) often arrive with the
-		 * swhdr seq+chan+nextlen bytes filled with 0xff. So
-		 * the standard `chanflag & 0x0f` extraction gives 0x0f
-		 * (TEST channel) instead of 0x0 (CONTROL). The frame
-		 * is still a good CONTROL response: dataoff points at
-		 * the BCDC dcmd header. Treat any frame whose first
-		 * three swhdr bytes are 0xff as CONTROL.
+		 * Credit: take the firmware's max sequence number from every
+		 * frame, with brcmf_sdio_hdparse's sanity check.  The
+		 * BCM43455 dcmd replies with an all-0xff swhdr (below) carry
+		 * none.  The firmware drops data frames sent outside the
+		 * window, so brcm_sdpcm_tx_credit gates transmit on it.
+		 */
+		{
+			const struct brcm_sdpcm_swhdr *sw =
+			    (const struct brcm_sdpcm_swhdr *)(bounce +
+			    sizeof(hwhdr));
+
+			if (!(sw->seqnr == 0xff && sw->chanflag == 0xff)) {
+				uint8_t mx = sw->maxseqnr;
+
+				mtx_lock(&st->sp_lock);
+				if ((uint8_t)(mx - st->tx_seq) > 0x40)
+					mx = st->tx_seq + 2;
+				st->max_seq = mx;
+				st->credit_seen = true;
+				st->max_seq_updates++;
+				mtx_unlock(&st->sp_lock);
+			}
+		}
+
+		/*
+		 * BCM43455 firmware often sends its replies to BCDC dcmd
+		 * requests (SET_VAR, GET_VAR, BRCM_C_*) with the swhdr
+		 * seq, chan and nextlen bytes all 0xff, so `chanflag & 0x0f`
+		 * yields 0x0f (TEST) instead of 0x0 (CONTROL).  The frame is
+		 * still a valid CONTROL response, with dataoff pointing at
+		 * the BCDC dcmd header, so treat any frame whose first three
+		 * swhdr bytes are 0xff as CONTROL.
 		 */
 		if (chanflag != BRCM_SDPCM_SWHDR_CHANNEL_CONTROL &&
 		    bounce[4] == 0xff && bounce[5] == 0xff &&
@@ -586,7 +645,7 @@ brcm_sdpcm_rx_frames(struct brcm_sdpcm_state *st, device_t f2_dev)
 			size_t paylen;
 
 			if (dataoff >= framelen) {
-				/* Empty payload. drop it. */
+				/* Empty payload — discard. */
 				continue;
 			}
 			paylen = (size_t)framelen - (size_t)dataoff;
@@ -599,7 +658,7 @@ brcm_sdpcm_rx_frames(struct brcm_sdpcm_state *st, device_t f2_dev)
 			m->m_pkthdr.len = paylen;
 
 			mtx_lock(&st->sp_lock);
-			/* Enqueue at the tail. Waiter unlinks from head. */
+			/* Enqueue at the tail; waiter unlinks from head. */
 			if (st->ctrl_resp == NULL) {
 				st->ctrl_resp = m;
 			} else {
@@ -615,10 +674,10 @@ brcm_sdpcm_rx_frames(struct brcm_sdpcm_state *st, device_t f2_dev)
 			    (size_t)framelen - (size_t)dataoff);
 		} else if (chanflag == BRCM_SDPCM_SWHDR_CHANNEL_GLOM) {
 			/*
-			 * GLOM superframe. Zero or more sub-frames back
-			 * to back at [dataoff, framelen). Each sub-frame
-			 * is its own SDPCM hwhdr+swhdr+payload. We walk
-			 * them in order, dispatching EVENT/CONTROL by
+			 * GLOM superframe: zero or more concatenated
+			 * sub-frames at [dataoff, framelen).  Each sub-
+			 * frame is its own SDPCM hwhdr+swhdr+payload.
+			 * We walk linearly, dispatching EVENT/CONTROL by
 			 * sub-chanflag, and skipping anything else.
 			 */
 			size_t off = dataoff;
@@ -657,20 +716,19 @@ brcm_sdpcm_rx_frames(struct brcm_sdpcm_state *st, device_t f2_dev)
 						    (size_t)s_doff);
 					}
 				}
-				/* Go to next sub-frame. 4-byte aligned. */
+				/* Advance to next sub-frame, 4-byte aligned. */
 				off += roundup2((size_t)s_flen, 4);
 			}
 		} else if (chanflag == BRCM_SDPCM_SWHDR_CHANNEL_DATA) {
 			/*
-			 * DATA channel. BCDC+ether-wrapped 802.3 frame
-			 * from the chip. Same on-wire shape as the EVENT
-			 * channel (BCDC header at offset 0, ether at
-			 * offset 4 + dataoff*4). `brcm_rx_frame` already
-			 * splits on ethertype (0x886c=event, else=data),
-			 * so we route through the existing event_rx_cb
-			 * path. The transport's callback queues an mbuf
-			 * onto the evrx worker, which dispatches via
-			 * brcm_rx_frame.
+			 * DATA channel: BCDC+ether-wrapped 802.3 frame from
+			 * the chip.  Same on-wire shape as the EVENT channel
+			 * (BCDC header at offset 0, ether at offset 4 +
+			 * dataoff*4) — `brcm_rx_frame` already splits on
+			 * ethertype (0x886c=event, else=data) so we can
+			 * route through the existing event_rx_cb path.  The
+			 * transport's callback queues an mbuf onto the evrx
+			 * worker, which dispatches via brcm_rx_frame.
 			 */
 			if (st->event_rx_cb != NULL &&
 			    dataoff < framelen) {
@@ -679,7 +737,7 @@ brcm_sdpcm_rx_frames(struct brcm_sdpcm_state *st, device_t f2_dev)
 				    (size_t)framelen - (size_t)dataoff);
 			}
 		} else {
-			/* TEST or unknown sub-channel. drop it. */
+			/* TEST or unknown sub-channel — drop. */
 		}
 	}
 
@@ -690,8 +748,8 @@ brcm_sdpcm_rx_frames(struct brcm_sdpcm_state *st, device_t f2_dev)
 }
 
 /*
- * Wait until a CONTROL channel response is available, or
- * `timeout_ms` elapses. Returns NULL on timeout.
+ * Block until a CONTROL channel response is available, or `timeout_ms`
+ * elapses.  Returns NULL on timeout.
  */
 struct mbuf *
 brcm_sdpcm_wait_ctrl_resp(struct brcm_sdpcm_state *st, int timeout_ms)
@@ -736,9 +794,8 @@ brcm_sdpcm_wait_ctrl_resp(struct brcm_sdpcm_state *st, int timeout_ms)
  *   | "name\0\0\0..."         |  resp_len bytes (caller's buffer)
  *   +-------------------------+
  *
- * len in the header = max(strlen(name)+1, resp_len), so the fw
- * has room to write the response value over the variable-name
- * region.
+ * len in the header = max(strlen(name)+1, resp_len), so fw has space
+ * to write the response value over the variable-name region.
  */
 size_t
 brcm_bcdc_build_getvar(void *buf, size_t bufsz, const char *name,
@@ -763,9 +820,10 @@ brcm_bcdc_build_getvar(void *buf, size_t bufsz, const char *name,
 	h->cmd = htole32(BRCM_C_GET_VAR);
 	h->len = htole32((uint32_t)payload);
 
-	/* dcmd flags: just GET (0) + id_tag. BCDC version goes in
-	 * the separate proto header (not built here). fw matches
-	 * responses to requests via the id field. */
+	/* dcmd flags: just GET (0) + id_tag.  The dcmd carries no
+	 * protocol version (the 4-byte BDC header with the version is
+	 * used on data frames only); fw matches responses to requests
+	 * via the id field. */
 	flags = ((uint32_t)id_tag &
 	    BRCM_BCDC_DCMD_ID_MASK) << BRCM_BCDC_DCMD_ID_SHIFT;
 	h->flags = htole32(flags);
@@ -787,8 +845,8 @@ brcm_bcdc_build_getvar(void *buf, size_t bufsz, const char *name,
  *   | value bytes             |  vallen
  *   +-------------------------+
  *
- * dcmd->len = nlen + vallen so the fw knows the total payload
- * size. dcmd->flags carries BRCM_BCDC_DCMD_SET + id_tag.
+ * dcmd->len = nlen + vallen so fw knows the total payload size.
+ * dcmd->flags carries BRCM_BCDC_DCMD_SET + id_tag.
  */
 size_t
 brcm_bcdc_build_setvar(void *buf, size_t bufsz, const char *name,
@@ -828,9 +886,9 @@ brcm_bcdc_build_setvar(void *buf, size_t bufsz, const char *name,
 }
 
 /*
- * BCDC raw dcmd request builder. Used for BRCM_C_* opcodes
- * that are not iovars. Most notably BRCM_C_UP and BRCM_C_DOWN,
- * which carry no payload.
+ * BCDC raw dcmd request builder.  Used for BRCM_C_* opcodes that
+ * aren't iovars — most notably BRCM_C_UP and BRCM_C_DOWN which
+ * carry no payload.
  */
 size_t
 brcm_bcdc_build_dcmd(void *buf, size_t bufsz, uint32_t cmd_id,

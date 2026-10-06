@@ -1,69 +1,73 @@
 /*-
- * SPDX-License-Identifier: BSD-2-Clause
+ * SPDX-License-Identifier: BSD-2-Clause AND ISC
  *
  * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
+ * Copyright (c) 2010-2016 Broadcom Corporation
+ * Copyright (c) 2018 Patrick Wildt <patrick@blueri.se>
  *
- * Broadcom-only SDIO host-side register defs for brcm_sdio.
- * These are NOT in any SD/SDIO spec. They are only in upstream
- * Linux brcmfmac (drivers/net/wireless/broadcom/brcm80211/
- * brcmfmac/sdio.h) and the Broadcom-internal BCMSDH source the
- * chip vendor ships with their SDK. Values cross-checked against
- * Linux at commit head 2026-06-17.
+ * Broadcom-only SDIO host-side registers for brcm_sdio.
  *
- * Address-space map:
+ * These are NOT in any SD/SDIO spec. They come from Linux
+ * brcmfmac (drivers/net/wireless/broadcom/brcm80211/
+ * brcmfmac/sdio.h, with the CHIPCLKCSR bits in sdio.c), the
+ * OpenBSD/NetBSD bwfm SDIO driver (if_bwfm_sdio.c/.h), and
+ * Broadcom's BCMSDH source that ships with vendor SDKs.
+ * Portions derived from Linux brcmfmac (sdio.h, sdio.c, chip.c)
+ * and OpenBSD/NetBSD if_bwfm_sdio are ISC licensed.
  *
- *   * SDIO function 0 (CCCR) is the standard control register
- *     block. IO_EN, IO_READY, INT_ENABLE, CIS pointer, etc.
+ * Address-space layout:
  *
- *   * SDIO function 1 is, on every BCM43xxx WLAN chip, the
- *     "BACKPLANE" function. Inside, the chip is a small SoC with
- *     many cores (chipcommon, SDIO core, ARM, WLAN MAC, ...)
- *     linked by an AXI-like internal fabric Broadcom calls the
- *     "SiliconBackplane" (hence the "SB" prefix below). Every
- *     internal register on every core sits at some 32-bit address
- *     on that backplane. The host reaches them by programming a
- *     "window" inside function 1 and then sending CMD52 / CMD53
- *     to func 1.
+ *   * SDIO function 0 (CCCR) is the standard control block.
+ *     IO_EN, IO_READY, INT_ENABLE, CIS pointer, etc.
  *
- *   * SDIO function 2 (when present) is the DMA mailbox used for
- *     bulk packet I/O once firmware is running. brcm_sdio does
- *     not touch it until the firmware-upload step.
+ *   * SDIO function 1 is the "BACKPLANE" function on every
+ *     BCM43xxx WLAN chip. The chip is a small SoC with many
+ *     cores (chipcommon, SDIO, ARM, WLAN MAC, ...) linked
+ *     by an internal AXI-like fabric Broadcom calls the
+ *     "SiliconBackplane". That is why the constants below
+ *     start with "SB". Every core's registers live at some
+ *     32-bit address on the backplane. The host reaches them
+ *     by programming a "window" inside func 1 and then doing
+ *     CMD52 / CMD53 to func 1.
+ *
+ *   * SDIO function 2 is the WLAN frame FIFO, used once the
+ *     firmware is running (see brcm_sdpcm.c).
  *
  * How the backplane window works:
  *
- *   The window picks one 32 KB region of chip-internal address space:
+ *   The window picks a 32 KB slice of chip address space:
  *     window_base = chip_addr & SBSDIO_SBWINDOW_MASK   (top 17 bits)
  *     sdio_offset = chip_addr & SBSDIO_SB_OFT_ADDR_MASK (low 15 bits)
  *
  *   To reach chip_addr:
- *     1.  Program the three SBADDR* bytes so the chip latches the
- *         current window_base. Byte layout:
- *           SBADDRLOW  byte = (chip_addr >> 8)  & 0xFF  (chip bits 8..15)
- *           SBADDRMID  byte = (chip_addr >> 16) & 0xFF  (chip bits 16..23)
- *           SBADDRHIGH byte = (chip_addr >> 24) & 0xFF  (chip bits 24..31)
- *         Bits 0..14 of chip_addr are not needed here. They come
- *         from the SDIO offset in step 2. Only bit 15 of SBADDRLOW
- *         adds new info beyond the SDIO offset. The other 7 bits
- *         just round to a byte register.
- *     2.  Send CMD52 or CMD53 to func 1 at SDIO address
- *         sdio_offset. OR with SBSDIO_SB_ACCESS_2_4B_FLAG for a
- *         2- or 4-byte access.
+ *     1. Program the three SBADDR* bytes so the chip latches
+ *        the new window_base:
+ *          SBADDRLOW  = (chip_addr >> 8)  & 0xFF  (bits 8..15)
+ *          SBADDRMID  = (chip_addr >> 16) & 0xFF  (bits 16..23)
+ *          SBADDRHIGH = (chip_addr >> 24) & 0xFF  (bits 24..31)
+ *        Bits 0..14 of chip_addr are unused here. They come
+ *        from the SDIO offset in step 2. Only bit 15 of
+ *        SBADDRLOW adds new info. The other 7 bits exist to
+ *        round out a byte register.
+ *     2. Do CMD52 or CMD53 to func 1 at sdio_offset. OR in
+ *        SBSDIO_SB_ACCESS_2_4B_FLAG for 2- or 4-byte access.
  *
- *   Linux caches the current window_base and skips the SBADDR
- *   writes when the new chip_addr sits inside the same 32 KB
- *   region. We do the same so firmware uploads do not spend 3
- *   CMD52s per chunk.
+ *   Linux caches the current window_base and skips the
+ *   SBADDR writes when the new chip_addr is in the same
+ *   32 KB region. We do the same so firmware upload does
+ *   not spend 3 CMD52s per chunk.
  */
 
 #ifndef _BRCM_SDIO_REGS_H_
 #define _BRCM_SDIO_REGS_H_
 
 /*
- * SDIO func 1 register addresses for the host-side SDIO interface
- * block on every BCM43xxx WLAN chip. These are NOT internal chip
- * registers. They sit in func 1's CCCR-style area, before the
- * backplane window takes over. Broadcom calls the range
- * 0x10000..0x1001F SBSDIO_FUNC1_MISC_REG.
+ * SDIO func 1 register addresses for the host-side SDIO
+ * block on every BCM43xxx WLAN chip.
+ *
+ * These are NOT internal chip registers. They live in func
+ * 1's CCCR-style area, before the backplane window kicks in.
+ * Broadcom calls the 0x10000..0x1001F range SBSDIO_FUNC1_MISC_REG.
  */
 #define	SBSDIO_SPROM_CS			0x10000
 #define	SBSDIO_SPROM_INFO		0x10001
@@ -85,20 +89,21 @@
 #define	SBSDIO_FUNC1_SDIOPULLUP		0x1000F
 
 /*
- * CHIPCLKCSR bit layout. The host asks for a clock domain by
- * writing the matching *_REQ bit. The chip acks by setting the
- * matching *_AVAIL bit. Polling AVAIL after the REQ write is how
- * we know the backplane clock is up.
+ * CHIPCLKCSR bit layout.
  *
- *   ILP   Internal Low-Power clock - always on. SDIO core only
- *   ALP   Active Low-Power clock   - lets us read backplane regs
- *   HT    High-Throughput clock    - lets us write backplane regs
- *                                    and drive any core's wrap
+ * The host asks for a clock by writing the matching *_REQ
+ * bit. The chip acks by setting the matching *_AVAIL bit.
+ * Poll AVAIL after writing REQ to know the backplane clock
+ * is up.
  *
- * On a cold chip (boot ROM running) the only clock is ILP/ALP.
- * HT is gated off. CC.CHIPID reads on ALP, so it works before
- * HT. But CR4 wrap.IOCTL writes need HT. Hence the failure we
- * saw on 2026-06-17.
+ *   ILP  Internal Low-Power clock. Always on; SDIO core only.
+ *   ALP  Active Low-Power clock. Lets us read backplane regs.
+ *   HT   High-Throughput clock. Lets us write backplane regs
+ *        and drive any core's wrap.
+ *
+ * On a cold chip (boot ROM running) only ILP/ALP is on and HT
+ * is gated off. CC.CHIPID reads work on ALP, but CR4
+ * wrap.IOCTL writes need HT.
  */
 #define	SBSDIO_FORCE_ALP		0x01
 #define	SBSDIO_FORCE_HT			0x02
@@ -126,18 +131,17 @@
 /*
  * Address-decoding masks for backplane-routed accesses.
  *
- *   SBSDIO_SB_OFT_ADDR_MASK  low 15 bits of chip_addr come
+ *   SBSDIO_SB_OFT_ADDR_MASK  Low 15 bits of chip_addr come
  *                            straight from the SDIO offset.
- *   SBSDIO_SB_OFT_ADDR_LIMIT 0x8000. Addresses at or above this
- *                            need a window reprogram before the
+ *   SBSDIO_SB_OFT_ADDR_LIMIT 0x8000. Addresses >= this need
+ *                            a window reprogram before the
  *                            next SDIO transaction.
- *   SBSDIO_SB_ACCESS_2_4B_FLAG OR into the SDIO offset to ask
- *                              for a 2- or 4-byte access. Without
- *                              this bit, the chip serves the
- *                              request 1 byte at a time even if
- *                              CMD53 carries more.
- *   SBSDIO_SBWINDOW_MASK     upper 17 bits of chip_addr. This is
- *                            what SBADDR{LOW,MID,HIGH} programs.
+ *   SBSDIO_SB_ACCESS_2_4B_FLAG OR into the SDIO offset for
+ *                            2- or 4-byte access. Without
+ *                            it, the chip serves 1 byte at a
+ *                            time even if CMD53 carries more.
+ *   SBSDIO_SBWINDOW_MASK     Upper 17 bits of chip_addr —
+ *                            what SBADDR{LOW,MID,HIGH} sets.
  */
 #define	SBSDIO_SB_OFT_ADDR_MASK		0x07FFF
 #define	SBSDIO_SB_OFT_ADDR_LIMIT	0x08000
@@ -145,12 +149,13 @@
 #define	SBSDIO_SBWINDOW_MASK		0xFFFF8000U
 
 /*
- * Vendor-specific CCCR registers. Broadcom puts these above the
- * standard CCCR layout (0x00..0x17). brcm_sdio uses BRCM_CARDCAP
- * to learn which CMD14 (sleep-control) variant the chip supports.
- * BRCM_SEPINT routes the host-wake interrupt out of band when
- * the platform wires it that way. Pi 4 does not need either
- * today.
+ * Vendor CCCR registers Broadcom adds above the standard
+ * CCCR layout (0x00..0x17).
+ *
+ * BRCM_CARDCAP says which CMD14 (sleep-control) variant the
+ * chip supports. BRCM_SEPINT routes the host-wake interrupt
+ * out of band on platforms wired that way; this driver does
+ * not use it.
  */
 #define	SDIO_CCCR_BRCM_CARDCAP			0xF0
 #define	 SDIO_CCCR_BRCM_CARDCAP_CMD14_SUPPORT	(1u << 1)
@@ -166,11 +171,13 @@
 #define	 SDIO_CCCR_BRCM_SEPINT_ACT_HI		(1u << 2)
 
 /*
- * Function 1 / Function 2 enable + ready bit masks. The standard
- * SDIO CCCR.IO_EN (offset 0x02) and CCCR.IO_READY (offset 0x03)
- * each use bit N to mean "function N enabled" / "function N
- * ready". Linux names these in brcmfmac/sdio.h. We reuse the
- * same names so grepping against the reference driver is easy.
+ * Function 1 / Function 2 enable + ready bit masks.
+ *
+ * The standard SDIO CCCR.IO_EN (offset 0x02) and
+ * CCCR.IO_READY (offset 0x03) use bit N to mean "function N
+ * enabled" / "function N ready". Linux names these in
+ * brcmfmac/sdio.h. We use the same names so grep works
+ * against the reference driver.
  */
 #define	SDIO_FUNC_ENABLE_1	0x02
 #define	SDIO_FUNC_ENABLE_2	0x04
@@ -179,14 +186,19 @@
 
 /*
  * Chip-internal addresses for the chipcommon ("CC") core.
- * ChipCommon is always the first core on the BCM43xxx backplane.
- * BCM has used the same address across the whole family:
- * 0x18000000. CC.CHIPID at offset 0 is the classic "are you
- * alive" probe register. Its low 16 bits hold the chip id
- * (matches the SDIO CIS prodid we already read). Bits 16..27
- * hold revision and package option. Bits 28..31 hold the number
- * of cores on the backplane. Linux reads this register right
- * after enabling function 1 to prove the backplane window works.
+ *
+ * ChipCommon is always the first core on the BCM43xxx
+ * backplane. Broadcom uses the same address across the
+ * whole family: 0x18000000.
+ *
+ * CC.CHIPID at offset 0 is the "are you alive" probe
+ * register. Low 16 bits hold the chip id (it matches the SDIO
+ * CIS prodid). Bits 16..19 hold the revision,
+ * 20..23 the package option, 24..27 the core count, and
+ * 28..31 the chip (interconnect) type.
+ *
+ * Linux reads this register right after enabling function 1
+ * to prove the backplane window plumbing works.
  */
 #define	BRCM_CC_CORE_BASE	0x18000000U
 #define	BRCM_CC_CHIPID		0x00
@@ -198,10 +210,11 @@
 
 /*
  * BCM chip family IDs as they show up in CC.CHIPID bits 0..15.
- * Linux brcmfmac names some in decimal (43430 == 0xa9a6) and
- * some in hex (0x4345). We use the real hex register value here
- * so grep matches the wire bytes. The hex value is what the
- * host reads from the chip via the backplane window.
+ *
+ * Linux brcmfmac names some of these in decimal
+ * (43430 == 0xa9a6) and some in hex (0x4345). We use the hex
+ * register value here so grepping against the wire is easy.
+ * That hex value is what the host reads from the chip.
  */
 #define	BRCM_CHIP_BCM43430	0xa9a6	/* Linux: BRCM_CC_43430_CHIP_ID */
 #define	BRCM_CHIP_BCM4339	0x4339
@@ -212,20 +225,22 @@
 #define	BRCM_CHIP_BCM4373	0x4373	/* CYW4373 */
 
 /*
- * ARM core type in the chip's compute unit. Picks the
- * passive/active reset order we use:
+ * ARM core type at the chip's compute centre.
  *
- *   BRCM_ARM_CM3  Cortex-M3, simple MCU class. BCM4329, BCM43430,
- *                 BCM43439. ARM reset uses the SOCRAM core's
- *                 standard reset bit.
- *   BRCM_ARM_CR4  Cortex-R4, real-time class. BCM4345/43455,
- *                 BCM4339, BCM4354, BCM4356, BCM4359, BCM4373. Has
- *                 its own "rstvec" register. Firmware load address
- *                 may not match the ARM reset vector. We set the
- *                 vector via the CR4's TCM register.
- *   BRCM_ARM_CA7  Cortex-A7, application class. Newer chips
- *                 (BCM43596 etc.). Not on Pi. Listed so the
- *                 enum matches Linux's set.
+ * Picks the passive/active reset sequence we use:
+ *
+ *   BRCM_ARM_CM3 Cortex-M3, simple MCU. BCM4329, BCM43430,
+ *                BCM43439. ARM reset uses SOCRAM's standard
+ *                reset bit.
+ *   BRCM_ARM_CR4 Cortex-R4, real-time. BCM4345/43455,
+ *                BCM4339, BCM4354, BCM4356, BCM4359, BCM4373.
+ *                Has its own "rstvec" register. Firmware
+ *                load address is not always the ARM reset
+ *                vector (we program the vector via CR4 TCM).
+ *   BRCM_ARM_CA7 Cortex-A7, application class. Newer chips
+ *                (BCM43596, etc.). Listed to cover the three
+ *                ARM core ids Linux handles
+ *                (BCMA_CORE_ARM_CM3/CR4/CA7).
  */
 enum brcm_arm_core {
 	BRCM_ARM_CM3 = 1,
@@ -234,29 +249,34 @@ enum brcm_arm_core {
 };
 
 /*
- * ChipCommon (CC) core register offsets. CC always sits at
- * BRCM_CC_CORE_BASE. Besides CHIPID at offset 0, we care about
- * EROMPTR at offset 0xFC. That is the pointer to the Enumeration
- * ROM, which lists every core on the backplane. Walking the EROM
- * lets us find the ARM CR4 core (and SOCRAM, WLAN, SDIO core)
- * without hardcoding per-chip addresses. Linux uses 0xFC via
- * the struct chipcregs eromptr field. The chip's AHB-style
- * mirror at 0x40C does not exist on the SoC variant we talk to
- * over SDIO.
+ * ChipCommon (CC) core register offsets.
+ *
+ * CC always sits at BRCM_CC_CORE_BASE. Beyond CHIPID at
+ * offset 0, we care about EROMPTR at offset 0xFC. That is
+ * the pointer to the Enumeration ROM, which lists every
+ * core on the backplane. Walking EROM finds the ARM CR4
+ * core (and SOCRAM, WLAN, SDIO core) without hardcoding
+ * per-chip addresses.
+ *
+ * Linux uses 0xFC via the struct chipcregs eromptr field.
+ * The chip's AHB-style mirror at 0x40C does not exist on
+ * the SoC variant we reach over SDIO.
  */
 #define	BRCM_CC_EROMPTR		0xFC
 
 /*
- * EROM descriptor decode. Each EROM entry is a 32-bit word read
- * at the running EROM pointer (bumped by 4 each read). Linux
- * brcmfmac/chip.c documents the layout. We reuse the same names
- * so a side-by-side review against the reference driver is
+ * EROM descriptor decode.
+ *
+ * Each EROM entry is a 32-bit word read at the running EROM
+ * pointer (incremented by 4 each read). Linux
+ * brcmfmac/chip.c documents the layout. We use the same
+ * names so side-by-side review with the reference driver is
  * grep-friendly.
  *
- * The low 4 bits of each entry pick the entry type. Component
- * entries hold the core's vendor/partnum/rev info. Address
- * descriptors hold the core's slave-register-window base and
- * wrapper base. Walking the table builds a per-chip core map.
+ * The low 4 bits of each entry give its type. Components
+ * hold vendor / partnum / rev metadata. Address descriptors
+ * hold the core's slave-register-window base and wrapper
+ * base. Walking the table builds a per-chip core map.
  */
 #define	DMP_DESC_TYPE_MSK	0x0000000F
 #define	 DMP_DESC_EMPTY		0x00000000
@@ -289,13 +309,14 @@ enum brcm_arm_core {
 #define	 DMP_SLAVE_SIZE_DESC	3
 
 /*
- * Broadcom core IDs (DMP partnum field). Each ARM-class chip
- * has at least chipcommon + one ARM core + one or more WLAN
- * cores. We recognise the ones the firmware uploader and
- * runtime touch.
+ * Broadcom core IDs (DMP partnum field).
  *
- * Linux uses these names as-is (drivers/bcma/core.c
- * BCMA_CORE_*). Carried over for grep parity.
+ * Every ARM-class chip has at least chipcommon + one ARM
+ * core + one or more WLAN cores. We name only the ones the
+ * firmware uploader and runtime touch.
+ *
+ * Linux uses these names as-is (include/linux/bcma/bcma.h
+ * BCMA_CORE_*). Kept verbatim for grep parity.
  */
 #define	BCMA_CORE_CHIPCOMMON		0x800
 #define	BCMA_CORE_INTERNAL_MEM		0x80E	/* SOCRAM */
@@ -309,24 +330,28 @@ enum brcm_arm_core {
 #define	BCMA_CORE_SDIO_DEV		0x829
 
 /*
- * SDIO device-core register offsets. Subset of struct sdpcmd_regs
- * in Linux brcmfmac/sdio.h. Only the fields the chip activate
- * sequence touches are here. Add more as sdio.c is ported.
+ * SDIO device-core register offsets. Subset of struct
+ * sdpcmd_regs in Linux brcmfmac/sdio.h.
+ *
+ * Only the fields the chip activate sequence touches are
+ * here.
  */
 #define	BRCM_SD_REG_INTSTATUS		0x020
 
 /*
- * Wrapper register offsets shared across cores. Every core's
- * wrapper exposes the same IOCTL and RESETCTL registers. Only
- * the wrap base address changes per core.
+ * Wrapper register offsets, shared across cores.
  *
- *   BCMA_IOCTL     0x408  core-specific control bits (clock enable,
- *                         PHY reset for d11, CPU halt for ARM)
- *   BCMA_RESET_CTL 0x800  bit 0 = "place core in reset"
+ * Every core's wrapper has the same IOCTL and RESETCTL
+ * registers. Only the wrap base address changes per core.
  *
- * ARMCR4_BCMA_IOCTL_CPUHALT is the CR4-specific bit we OR into
- * BCMA_IOCTL to keep the Cortex-R4 stopped while we write into
- * its tightly-coupled memory (TCM) banks.
+ *   BCMA_IOCTL     0x408 Core-specific control bits (clock
+ *                        enable, PHY reset for d11, CPU
+ *                        halt for ARM).
+ *   BCMA_RESET_CTL 0x800 Bit 0 = "place core in reset".
+ *
+ * ARMCR4_BCMA_IOCTL_CPUHALT is the CR4-only bit we OR into
+ * BCMA_IOCTL to keep the Cortex-R4 stopped while we write
+ * into its tightly-coupled memory (TCM) banks.
  */
 #define	BCMA_IOCTL			0x408
 #define	 BCMA_IOCTL_CLK			0x0001	/* core clock enable */
@@ -336,15 +361,16 @@ enum brcm_arm_core {
 #define	ARMCR4_BCMA_IOCTL_CPUHALT	0x0020
 
 /*
- * Chipcommon PMU control register. Lives at chipcommon base +
- * 0x600 on every BCM43xxx the SDIO driver currently supports
- * (PMU is inside chipcommon, not a separate core, on these
- * chips). RES_RELOAD tells the PMU to reload its resource
- * table. On a chip whose boot ROM left the resource state
- * partial, this is what flips the PMU into a mode where it
- * really generates HT for FORCE_HT requests. Without
- * RES_RELOAD the PMU acks FORCE_HT in CHIPCLKCSR but does not
- * service it, and HT_AVAIL never asserts.
+ * Chipcommon PMU control register.
+ *
+ * Lives at chipcommon base + 0x600. Linux uses chipcommon
+ * unless the chip has a separate PMU core (ccrev >= 35 with
+ * the AOB capability); see brcm_chip_get_pmu().
+ *
+ * RES_RELOAD tells the PMU to reload its resource table. On
+ * chips whose boot ROM left the resource state partial, the
+ * PMU otherwise acks FORCE_HT in CHIPCLKCSR but never asserts
+ * HT_AVAIL; after the reload it grants HT.
  */
 #define	BRCM_CC_PMUCONTROL			0x00000600
 #define	 BRCM_CC_PMUCONTROL_RES_MASK		0x00006000
@@ -360,35 +386,37 @@ enum brcm_arm_core {
 #define	D11_BCMA_IOCTL_PHYRESET		0x0008
 
 /*
- * Per-chip recipe. One row per (family, rev range) that Linux
- * brcmfmac supports for SDIO. Matched by chip_id ==
- * CC.CHIPID.low16 AND (chiprev_mask & (1 << chip_rev)) != 0.
- * Linux uses a 32-bit rev_mask because Broadcom respins the
- * same silicon at different revs and switches firmware lineage
- * at rev boundaries. Example: BCM4345 rev <9 uses
- * brcmfmac43455-sdio.bin while rev 9 uses
- * brcmfmac43456-sdio.bin.
+ * Per-chip recipe. One row per (family, rev range) Linux
+ * brcmfmac supports for SDIO.
  *
- *   ram_base    chip-internal address where the firmware blob
- *               starts loading. For CR4 chips this is also
+ * Match rule: chip_id == CC.CHIPID.low16 AND
+ * (chiprev_mask & (1 << chip_rev)) != 0. Linux uses a
+ * 32-bit rev_mask because Broadcom respins the same silicon
+ * at different revs and switches firmware at rev boundaries.
+ * For example, BCM4345 rev 9 uses brcmfmac43456-sdio.bin
+ * while revs 6-8 and 10 and up use brcmfmac43455-sdio.bin
+ * (revs 0-5 match no row).
+ *
+ *   ram_base    Chip-internal address where the firmware
+ *               blob starts loading. On CR4 chips, also
  *               where we point the ARM rstvec after upload.
- *   fw_name     short suffix. brcm_sdio prepends "brcmfmac"
- *               and appends "-sdio" + ".bin" / ".txt" to build
- *               the firmware(9) request name. Matches Linux's
- *               /lib/firmware/brcm/brcmfmac*-sdio.{bin,txt}.
- *   nvram_board optional board-specific override for the NVRAM
- *               file (Pi 4 needs a different antenna trim from
- *               generic boards). NULL means use the default
- *               "brcmfmac<fw_name>-sdio.txt" filename.
+ *   fw_name     Short suffix. brcm_sdio prepends "brcmfmac"
+ *               and appends "-sdio.bin" or "-sdio.txt" to
+ *               form the firmware(9) request name, following
+ *               Linux's brcmfmac*-sdio.{bin,txt} naming.
+ *   nvram_board Optional board-specific NVRAM file override.
+ *               Some boards need a different antenna trim
+ *               from generic ones. NULL means use the default
+ *               "brcmfmac<fw_name>-sdio.txt".
  */
 struct brcm_sdio_chip_recipe {
-	uint16_t		chip_id;
-	uint32_t		chiprev_mask;
+	uint16_t		chip_id;	/* chip family id */
+	uint32_t		chiprev_mask;	/* which chip revisions match */
 	uint32_t		ram_base;
-	enum brcm_arm_core	arm_core;
+	enum brcm_arm_core	arm_core;	/* which ARM core type */
 	const char		*fw_name;
 	const char		*nvram_board;
-	const char		*desc;
+	const char		*desc;	/* human-readable name */
 };
 
 #endif /* _BRCM_SDIO_REGS_H_ */

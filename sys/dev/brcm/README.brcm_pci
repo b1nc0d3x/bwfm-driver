@@ -1,0 +1,133 @@
+brcm_pci -- FreeBSD driver for Broadcom FullMAC PCIe wireless chips
+===================================================================
+
+Hardware
+--------
+
+brcm_pci probes these Broadcom PCI device IDs (vendor 14e4):
+
+    43ba  BCM43602   full bring-up; the supported chip
+    43a0  BCM4360    probe only
+    43a2  BCM4360    2x2, probe only
+    43a3  BCM4350    probe only
+    4415, 43c3, 43ca, 4464  (BCM4366/4365/4364 family) probe only
+
+Only the BCM43602 is brought up.  It has been tested on the Apple
+MacBook Pro 11,4 (subsystem 106b:0152), revision A1.  The BCM4360 has
+no ARM-CR4 FullMAC firmware available, so bring-up is refused on it;
+see sys/modules/brcm_pci_fw_4360/Makefile.
+
+The BCM43602 firmware, brcmfmac43602-pcie.bin, is shipped as the
+brcm_pci_fw_43602 module and registered under the firmware(9) name
+brcmfmac43602_pcie.
+
+Loading
+-------
+
+    kldload brcm_pci_fw_43602 brcm_pci
+
+At boot, load it from rc.conf rather than loader.conf:
+
+    kld_list="brcm_pci_fw_43602 brcm_pci"
+
+kld_list loads the modules once the system is up.  Preloaded from
+loader.conf, the driver attaches during boot-time autoconfiguration,
+and a chip left wedged by an earlier hang can then stop the boot with
+nothing logged.  Loaded later, the same failure leaves a running system
+to recover from.
+
+Attach does no BAR0 access until the warm-up sequence has run: on the
+Apple machines the chip sits behind an EC-controlled power gate, and a
+BAR0 read before it is opened master-aborts the host.
+
+Bring-up
+--------
+
+At the end of attach a kernel thread uploads the firmware (unless it is
+already running), attaches the msgbuf rings, sends WLC_UP and attaches
+to net80211.  This takes about nine seconds; kldload returns at once.  The
+device then appears in net.wlan.devices, and only wlan0 is left to
+create:
+
+    ifconfig wlan0 create wlandev brcm_pci0
+
+wlans_brcm_pci0 in rc.conf is too early, since netif runs before the
+bring-up has finished.
+
+Taking the last vap down leaves the network and turns the radio off
+with WLC_DOWN; bringing one up turns it back on with WLC_UP.  The
+firmware stays loaded in between.
+
+Loader tunables
+---------------
+
+    hw.brcm_pci.autostart=0
+        Leave the chip alone after attach and run the bring-up by hand:
+
+            sysctl dev.brcm_pci.0.bringup=1     # skip if fw_running is 1
+            sysctl dev.brcm_pci.0.msgbuf_attach=1
+            sysctl dev.brcm_pci.0.wlc_up=1
+            sysctl dev.brcm_pci.0.net80211_attach=1
+
+    hw.brcm_pci.attach_appu_warm=0
+        Skip the warm-up sequence at attach (default 1).
+
+    hw.brcm_pci.pm_supported=1
+        Allow suspend/resume attempts (default 0, suspend is refused).
+        Warm resume is best effort; a cold resume still needs
+        kldunload and kldload.
+
+dev.brcm_pci_nvram_seed_enable (default 0) adds a random-seed prelude to
+the NVRAM image.  It is off because it stopped the BCM43602 firmware
+from coming up.
+
+Sysctls (dev.brcm_pci.0)
+------------------------
+
+    debug                  log verbosity (0 = quiet)
+    chip_alive             write 1 to check PCIe config space; safe in
+                           any chip state
+    fw_running             1 once bring-up has started the firmware
+    bringup                run the chip bring-up; refused while
+                           fw_running is 1
+    msgbuf_attach          attach the msgbuf protocol rings
+    wlc_up / wlc_down      send WLC_UP / WLC_DOWN to the firmware
+    net80211_attach        attach to net80211 (then create wlan0)
+    net80211_detach        undo net80211_attach
+    delete_flowring        write a flow ID to send FLOW_RING_DELETE
+    dump_console           drain the firmware console into dmesg
+    mac_addr               the chip's MAC address (cur_etheraddr)
+    d3_probe               firmware D3 inform/ack round trip
+    cold_reattach          firmware re-upload and full re-bring-up, as
+                           on a cold resume; drops the association
+    crash_recover_threshold
+                           consecutive command timeouts before an
+                           automatic cold_reattach (default 0, off: a
+                           timeout does not prove the firmware crashed,
+                           and rebuilding a running chip can hang the
+                           host)
+    crash_recover_events   recoveries run since attach
+    crash_probe            inject a fake crash to exercise recovery
+
+bringup is refused once the firmware is running, because writing the
+image over running firmware kills it.  The four bring-up sysctls are
+refused while the autostart thread is still running, and
+net80211_attach does nothing the second time.
+
+Security
+--------
+
+WPA2-PSK with host EAPOL: wpa_supplicant runs the 4-way handshake and
+installs the keys through net80211.  Tested with CCMP pairwise and TKIP
+group ciphers.  The BCM43602 firmware does not support SAE (WPA3) or
+FT.
+
+Known limits
+------------
+
+- Do not kldunload brcm_pci after a vap has been created; reboot.
+  Detach is refused while net80211 is attached (destroy wlan0 and
+  write 1 to net80211_detach first).
+- After the wireless power rail has been fully power-cycled, the
+  firmware has been seen to halt during PA calibration.
+- Only one access point has been tested.

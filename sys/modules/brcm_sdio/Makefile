@@ -1,10 +1,9 @@
-# Kernel module for the brcm SDIO card path. It plugs into the
-# `sdio` bus (sys/dev/mmc/sdio_func.c) and looks for Broadcom
-# BCM43xxx Wi-Fi chips.
+# Standalone kld for the brcm SDIO transport.  It attaches under the
+# sdio newbus parent (sys/dev/mmc/sdio_func.c) and probes Broadcom
+# BCM43xxx WLAN functions.
 #
-# All SDIO headers (mmc_subr.h, sdio_func.h, sdioreg.h) come with
-# 15.1. No outside KERN_TREE needed. On older 14.x, you can add
-# `-I${KERN_TREE}/sys` on the command line.
+# The SDIO headers (mmc_subr.h, sdio_func.h, sdioreg.h) are in base
+# from 15.1.  On 14.x, add -I${KERN_TREE}/sys on the command line.
 
 .PATH:	${SRCTOP}/sys/dev/brcm
 

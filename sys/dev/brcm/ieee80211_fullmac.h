@@ -3,37 +3,39 @@
  *
  * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
  *
- * Glue layer for net80211 with FullMAC chips.
+ * net80211 FullMAC adaptation layer.
  *
- * net80211 is built for SoftMAC. The driver feeds raw 802.11
- * frames and the stack does scan, AUTH, ASSOC, 4-way, keymgmt.
- * FullMAC firmware (Broadcom brcmfmac, iwlwifi MVM-mode,
- * mt76 firmware-mode, and many USB dongles) does all that on
- * the chip and gives the host plain 802.3. Without a framework,
- * each FullMAC driver has to redo the same dance:
+ * net80211's native shape is SoftMAC: the driver feeds raw 802.11
+ * frames and the stack runs scan / AUTH / ASSOC and key handling,
+ * with wpa_supplicant running the 4-way.  FullMAC firmware
+ * (Broadcom brcmfmac, Marvell mwifiex, Quantenna qtnfmac, a
+ * number of USB dongles) does all of
+ * that on the chip and gives the host 802.3.  Without a framework
+ * each FullMAC driver re-implements the same dance:
  *
- *   * hook iv_newstate so net80211 does not try to walk a state
- *     machine the firmware already finished;
- *   * jump from INIT to AUTH to ASSOC to RUN when the chip
- *     says "linked";
- *   * make a fake beacon (or reuse IEs the firmware captured)
- *     so ieee80211_add_scan() has something to match ssid on;
- *   * forward EAPOL only when the firmware supplicant is off
- *     and the host runs wpa_supplicant;
- *   * turn iv_key_set / iv_key_delete into a firmware-side
- *     "install key" command instead of poking hardware crypto
- *     keys directly;
- *   * keep the firmware's country / channel list in sync with
- *     net80211's regdomain.
+ *   * intercept iv_newstate so net80211 doesn't try to walk a state
+ *     machine the firmware is already past;
+ *   * fast-forward INIT -> AUTH -> ASSOC -> RUN when the chip
+ *     announces "linked";
+ *   * synthesise a beacon (or carry the firmware-captured IEs
+ *     forward) so ieee80211_add_scan() has something believable to
+ *     match the ssid_match against;
+ *   * forward EAPOL only when the firmware supplicant is disabled
+ *     and the host is running wpa_supplicant;
+ *   * forward iv_key_set / iv_key_delete into a firmware-side
+ *     "install key" command instead of programming hardware
+ *     crypto keys directly;
+ *   * keep the firmware's idea of country / channel set in sync
+ *     with net80211's regdomain.
  *
- * This header adds a small ops table and a few up-call helpers
- * that soak up that glue in one place. Drivers register their
- * ieee80211_fullmac_ops in attach. The framework hooks the
- * ic_* / vap_* slots before ieee80211_ifattach(). Driver code
- * shrinks to: fill the ops, call the up-calls on firmware events.
+ * This header provides a small ops vtable and a handful of up-call
+ * helpers that absorb that glue once.  Drivers register their
+ * struct ieee80211_fullmac_ops in attach, the framework hooks the
+ * relevant ic_* / vap_* slots before ieee80211_ifattach(), and
+ * driver code reduces to: implement the ops, call the up-calls
+ * when firmware events land.
  *
- * Status: DRAFT. The API can still change while brcm moves to
- * it. Lock the shape after at least one merged driver uses it.
+ * brcm is the only user so far, and the API may still change.
  */
 
 #ifndef _NET80211_IEEE80211_FULLMAC_H_
@@ -50,64 +52,85 @@ struct ieee80211_key;
 struct ieee80211_scanparams;
 
 /*
- * Extra info per frame. The driver attaches this when it hands
- * a mgmt-frame mbuf up with ieee80211_fmac_input_beacon(). The
- * framework turns these dBm values into net80211's half-dB-above-
- * noise units, fills an ieee80211_rx_stats, attaches the stats
- * mtag, and calls ieee80211_input_mimo_all.
+ * Per-frame receive info attached by the driver when handing a
+ * mgmt-frame mbuf up via ieee80211_fmac_input_beacon().  The
+ * framework converts these absolute-dBm values into net80211's
+ * half-dB-above-noise units and hands the parsed frame, with that
+ * rssi and noise floor, straight to the scan module's scan_add.
  */
 struct ieee80211_fmac_rxinfo {
 	uint16_t	fri_chan_freq;	/* MHz */
 	uint8_t		fri_chan_ieee;	/* IEEE channel number */
 	int8_t		fri_rssi_dbm;	/* signed dBm */
-	int8_t		fri_noise_dbm;	/* signed dBm; 0 means "use -95" */
+	int8_t		fri_noise_dbm;	/* signed dBm; see below */
 };
 
 /*
- * One scan result. The driver builds this from a firmware
- * "scan result" event and passes it in via
- * ieee80211_fmac_scan_result(). The framework makes a fake
- * probe-response buffer from these fields plus the IE blob
- * and drops it into the normal net80211 scan cache.
+ * net80211 takes signal as dB above the noise floor (rssi - nf, in half
+ * dB) and refuses to join a BSS too close to it.  Firmware noise figures
+ * are not always plausible: the BCM43602 at times reports phy_noise =
+ * -22 dBm for every BSS, which puts each AP at or below the floor, so
+ * sta_pick_bss finds no scan candidate and never joins.  Use the
+ * firmware's figure only when it is a plausible noise floor, and -95 dBm
+ * otherwise; 0 means "none".
+ */
+#define	IEEE80211_FMAC_NF_DEFAULT	(-95)
+#define	IEEE80211_FMAC_NF_MIN		(-110)
+#define	IEEE80211_FMAC_NF_MAX		(-70)
+
+static __inline int
+ieee80211_fmac_noise_floor(int dbm)
+{
+	if (dbm < IEEE80211_FMAC_NF_MIN || dbm > IEEE80211_FMAC_NF_MAX)
+		return (IEEE80211_FMAC_NF_DEFAULT);
+	return (dbm);
+}
+
+/*
+ * Per-scan-result payload the driver assembles from a firmware
+ * "scan result" event and hands up via ieee80211_fmac_scan_result().
+ * The framework synthesises a probe-response-equivalent buffer from
+ * these fields plus the supplied IE blob and feeds it into the
+ * usual net80211 scan cache.
  */
 struct ieee80211_fmac_bss {
-	uint8_t		fb_bssid[IEEE80211_ADDR_LEN];
-	uint8_t		fb_ssid[IEEE80211_NWID_LEN];
-	uint8_t		fb_ssidlen;
+	uint8_t		fb_bssid[IEEE80211_ADDR_LEN];	/* AP MAC address */
+	uint8_t		fb_ssid[IEEE80211_NWID_LEN];	/* network name */
+	uint8_t		fb_ssidlen;	/* network name length */
 	uint16_t	fb_capinfo;	/* host byte order */
-	uint16_t	fb_bintval;
+	uint16_t	fb_bintval;	/* beacon interval */
 	int		fb_rssi;	/* dBm; negative */
 	int		fb_noise;	/* dBm; negative */
 	uint16_t	fb_chan_freq;	/* MHz */
 	uint8_t		fb_chan_flags;	/* 2 = 2.4 GHz, 5 = 5 GHz */
 	const uint8_t  *fb_ies;		/* concatenated TLVs from chip */
-	size_t		fb_ielen;
+	size_t		fb_ielen;	/* length of fb_ies */
 };
 
 /*
- * Assoc request. The framework passes this to the driver when
- * net80211 (or a user JOIN sysctl) asks to associate. Set fields
- * are non-zero. ssidlen of 0 means "use the stored config"
- * (some FullMAC chips associate with no host SSID at all).
+ * Association request the framework hands the driver when net80211
+ * (or a userspace JOIN sysctl) asks for an association.  Set fields
+ * are non-zero; zero ssidlen means "use stored configuration"
+ * (some FullMAC chips associate without a host-side SSID at all).
  */
 struct ieee80211_fmac_assoc {
-	uint8_t		fa_bssid[IEEE80211_ADDR_LEN];
-	uint8_t		fa_ssid[IEEE80211_NWID_LEN];
-	uint8_t		fa_ssidlen;
-	uint16_t	fa_chan_freq;
+	uint8_t		fa_bssid[IEEE80211_ADDR_LEN];	/* AP MAC address to join */
+	uint8_t		fa_ssid[IEEE80211_NWID_LEN];	/* network name to join */
+	uint8_t		fa_ssidlen;	/* network name length */
+	uint16_t	fa_chan_freq;	/* channel frequency (MHz) */
 	uint32_t	fa_wpa_auth;	/* WPA_AUTH_* */
 	uint32_t	fa_wsec;	/* CRYPTO_WEP/TKIP/AES bits */
 	const uint8_t  *fa_ies;		/* host-built RSN IE etc. */
-	size_t		fa_ielen;
+	size_t		fa_ielen;	/* length of fa_ies */
 };
 
 /*
- * Ops table. Required entries are marked. Optional ones can be
- * NULL when the chip has no path for that. All ops run in
- * process or taskqueue context, never in an IRQ. The framework
- * defers anything that would come from a hardirq.
+ * Ops vtable.  Required entries are marked; optional ones may be
+ * NULL when the chip doesn't expose that path.  All ops are called
+ * from process or taskqueue context (never IRQ) — the framework
+ * defers anything that would arrive from a hardirq.
  *
- * Return value: 0 on success, errno on failure.
+ * Return value convention: 0 on success, errno on failure.
  */
 struct ieee80211_fullmac_ops {
 	const char	*fmop_name;	/* driver tag for diag (required) */
@@ -124,7 +147,12 @@ struct ieee80211_fullmac_ops {
 	int		(*fmop_disassoc)(struct ieee80211com *,
 			    uint16_t reason);
 
-	/* Key install.  fmop_set_key required; del optional. */
+	/*
+	 * Key install.  fmop_set_key required; del optional.  Both return
+	 * an errno (0 = done, ENXIO = let net80211's own hook handle it);
+	 * the framework translates to net80211's nonzero-is-success
+	 * iv_key_set convention.
+	 */
 	int		(*fmop_set_key)(struct ieee80211com *,
 			    const struct ieee80211_key *);
 	int		(*fmop_del_key)(struct ieee80211com *,
@@ -139,9 +167,10 @@ struct ieee80211_fullmac_ops {
 			    const uint8_t *pmk, size_t pmklen);
 
 	/*
-	 * Optional. Send an EAPOL frame back to the host's
-	 * wpa_supplicant. When NULL, the framework forwards it
-	 * via ieee80211_input_all() like plain 802.3.
+	 * Optional: emit an EAPOL frame back at the host's
+	 * wpa_supplicant.  Not called by the framework yet; EAPOL
+	 * is delivered by ieee80211_fmac_eapol_rx through
+	 * ieee80211_vap_deliver_data.
 	 */
 	int		(*fmop_eapol_tx)(struct ieee80211com *,
 			    const void *buf, size_t len);
@@ -152,7 +181,7 @@ struct ieee80211_fullmac_ops {
 };
 
 /*
- * Feature bits the driver passes to ieee80211_fmac_attach() so
+ * Capability bits the driver passes to ieee80211_fmac_attach() so
  * the framework knows which net80211 slots to take over.
  */
 #define	IEEE80211_FMAC_CAP_ONCHIP_SUP	0x0001	/* on-chip supplicant */

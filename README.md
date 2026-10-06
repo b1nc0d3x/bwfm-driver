@@ -1,96 +1,135 @@
-# brcm — FreeBSD FullMAC driver for Broadcom wifi
+# brcm — FreeBSD driver for Broadcom FullMAC wifi
 
-A native FreeBSD driver for Broadcom FullMAC wifi chips. It
-supports the three common ways these chips plug in:
+A native FreeBSD driver for Broadcom FullMAC wifi chips, the ones that run
+their own firmware and leave the host to configure joins and install keys.
+It comes as three loadable modules, one per bus, sharing one source tree in
+`sys/dev/brcm/`:
 
-- **`brcm_pci`** — PCIe cards, mainly BCM43602 (`14e4:43ba`)
-- **`brcm_usb`** — USB dongles (BCM43143, 43236b, 43242a, 4329,
-  4330, 4334, 4335 etc.)
-- **`brcm_sdio`** — SDIO chips found on ARM boards (BCM43143,
-  43241, 4329, 4330, 4334, 4335, 43362, 43430, 43455 etc.)
+- `brcm_pci` for PCIe cards
+- `brcm_sdio` for SDIO chips on ARM boards such as the Raspberry Pi
+- `brcm_usb` for USB dongles
 
-The three bus bindings share the net80211 glue, the chip
-backplane walk, the FullMAC shim, and register defs. All in one
-`sys/dev/brcm/` tree. Each loadable module builds only the parts
-it needs.
+Station mode with WPA2-PSK works on all three. net80211 and wpa_supplicant
+drive the join and the 4-way handshake, and the driver installs the keys
+in the firmware.
 
-## Status
+## Tested hardware
 
-- **`brcm_pci`** on BCM43602 — STA mode, WPA2-PSK,
-  WPA2-PSK-SHA256, and 802.11w MFP (BIP-CMAC-128) all work
-  end-to-end. PTK, GTK, and IGTK install. DHCP finishes.
-  Over-the-air captures show MFP is on.
-- **`brcm_usb`** and **`brcm_sdio`** — attach, firmware upload,
-  and basic net80211 registration all work. They use the same
-  core join code but have had less testing than PCIe.
+| Bus  | Chip                   | Where it was tested        |
+|------|------------------------|----------------------------|
+| PCIe | BCM43602 (`14e4:43ba`) | MacBook Pro, amd64         |
+| SDIO | BCM43455               | Raspberry Pi 4, arm64      |
+| USB  | BCM43236 rev B         | USB dongle on a Pi 4       |
 
-## What is known to work
+Other chips are recognised by the driver's tables (PCIe BCM4350, 4360,
+4364, 4365, 4366; SDIO BCM43430, 43456 and others; USB BCM43143, 43242,
+43569), but they have not been tested, and most need firmware this
+repository does not ship.
 
-- WPA2-PSK join + DHCP + real traffic
-- WPA2-PSK-SHA256 + 802.11w MFP (BIP-CMAC-128) with IGTK
-  install
-- Rejoining across different SSIDs (both ways)
-- Scanning while joined (no hang, link stays up)
-- Over-the-air MFP check: an Atheros card in monitor mode saw
-  protected Action frames from the AP that our chip accepted
+## Requirements
 
+- FreeBSD 15.0 or later with kernel sources in `/usr/src`.  `brcm_usb` and
+  `brcm_pci` build against the stock sources (tested on 15.0 and 15.1).
+  `brcm_sdio` also needs the kernel's SDIO function layer
+  (`sys/dev/mmc/sdio_func.[ch]` and the matching `mmc.c` changes), which
+  stock FreeBSD does not have yet; it is on the `rkdev` branch of
+  [FBSD_DEV](https://github.com/b1nc0d3x/FBSD_DEV).
+- The net80211 cipher modules. The firmware does the encryption, but
+  net80211 still needs `wlan_ccmp` (and `wlan_tkip` for TKIP group keys)
+  loaded before keys can be installed, so load them first.
+- Firmware. The modules under `sys/modules/*_fw` wrap the firmware images
+  this repository ships (BCM43602, BCM43455, BCM43236) together with their
+  licences. The BCM4360 module is only a slot: supply that image yourself.
 
 ## Build
 
-Each transport is its own loadable module. Build only what you
-need:
+Each module builds on its own. `SRCTOP` points at the top of this
+repository:
 
 ```
-# PCIe
-cd sys/modules/brcm_pci  && SRCTOP=$(pwd)/../../.. make
-# USB
-cd sys/modules/brcm_usb  && SRCTOP=$(pwd)/../../.. make
-# SDIO (needs a newer sdio_func.h than /usr/src ships on 15.x —
-# point KERN_TREE at a CURRENT checkout)
-cd sys/modules/brcm_sdio && SRCTOP=$(pwd)/../../.. KERN_TREE=/path/to/freebsd-src make
+cd sys/modules/brcm_sdio && make SRCTOP=$(pwd)/../../.. SYSDIR=/usr/src/sys
+cd sys/modules/brcm_usb  && make SRCTOP=$(pwd)/../../.. SYSDIR=/usr/src/sys
+cd sys/modules/brcm_pci  && make SRCTOP=$(pwd)/../../.. SYSDIR=/usr/src/sys
 ```
 
-Put the `.ko` file under `/boot/modules/` and `kldload` the one
-you want.
+Build the matching firmware module the same way, for example
+`sys/modules/brcmfmac43455_fw`.
 
-## Kernel needs (802.11w / IGTK)
+## Install
 
-FreeBSD 15.x's stock `net80211` says no to `IOC_WPAKEY` with
-`kid >= 4`. That stops the IGTK install and blocks MFP from
-finishing. You have two choices:
+Copy the modules and refresh the hints:
 
-1. Apply the net80211 IGTK-slots patch. It mirrors Adrian
-   Chadd's WIP D46668 and adds IGTK slots 4/5 to the per-VAP
-   key table. Then rebuild the kernel plus all wlan modules and
-   reboot. The patch is queued for freebsd-wireless / Adrian
-   upstream. Email us if you want an early copy.
-2. Skip MFP. The driver still joins fine to non-MFP APs
-   (`pmf=disable` on the AP or `pmf=0` in wpa_supplicant.conf).
+```
+install -m 555 sys/modules/brcm_sdio/brcm_sdio.ko \
+    sys/modules/brcmfmac43455_fw/brcmfmac43455_fw.ko /boot/modules/
+kldxref /boot/modules
+```
+
+Install the devd rule, which creates the wlan interfaces once a device is
+ready (its firmware can come up after the network has started, and USB
+dongles can arrive at any time):
+
+```
+install -m 644 etc/devd/brcm.conf /usr/local/etc/devd/
+service devd restart
+```
+
+Load the modules from `/etc/rc.conf`, cipher and firmware modules first:
+
+```
+kld_list="wlan_ccmp wlan_tkip brcmfmac43455_fw brcm_sdio"
+```
+
+For USB use `brcmfmac43236b_fw brcm_usb`, and for PCIe
+`brcm_pci_fw_43602 brcm_pci`. Then name the interface and let rc run
+wpa_supplicant and DHCP as usual (the PCIe device is `brcm_pci0`, so its
+line is `wlans_brcm_pci0`):
+
+```
+wlans_brcm0="wlan0"
+ifconfig_wlan0="WPA DHCP"
+```
+
+Each module brings its chip up from attach (firmware download, then
+net80211), so there are no bring-up scripts.  `hw.brcm_sdio.autostart=0`
+or `hw.brcm_pci.autostart=0` at the loader prompt turns that off.
+
+`brcm_sdio` and `brcm_pci` cannot be unloaded while net80211 is
+attached, so replacing them takes a reboot.  `brcm_usb` unloads once its
+wlan interface is destroyed.
+
+## Known issues
+
+- With both an SDIO and a USB chip in one machine, list `brcm_sdio` before
+  `brcm_usb` in `kld_list`.  If the USB device attaches first and the SDIO
+  chip becomes `brcm1`, the SDIO chip associates but receives no data.
 
 ## Layout
 
 ```
 sys/dev/brcm/
-    if_brcm_pci.c           PCIe bus attach, DMA, IRQ, PLL/PMU init
-    if_brcm_usb.c           USB bus attach, bulk-URB fw upload
-    if_brcm_sdio.c          SDIO bus attach
-    if_brcm_sdio_cdev.h     SDIO character device iface
-    brcm_pci_msgbuf.c/.h    msgbuf ring protocol (host <-> fw, PCIe)
-    brcm_sdpcm.c/.h         SDPCM protocol framing (SDIO)
-    brcm.c                  shared net80211 glue, join/roam, key install
-    brcm_chip.c/.h          silicon backplane walk, core reset
-    brcm_sdio_regs.h        SDIO core register defs
-    ieee80211_fullmac.c/.h  FullMAC shim over net80211
-    brcmreg.h               chip register defs, iovar constants
-    brcmvar.h               softc, struct definitions
-    brcm_srom_v11_table.h   SROM v11 layout
-    brcm_stub_arm64.c       arm64 probe-only stub build
-sys/modules/
-    brcm_pci/Makefile       PCIe kmod
-    brcm_usb/Makefile       USB kmod
-    brcm_sdio/Makefile      SDIO kmod
+    brcm.c                  net80211 glue, joins, key install (shared)
+    ieee80211_fullmac.c/.h  FullMAC layer over net80211 (shared)
+    brcmreg.h, brcmvar.h    firmware interface definitions, softc
+    brcm_chip.c/.h          chip backplane walk and core reset
+    if_brcm_pci.c           PCIe attach, firmware download, rings
+    brcm_pci_msgbuf.c/.h    msgbuf protocol (PCIe)
+    if_brcm_sdio.c          SDIO attach and firmware bring-up
+    brcm_sdpcm.c/.h         SDPCM framing (SDIO)
+    brcm_sdio_regs.h        SDIO core registers
+    if_brcm_usb.c           USB attach and firmware download
+sys/modules/                one directory per module and firmware image
+etc/devd/brcm.conf          creates wlan interfaces when a device is ready
 ```
+
+## Credits
+
+The driver was written for FreeBSD, but its firmware interface follows
+Linux brcmfmac (Broadcom) and OpenBSD bwfm (Patrick Wildt). Files that
+carry their definitions say so and keep their ISC notices.
 
 ## License
 
-BSD-2-Clause. See `LICENSE`.
+BSD-2-Clause, see `LICENSE`, except for the portions noted in individual
+files, which are ISC. The firmware images are Broadcom's and come with
+their own licences in `sys/modules/*_fw/`.

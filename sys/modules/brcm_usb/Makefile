@@ -2,10 +2,10 @@
 
 KMOD=	brcm_usb
 
-# One module on its own. Bring in the shared core (brcm.c,
-# ieee80211_fullmac.c) so brcm_usb.ko does not need brcm.ko for
-# brcm_attach / ieee80211_fmac_attach / etc. The old all-in-one
-# `brcm` module in sys/modules/brcm/ is kept for the older USB build.
+# Standalone module.  It links in the shared core (brcm.c,
+# ieee80211_fullmac.c) so that brcm_attach and ieee80211_fmac_attach
+# resolve without a separate brcm.ko.  The monolithic brcm module in
+# sys/modules/brcm/ remains for the USB-only build.
 SRCS=	if_brcm_usb.c \
 	brcm.c \
 	ieee80211_fullmac.c \

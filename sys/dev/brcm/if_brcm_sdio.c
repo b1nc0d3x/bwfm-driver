@@ -3,56 +3,47 @@
  *
  * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
  *
- * Broadcom FullMAC SDIO transport glue for brcm. Targets the
- * BCM43xxx family that the Raspberry Pi 4 has on its internal
- * SDIO bus (BCM43430 / CYW43436 / BCM43455).
+ * Broadcom FullMAC SDIO transport glue for brcm.  Targets the
+ * BCM43xxx family the Raspberry Pi 4 carries on its internal SDIO
+ * bus (BCM43430 / CYW43436 / BCM43455).
  *
- * Life cycle:
- *   1. sdio0 lists I/O functions and creates one newbus child
- *      per function (sdio_func.c). Each child carries
- *      manfid/prodid/class ivars via SDIO_ACCESSOR().
- *   2. probe() matches on (manfid, prodid) being the Broadcom
- *      WLAN function (manfid=0x02d0, prodid in the BCM43xxx
- *      table) AND func_num == 1, the WLAN function. Functions
- *      2 and 3 are vendor management interfaces we do not
- *      drive yet.
- *   3. attach() grabs the parent sdio bus device so the bus_ops
- *      can send CMD52/CMD53 via sdio_read_byte() /
- *      sdio_write_byte(). Records the chip identity for
- *      logging. Does NOT yet pull firmware or call
- *      brcm_attach(). Those need the backplane-window CMD53
- *      path plus per-chip si_pmu init, still on the todo list.
- *   4. detach() releases the child.
+ * Lifecycle:
+ *   1. sdio0 enumerates I/O functions and creates one newbus child per
+ *      function (sdio_func.c).  Each child carries manfid/prodid/class
+ *      ivars exposed via SDIO_ACCESSOR().
+ *   2. probe() matches on (manfid, prodid) being the Broadcom WLAN
+ *      function (manfid=0x02d0, prodid in the BCM43xxx table) AND
+ *      func_num == 1 — the backplane function.  Function 2 is the
+ *      WLAN frame FIFO, handled by the brcm_sdio_f2 sibling driver;
+ *      function 3, where present, is Bluetooth and not driven here.
+ *   3. attach() captures the parent sdio bus and starts the autostart
+ *      thread (hw.brcm_sdio.autostart), which downloads the firmware,
+ *      releases the CR4 and calls brcm_attach() so net80211 can bind.
+ *   4. detach() reverses everything (see brcm_sdio_detach: the
+ *      watchdog and taskqueues are drained, then the common teardown
+ *      runs).
  *
- * What this scaffold proves:
- *   - The sdio function bus + per-function CIS parser make
- *     correctly-keyed children.
- *   - newbus binds brcm_sdio to func 1.
- *   - The bus_ops table plumbs to SDIO without dragging in
- *     brcm.c yet.
- *
- * What is stubbed on purpose:
- *   - bs_txctl / bs_rxctl / bs_txdata return ENOTSUP. There is
- *     no firmware running yet, so there is nothing to talk to.
- *   - bs_stop is a no-op.
- *   - No brcm_attach() call. net80211 would try to bring up
- *     the interface and panic on missing firmware. Wire it up
- *     in the next phase, after CMD53 + backplane window +
- *     firmware upload land.
+ * The chip bring-up and firmware download sequences follow Linux
+ * brcmfmac (sdio.c, bcmsdh.c, chip.c; Broadcom) and OpenBSD
+ * sys/dev/sdmmc/if_bwfm_sdio.c (Patrick Wildt); the code was written
+ * for this driver.
  */
 
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/bus.h>
 #include <sys/kernel.h>
+#include <sys/kthread.h>
 #include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/mbuf.h>
 #include <sys/module.h>
 #include <sys/mutex.h>
 #include <sys/socket.h>
+#include <sys/sbuf.h>
 #include <sys/sysctl.h>
 #include <sys/firmware.h>
+#include <sys/priv.h>		/* priv_check(td, PRIV_DRIVER) */
 #include <sys/proc.h>		/* kern_yield, thread_lock, curthread */
 #include <sys/sched.h>		/* sched_bind / sched_unbind */
 #include <sys/smp.h>		/* mp_ncpus */
@@ -81,6 +72,21 @@
 #include <dev/brcm/brcm_sdio_regs.h>
 #include <dev/brcm/if_brcm_sdio_cdev.h>
 #include <dev/brcm/brcm_chip.h>
+
+/*
+ * BCM43455 (CYW43455, rev 6) SOCRAM: 800 KB from ram_base 0x198000, so
+ * RAM ends at 0x260000.  The size matters: the firmware looks for its
+ * NVRAM at the end of RAM, and if it is placed short of the real end
+ * the firmware runs without the board's radio settings (every AUTH is
+ * NO_ACK).  Backplane reads succeed through 0x25fffc and fail at
+ * 0x260000, and the firmware publishes its sdpcm_shared pointer in the
+ * last word, 0x25fffc.  Linux brcmfmac sizes the same RAM from the CR4
+ * bank registers and gets 0xC8000.
+ */
+#define	BRCM_43455_RAM_BASE	0x00198000u
+#define	BRCM_43455_RAM_SIZE	0x000c8000u
+#define	BRCM_43455_RAM_END	(BRCM_43455_RAM_BASE + BRCM_43455_RAM_SIZE)
+#define	BRCM_43455_SHARED_SLOT	(BRCM_43455_RAM_END - 4)
 
 #ifdef __aarch64__
 #include <arm/broadcom/bcm2835/bcm2835_firmware.h>
@@ -121,26 +127,48 @@ struct brcm_sdio_softc {
 	 * Per-sc event delivery queue.  SDPCM rx callback enqueues an
 	 * mbuf-wrapped raw EVENT body here; sc_event_rx_task drains it
 	 * on a dedicated kernel taskqueue thread and calls brcm_rx_frame.
-	 * Mirrors Linux brcmfmac's event_worker pattern (see Pi 3B
-	 * ftrace recon).
+	 * Mirrors Linux brcmfmac's event_worker pattern.
 	 */
 	struct mtx		 sc_event_rx_mtx;
 	struct mbufq		 sc_event_rx_q;
 	struct task		 sc_event_rx_task;
 	struct taskqueue	*sc_event_rx_tq;
+	/*
+	 * Data transmit queue.  net80211 calls ic_transmit with its TX lock
+	 * (a mutex) held, and an SDIO write sleeps (sc_chip_sx, then the
+	 * MMC request), so brcm_sdio_txdata only queues the frame and
+	 * sc_tx_task sends it from its own thread, as brcm_pci does with
+	 * its flow-ring queue.
+	 */
+	struct mtx		 sc_tx_mtx;
+	struct mbufq		 sc_tx_q;
+	/* Mailbox and credit verification counters (dev.brcm.N.sdio_stats). */
+	uint32_t		 st_hmb_int;	/* I_HMB_HOST_INT seen */
+	uint32_t		 st_hmb_ack;	/* SMB_INT_ACK written */
+	uint32_t		 st_hmb_reason[5];	/* per tohostmailboxdata bit */
+	uint32_t		 st_hmb_stuck;	/* bit still set after clearing */
+	uint32_t		 st_fc_on, st_fc_off;
+	int			 st_fc_since;	/* ticks when FC went on */
+	uint32_t		 st_fc_held_ms;
+	uint32_t		 st_credit_waits;
+	uint32_t		 st_credit_wait_max_ms;
+	struct task		 sc_tx_task;
+	struct taskqueue	*sc_tx_tq;
 
 	/*
-	 * Linux-parity periodic SDIO watchdog (sdio.c:3669
-	 * brcmf_sdio_bus_watchdog).  Fires every BRCM_WD_POLL_MS to
-	 * pump the SDIO F2 RX queue -- catches any interrupts our
-	 * ithread missed and, critically, keeps SDIO bus warm so chip
-	 * fw doesn't decide "host is dead" and tear down the assoc
-	 * (BCM43455 fw 7.45.18 does this within milliseconds of ASSOC
-	 * if host is silent -- observed).
+	 * Periodic SDIO watchdog, on the same 10 ms timer + thread
+	 * pattern as Linux brcmf_sdio_watchdog (sdio.c).  Unlike Linux,
+	 * whose brcmf_sdio_bus_watchdog lets an idle bus sleep, it
+	 * fires every BRCM_WD_POLL_MS to pump the SDIO F2 RX queue.  That
+	 * catches interrupts the ithread missed and keeps the bus active:
+	 * BCM43455 firmware 7.45.18 tears down an association within
+	 * milliseconds of ASSOC if the host goes silent.
 	 */
 	struct callout		 sc_wd_callout;
 	struct task		 sc_wd_task;
 	bool			 sc_wd_stop;
+	/* The autostart thread is running; detach waits for it. */
+	bool			 sc_autostart_running;
 };
 
 #define	BRCM_WD_POLL_MS		10
@@ -149,37 +177,49 @@ struct brcm_sdio_softc {
 static void brcm_sdio_watchdog_callout(void *arg);
 static void brcm_sdio_watchdog_task(void *arg, int pending);
 
-/* Forward-decl of the F1 → F2 binding global; defined near the F2
- * sibling driver at the end of this file. */
+/* The F1 -> F2 binding global; defined with the F2 sibling driver. */
 static struct brcm_sdio_softc * volatile brcm_sdio_global_softc;
 
-/* Forward-decl of the F2 sibling driver's per-instance softc; defined
- * with the rest of the F2 plumbing below.  attach() walks the sdio
- * bus children looking for an already-attached "brcm_f2" and binds
- * itself to it via this struct. */
+/*
+ * Bring the chip up after attach, from a kernel thread: chip id,
+ * firmware download, CR4 release and net80211 attach, the same steps as
+ * the read_chipid, load_firmware, release_cr4 and net80211_attach
+ * sysctls.  The firmware module (e.g. brcmfmac43455_fw) must be loaded
+ * first.  0 leaves the bring-up to those sysctls; if it goes wrong at
+ * boot, "set hw.brcm_sdio.autostart=0" at the loader prompt.
+ */
+static SYSCTL_NODE(_hw, OID_AUTO, brcm_sdio, CTLFLAG_RD | CTLFLAG_MPSAFE, 0,
+    "Broadcom FullMAC SDIO driver");
+static int brcm_sdio_autostart_dflt = 1;
+SYSCTL_INT(_hw_brcm_sdio, OID_AUTO, autostart, CTLFLAG_RDTUN,
+    &brcm_sdio_autostart_dflt, 0,
+    "Bring the chip up (firmware, net80211) after attach.  "
+    "0 leaves it to the bring-up sysctls.");
+
+static int	brcm_sdio_net80211_attach_now(struct brcm_sdio_softc *);
+static void	brcm_sdio_autostart(void *);
+
+/*
+ * The F2 sibling driver's softc, defined with the F2 code below.
+ * attach() looks for an already-attached "brcm_f2" among the sdio bus
+ * children and binds to it through this struct.
+ */
 struct brcm_sdio_f2_softc;
 
 /*
- * DPRINTF(&sc->bsc_base, level, ...) — defined by brcmvar.h, gated on
- * the per-instance sc_debug exposed as dev.brcm.N.debug (added at
- * attach below).  Levels per the core driver convention:
+ * DPRINTF(&sc->bsc_base, level, ...) comes from brcmvar.h and is gated
+ * on sc_debug in the embedded brcm_softc, exposed as dev.brcm.N.debug,
+ * so it behaves the same on the USB, PCI and SDIO transports:
  *   0 = silent (default)
  *   1 = milestones (attach checkpoints, chip-id, firmware load steps)
  *   2 = protocol (each CMD52/CMD53 + BCDC header)
  *   3 = per-frame / hex dumps
- *
- * sc_debug lives in the embedded brcm_softc (bsc_base) so the
- * standard brcm DPRINTF macro picks it up uniformly across USB /
- * PCI / SDIO transports.
  */
 
 /*
  * Recognised BCM43xxx prodids (manfid is always 0x02d0 = Broadcom).
- * Keep the list narrow at first — we want explicit support tables, not
- * wildcard claims.  Each entry will gain a chip-id row when we wire up
- * the firmware loader; for now the table is just a probe filter.
- *
- * Names use the Broadcom marketing IDs; Cypress's post-acquisition
+ * The list is explicit rather than a wildcard claim; it is only a probe
+ * filter.  Names use the Broadcom marketing IDs; Cypress's post-acquisition
  * relabelling is noted in comments where the chip changed name.
  */
 struct brcm_sdio_match {
@@ -206,6 +246,7 @@ static const struct brcm_sdio_match brcm_sdio_chips[] = {
 	{ SDIO_DEVICE_BCM43456, "BCM43456 WLAN (Pi CM4)" },
 };
 
+/* find the table entry for a product id */
 static const struct brcm_sdio_match *
 brcm_sdio_lookup(uint16_t prodid)
 {
@@ -220,15 +261,13 @@ brcm_sdio_lookup(uint16_t prodid)
 
 /* ------------------------------------------------------------------
  * BCM43xxx chip bring-up — function 1 enable, backplane window,
- * chip-id readback.  Tier 0 of the firmware-upload path: until these
- * work, every higher-level operation (firmware blob upload, mailbox
- * setup, BCDC commands) is unreachable because they all need either
- * func 1 to be enabled or the backplane window to be addressable.
+ * chip-id readback.  Everything later (firmware upload, mailbox setup,
+ * BCDC commands) needs function 1 enabled and the backplane window
+ * addressable.
  *
- * Sequence below mirrors the early lines of Linux brcmfmac's
- * brcmf_sdio_probe() in drivers/net/wireless/broadcom/brcm80211/
- * brcmfmac/sdio.c — we don't follow the Linux structure verbatim, but
- * the chip-side semantics are identical:
+ * The sequence has the same chip-side semantics as the start of Linux
+ * brcmfmac's brcmf_sdio_probe() (brcmfmac/sdio.c), though the code is
+ * structured differently:
  *
  *   1.  CCCR.IO_EN |= 0x02      (host signals "please bring up F1")
  *   2.  poll CCCR.IO_READY      (chip ACKs "F1 is live")
@@ -236,10 +275,9 @@ brcm_sdio_lookup(uint16_t prodid)
  *   4.  CMD53 read 4 bytes      (host fetches CC.CHIPID from
  *                                chip-internal address 0x18000000)
  *
- * If step 4 returns a sensible chip_id (matches the SDIO CIS prodid
- * we already saw), the whole backplane path is healthy and we know
- * the chip's PLL is stable enough to clock its internal AXI fabric.
- * That's the prerequisite the firmware uploader will rely on.
+ * A chip_id matching the SDIO CIS prodid shows the backplane path works
+ * and the chip's PLL is stable enough to clock its internal AXI fabric,
+ * which the firmware upload relies on.
  * ------------------------------------------------------------------ */
 
 /*
@@ -297,20 +335,20 @@ brcm_sdio_kso_enable(struct brcm_sdio_softc *sc)
 /*
  * Buscore prep: force ALP and lock HW clock request off.
  *
- * This is the EXACT preamble Linux brcmfmac runs in
- * brcmf_sdio_buscoreprep() before chip recognition.  Skipping it
- * means HT_AVAIL_REQ can be acknowledged (bit stays set) but the
- * chip's PMU never spins up HT.  The trick is sequential: force
- * ALP first, wait for it, lock the hw-clock-request OFF, only then
- * release the lock and ask for HT.
+ * This is the preamble Linux brcmfmac runs in brcmf_sdio_buscoreprep()
+ * before chip recognition.  Without it HT_AVAIL_REQ is acknowledged
+ * (the bit stays set) but the PMU never spins up HT.  The order
+ * matters: force ALP, wait for it, lock the hw clock request off, and
+ * only then release the lock and ask for HT.
  *
- * Steps verbatim from Linux:
+ * Steps from Linux (only the ALP timeout differs):
  *   1. CHIPCLKCSR = FORCE_HW_CLKREQ_OFF | ALP_AVAIL_REQ  (0x28)
  *      -- ask for ALP and prevent the chip from auto-requesting HT.
- *   2. Read back; the low 5 bits (CSR_MASK) must match what we wrote
- *      (the upper bits are AV status the chip sets).
- *   3. Poll for ALP_AVAIL (bit 6, 0x40) up to ~5 s.  Linux comments
- *      say "may take up to 15 ms".
+ *   2. Read back; every bit except the two AVAIL status bits
+ *      (SBSDIO_AVBITS, 0xC0) must match what we wrote.
+ *   3. Poll for ALP_AVAIL (bit 6, 0x40) up to ~5 s.  Linux waits up
+ *      to 1 s (PMU_MAX_TRANSITION_DLY); its comment says "may take
+ *      up to 15 ms".
  *   4. CHIPCLKCSR = FORCE_HW_CLKREQ_OFF | FORCE_ALP  (0x21)
  *      -- lock the chip on ALP.
  *   5. DELAY(65).
@@ -416,10 +454,9 @@ brcm_sdio_buscoreprep(struct brcm_sdio_softc *sc)
  *    earlier in halt_cr4_now); without them the SR-capable chip
  *    treats even FORCE_HT as a request to dismiss.
  *
- * Discriminating which flavour we're on: every BCM43xxx chip the
- * SDIO bus enumerates here is SR-capable in practice -- the few
- * non-SR-capable parts (BCM43340/43342/43362) predate the SDIO bus
- * support tier we promise.  Treat every chip as SR-capable.
+ * Every chip this driver supports is SR-capable in practice; the
+ * non-SR parts (BCM43340/43342/43362) are older than anything we
+ * claim to support, so every chip is treated as SR-capable.
  *
  * CHIPCLKCSR + WAKEUPCTRL live at func 1 SDIO offsets below 0x18000
  * so they do NOT need the backplane window programmed; CMD52 to
@@ -457,7 +494,7 @@ brcm_sdio_request_ht_clock(struct brcm_sdio_softc *sc)
 
 	/*
 	 * Clear all clock requests first so the next write isn't OR-ing
-	 * with a stale CHIPCLKCSR.  Mirrors OpenBSD brcm_sdio_attach's
+	 * with a stale CHIPCLKCSR.  Mirrors OpenBSD bwfm_sdio_attach's
 	 * final CHIPCLKCSR=0 after the WLANRESET + RES_RELOAD pair --
 	 * gets the chip out of "asking for ALP" before we ask for HT.
 	 */
@@ -483,13 +520,10 @@ brcm_sdio_request_ht_clock(struct brcm_sdio_softc *sc)
 
 	/*
 	 * Poll for HT_AVAIL but treat its absence as informational, not
-	 * fatal.  On SR-capable chips the WHD reference path never
-	 * polls -- KSO + FORCE_HT are the contract and backplane writes
-	 * are expected to work even if CHIPCLKCSR doesn't surface
-	 * HT_AVAIL.  If HT_AVAIL never sets we still return 0; the next
-	 * step (CR4 IOCTL write) is the real test of whether HT actually
-	 * latches.  If that write also fails to latch we'll know
-	 * FORCE_HT wasn't enough on this chip.
+	 * fatal.  On SR-capable chips the WHD reference path never polls:
+	 * KSO + FORCE_HT are the contract, and backplane writes are
+	 * expected to work even if CHIPCLKCSR doesn't show HT_AVAIL.  The
+	 * next step, the CR4 IOCTL write, is the real test.
 	 */
 	for (retries = 0; retries < 200; retries++) {
 		err = sdio_read_byte(sc->sc_dev, SBSDIO_FUNC1_CHIPCLKCSR,
@@ -635,34 +669,29 @@ brcm_sdio_set_backplane(struct brcm_sdio_softc *sc, uint32_t chip_addr)
 	diff = newbase ^ sc->sc_sbwad;
 
 	/*
-	 * Skip only when we already have an established cached window
-	 * (sc_sbwad != 0) AND the new base falls inside it.  When
-	 * sc_sbwad == 0 the cache is uninitialised -- this happens at
-	 * cold attach, after kldunload/kldload, and after any I/O error
-	 * that forced a reset of sc_sbwad in the fail: path below.
-	 * The chip's SBADDR* bytes may carry leftover state from a
-	 * prior session, so we cannot trust the diff and must write
-	 * every byte to bring the window to a known state.
+	 * Skip only when a cached window is established (sc_sbwad != 0)
+	 * and the new base falls inside it.  sc_sbwad == 0 means the
+	 * cache is uninitialised: cold attach, after a module reload, or
+	 * after an I/O error reset it in the fail: path below.  The
+	 * chip's SBADDR* bytes may hold leftover state then, so the diff
+	 * cannot be trusted and every byte must be written.
 	 */
 	if (sc->sc_sbwad != 0 && diff == 0)
 		return (0);
 
 	/*
-	 * Linux-style "only write the SBADDR bytes that actually changed",
-	 * with one wrinkle: on cold/post-error (sc_sbwad == 0) write all
-	 * three regardless of the diff bits.  Otherwise a stale chip-side
-	 * byte that happens to be non-zero but matches diff==0 would
-	 * leave the window pointing at the wrong region (e.g. the prior
-	 * session left SBADDRMID=0x10 for a CR4 access, and we now want
-	 * CC.CHIPID at 0x18000000 -- without the unconditional cold
-	 * write we'd read 0x18100000 by mistake).
+	 * Only write the SBADDR bytes that actually changed.  (Linux
+	 * skips the update only when the whole window is unchanged and
+	 * otherwise writes all three bytes.)  When cold (sc_sbwad == 0)
+	 * all three are written regardless of the diff, because a stale
+	 * chip-side byte would otherwise leave the window on the wrong
+	 * region: a leftover SBADDRMID=0x10 from a CR4 access would turn
+	 * a CC.CHIPID read at 0x18000000 into one at 0x18100000.
 	 *
-	 * The byte values are taken from newbase, not chip_addr, so the
-	 * lower bits of chip_addr (which the chip masks anyway via the
-	 * SDIO offset on every access) can't accidentally end up in
-	 * SBADDR{LOW,MID}.  Historical bug: chip_addr=0x18000400 used to
-	 * write SBADDRLOW=0x04 here, wedging the next CMD53 with
-	 * MMC_ERR_INVALID until the chip recovered.
+	 * The byte values come from newbase, not chip_addr, so the low
+	 * bits of chip_addr can't end up in SBADDR{LOW,MID}; a stray
+	 * SBADDRLOW=0x04 (from chip_addr=0x18000400) wedges the next
+	 * CMD53 with MMC_ERR_INVALID until the chip recovers.
 	 */
 	cold = (sc->sc_sbwad == 0);
 
@@ -736,9 +765,8 @@ brcm_sdio_bp_write32(struct brcm_sdio_softc *sc, uint32_t chip_addr,
  * a wide access — without it the chip serves the request 1 byte at a
  * time regardless of CMD53's count field.
  *
- * Buffer alignment: the value lands in a local uint32_t which sits at
- * a 4-byte-aligned slot on the stack; the host (bcm2835_sdhci on Pi 4)
- * can DMA directly into it.  Caller's `*valp` is filled only on
+ * The value lands in a 4-byte-aligned local uint32_t that the host
+ * controller can DMA into directly.  `*valp` is filled only on
  * success.
  */
 static int
@@ -782,17 +810,16 @@ brcm_sdio_bp_read32(struct brcm_sdio_softc *sc, uint32_t chip_addr,
  * row->chip_id AND (1 << rev) & row->chiprev_mask, top to bottom.
  *
  * Source of truth: Linux brcmfmac drivers/net/wireless/broadcom/
- * brcm80211/brcmfmac/sdio.c brcmf_sdio_fwnames[] (2026 head, cross-
- * checked against the rambase function in chip.c).  We only include
- * the chips that actually ship on hardware we expect to see in the
- * field (Pi 3, Pi 4, common dev boards); the long tail can be added
- * as it turns up.
+ * brcm80211/brcmfmac/sdio.c brcmf_sdio_fwnames[], cross-checked
+ * against the rambase function in chip.c.  Only chips found on common
+ * hardware (Pi 3, Pi 4, common dev boards) are listed.  One row
+ * departs from Linux: the 43430 rev A1 row asks for
+ * brcmfmac43430a1-sdio, where Linux uses brcmfmac43430-sdio.
  *
- * Important note on Pi 4: the SDIO CIS prodid 0xa9a6 is shared by
- * BCM43430-class and BCM43455-class boards.  Our Pi 4 sample reads
- * CC.CHIPID = 0x4345 rev 6, so it's actually BCM43455 silicon --
- * different firmware from BCM43430.  Always select firmware from
- * CC.CHIPID, never from the SDIO prodid.
+ * The SDIO CIS prodid 0xa9a6 is shared by BCM43430-class and
+ * BCM43455-class boards; a Pi 4 with that prodid reads CC.CHIPID =
+ * 0x4345 rev 6, which is BCM43455 silicon needing different firmware.
+ * Always select firmware from CC.CHIPID, never from the SDIO prodid.
  */
 static const struct brcm_sdio_chip_recipe brcm_sdio_recipes[] = {
 	{ BRCM_CHIP_BCM43430, 0x00000001, 0x000000, BRCM_ARM_CM3,
@@ -845,6 +872,7 @@ brcm_sdio_lookup_recipe(uint16_t chip_id, uint8_t chip_rev)
 	return (NULL);
 }
 
+/* readable name for an ARM core */
 static const char *
 brcm_sdio_arm_name(enum brcm_arm_core c)
 {
@@ -903,15 +931,10 @@ brcm_sdio_read_chipid_now(struct brcm_sdio_softc *sc)
 	    r->nvram_board != NULL ? r->nvram_board : r->fw_name);
 
 	/*
-	 * Final verification step: try to look up the firmware blobs
-	 * via firmware(9).  If brcmfmac<chip>_fw.ko is loaded (or built
-	 * into the kernel), firmware_get() returns a handle and we log
-	 * the blob size as proof the upload path will have something to
-	 * push.  If it's missing the operator sees exactly which
-	 * filename to install -- usually just a kldload away.
-	 *
-	 * We release the references immediately; the actual firmware
-	 * upload path will re-acquire them when it's ready to run.
+	 * Look up the firmware blobs via firmware(9) and log their sizes,
+	 * or, if missing, the filename the operator needs to install.
+	 * The references are released at once; the upload path takes
+	 * its own.
 	 */
 	{
 		char fwname[64];
@@ -1023,6 +1046,7 @@ brcm_sdio_pin_host_irq(struct brcm_sdio_softc *sc, int cpu)
 	return (0);
 }
 
+/* sysctl: pin the card interrupt to a CPU */
 static int
 brcm_sdio_sysctl_pin_host_irq(SYSCTL_HANDLER_ARGS)
 {
@@ -1047,13 +1071,13 @@ brcm_sdio_sysctl_pin_host_irq(SYSCTL_HANDLER_ARGS)
  * within a single window, reprogramming SBADDR{LOW,MID,HIGH} when the
  * upload crosses a 32-KB boundary.
  *
- * Bulk uses block-mode CMD53 (511 blocks * F1 block_size = 32704 B per
- * transaction).  Block mode bundles the block stream inside the SDHCI
- * hardware, so we get one TRANS_COMPLETE IRQ per CMD53 instead of one
- * per <=64 B byte-mode CMD53.  For a 622 KB firmware upload that
- * drops the interrupt count from ~10k to ~40 -- removes the shared
- * SDHCI ithread saturation that previously starved sdhci_bcm1 (SD
- * card / root FS) into a controller timeout panic.
+ * Bulk can use block-mode CMD53 (511 blocks * F1 block_size = 32704 B
+ * per transaction).  Block mode keeps the block stream inside the
+ * SDHCI hardware, so there is one TRANS_COMPLETE IRQ per CMD53 instead
+ * of one per <=64 B byte-mode CMD53; for a 622 KB firmware upload that
+ * is ~40 interrupts instead of ~10k, which keeps the shared SDHCI
+ * ithread from starving sdhci_bcm1 (SD card / root FS) into a
+ * controller timeout panic.
  *
  * Sub-block tails (len < block_size) fall back to byte-mode CMD53
  * via sdio_write_multi -- only happens at the very end of the
@@ -1146,6 +1170,7 @@ brcm_sdio_cmd53_block_xfer(struct brcm_sdio_softc *sc, uint32_t off,
 	return (0);
 }
 
+/* write a block into the chip's RAM */
 static int
 brcm_sdio_socram_write(struct brcm_sdio_softc *sc, uint32_t chip_addr,
     const void *buf, size_t len)
@@ -1193,10 +1218,9 @@ brcm_sdio_socram_write(struct brcm_sdio_softc *sc, uint32_t chip_addr,
 		} else {
 			/*
 			 * Byte-mode CMD53.  Chunk size capped by the
-			 * dev.brcm.0.byte_chunk tunable -- bcm2835_sdhci has
-			 * a 512-byte DMA segment ceiling, and there may be
-			 * smaller working maxima that we're still bisecting.
-			 * sdio_write_multi will further cap at 512 internally.
+			 * dev.brcm.0.byte_chunk tunable; bcm2835_sdhci has
+			 * a 512-byte DMA segment ceiling, and
+			 * sdio_write_multi also caps at 512.
 			 *
 			 * When the remaining payload is a sub-block tail
 			 * (len < blocksize and < cap), pad up to blocksize
@@ -1286,6 +1310,7 @@ brcm_sdio_socram_write(struct brcm_sdio_softc *sc, uint32_t chip_addr,
 	return (0);
 }
 
+/* read a block from the chip's RAM */
 static int
 brcm_sdio_socram_read(struct brcm_sdio_softc *sc, uint32_t chip_addr,
     void *buf, size_t len)
@@ -1322,20 +1347,100 @@ brcm_sdio_socram_read(struct brcm_sdio_softc *sc, uint32_t chip_addr,
 }
 
 /*
- * Upload firmware (and NVRAM) into SOCRAM.  Matches the
- * brcmf_sdio_download_firmware() / brcm_sdio_load_microcode() path on
- * Linux / OpenBSD: firmware blob at chip ram_base, NVRAM at the
- * tail of RAM at (ram_base + ramsize - nvram_len).  We don't yet know
- * ramsize from chip-side discovery, so plumb in the chip recipe's
- * advertised size (768 KB for BCM43455 by convention).  Verify by
- * reading back the first and last 16 bytes of each region.
+ * Upload firmware (and NVRAM) into chip RAM (the CR4 TCM on
+ * BCM43455).  Matches the brcmf_sdio_download_firmware() /
+ * bwfm_sdio_load_microcode() path on Linux / OpenBSD: firmware blob
+ * at chip ram_base, NVRAM at the tail of RAM at (ram_base + ramsize -
+ * nvram_len).  Unlike Linux we don't read ramsize from the CR4 bank
+ * registers but use the known size (BRCM_43455_RAM_SIZE, 800 KB).  The
+ * first and last 16 bytes of each region are read back to verify.
  *
- * The CR4 wrap stays powered-down through all of this -- which is
- * fine, the upload doesn't touch the wrap.  Releasing CR4 from reset
- * after the upload is the next phase; that's when the chip's PMU
- * brings up the CR4 power island in response to firmware's resource
- * requests.
+ * The CR4 wrap stays powered down throughout, since the upload doesn't
+ * touch it.  The PMU brings up the CR4 power island later, when CR4 is
+ * released from reset and the firmware requests its resources.
  */
+/*
+ * Pack a raw NVRAM text blob into the binary form the firmware expects.
+ *
+ * The .txt we load is human-readable "key=value" lines with comments and
+ * newlines.  The firmware instead wants the lines NUL-separated with the
+ * comments removed, padded to a 4-byte boundary, and a length token as
+ * the final word.  The firmware reads that token at the top of RAM to
+ * locate and parse the NVRAM -- without it the vars (nocrc, board params)
+ * are never found and the fw's integrity check fails.  Port of Linux
+ * brcmfmac brcmf_fw_nvram_strip().  Returns the packed length (including
+ * the 4-byte token) or 0 on failure.
+ */
+static size_t
+brcm_sdio_nvram_strip(const uint8_t *data, size_t data_len,
+    uint8_t *out, size_t out_cap)
+{
+	size_t i = 0, j = 0;
+	uint32_t token, new_length, t_le;
+
+	while (i < data_len) {
+		uint8_t c = data[i];
+
+		/* skip inter-entry whitespace and stray NULs */
+		if (c == ' ' || c == '\t' || c == '\r' || c == '\n' ||
+		    c == '\0') {
+			i++;
+			continue;
+		}
+		/* comment line -> skip to end of line */
+		if (c == '#') {
+			while (i < data_len && data[i] != '\n')
+				i++;
+			continue;
+		}
+		/* entry: accumulate "key=value" until a non-NVRAM char */
+		{
+			size_t start = i, len;
+			bool have_eq = false;
+
+			while (i < data_len) {
+				uint8_t d = data[i];
+
+				/* is_nvram_char: printable ASCII, not '#' */
+				if (d < 0x20 || d >= 0x7f || d == '#')
+					break;
+				if (d == '=')
+					have_eq = true;
+				i++;
+			}
+			len = i - start;
+			/* keep real key=value lines; drop RAW1 + keyless */
+			if (have_eq && len >= 2 &&
+			    !(len >= 4 &&
+			      strncmp((const char *)&data[start], "RAW1", 4) == 0)) {
+				if (j + len + 1 > out_cap)
+					return (0);
+				memcpy(&out[j], &data[start], len);
+				j += len;
+				out[j++] = '\0';
+			}
+		}
+	}
+
+	if (j == 0)
+		return (0);
+
+	/* pad to roundup(len + 1, 4): the extra NUL terminates the list */
+	new_length = (uint32_t)((j + 1 + 3) & ~(size_t)3);
+	if ((size_t)new_length + 4 > out_cap)
+		return (0);
+	while (j < new_length)
+		out[j++] = 0;
+
+	/* length token as the final word: (~n << 16) | (n & 0xffff), n=len/4 */
+	token = new_length / 4;
+	token = (~token << 16) | (token & 0x0000FFFFu);
+	t_le = htole32(token);
+	memcpy(&out[new_length], &t_le, sizeof(t_le));
+
+	return ((size_t)new_length + 4);
+}
+
 static int
 brcm_sdio_load_firmware_now(struct brcm_sdio_softc *sc, bool do_upload)
 {
@@ -1347,17 +1452,17 @@ brcm_sdio_load_firmware_now(struct brcm_sdio_softc *sc, bool do_upload)
 	uint16_t chip_id;
 	uint8_t chip_rev;
 	int err;
-	const uint32_t ramsize_43455 = 0xC0000;	/* 768 KB */
+	const uint32_t ramsize_43455 = BRCM_43455_RAM_SIZE;
 	uint32_t nvram_addr;
 
 	sx_assert(&sc->sc_chip_sx, SA_XLOCKED);
 
 	/*
-	 * Same prelude as halt_cr4_now -- soft-reset first to put the
-	 * chip into a known fresh state regardless of what previous
-	 * sysctl experiments left in place.  Without this, the KSO
-	 * enable loop can hang on a chip whose SLEEPCSR.DEVON is in a
-	 * mid-state from a half-completed prior bring-up.
+	 * Same prelude as halt_cr4_now: soft-reset first so the chip is
+	 * in a known state whatever an earlier attempt left behind.
+	 * Otherwise the KSO enable loop can hang on a chip whose
+	 * SLEEPCSR.DEVON is stuck mid-state from a half-completed
+	 * bring-up.
 	 */
 	device_printf(sc->sc_dev,
 	    "load_firmware: phase 1/8 chip soft-reset (do_upload=%d)\n",
@@ -1416,6 +1521,14 @@ brcm_sdio_load_firmware_now(struct brcm_sdio_softc *sc, bool do_upload)
 	device_printf(sc->sc_dev,
 	    "load_firmware: chip=0x%04x rev=%u ram_base=0x%06x fw=%s\n",
 	    chip_id, chip_rev, r->ram_base, r->fw_name);
+
+	/*
+	 * Publish the fw basename so brcm.c's CLM-blob upload path can
+	 * request the per-chip blob instead of a hardcoded name.
+	 */
+	snprintf(sc->bsc_base.sc_fw_basename,
+	    sizeof(sc->bsc_base.sc_fw_basename),
+	    "brcmfmac%s-sdio", r->fw_name);
 
 	if (!do_upload) {
 		device_printf(sc->sc_dev,
@@ -1521,13 +1634,11 @@ brcm_sdio_load_firmware_now(struct brcm_sdio_softc *sc, bool do_upload)
 	if (memcmp(tail, (const uint8_t *)fw_blob->data +
 	    fw_blob->datasize - sizeof(tail), sizeof(tail)) != 0) {
 		/*
-		 * When fw size is not 4-byte aligned (e.g., 488193 = 0x77301
-		 * for brcmfmac43455-sdio.bin), the SDIO backplane CMD53 read
-		 * of the tail rounds to a 4-byte boundary, producing a
-		 * 1-3 byte shift in the readback vs. source.  The bulk
-		 * upload itself works (HEAD verifies clean and SOCRAM
-		 * activity is visible post-CR4 release).  Warn but don't
-		 * abort.
+		 * When the firmware size is not a multiple of 4 (e.g.
+		 * 488193 = 0x77301 for brcmfmac43455-sdio.bin), the
+		 * backplane CMD53 read of the tail rounds to a 4-byte
+		 * boundary and the readback is shifted by 1-3 bytes.  The
+		 * upload itself is fine, so warn but don't abort.
 		 */
 		device_printf(sc->sc_dev,
 		    "firmware TAIL mismatch (likely SDIO alignment with "
@@ -1544,86 +1655,49 @@ brcm_sdio_load_firmware_now(struct brcm_sdio_softc *sc, bool do_upload)
 	 * NVRAM lives at (ram_base + ramsize - nvram_len) per Linux
 	 * brcmfmac convention.
 	 */
-	nvram_addr = r->ram_base + ramsize_43455 - nvram_blob->datasize;
-	err = brcm_sdio_socram_write(sc, nvram_addr,
-	    nvram_blob->data, nvram_blob->datasize);
-	if (err != 0) {
+	{
+		uint8_t *nvbuf;
+		size_t nvcap = (size_t)nvram_blob->datasize + 16;
+		size_t nvlen;
+		uint32_t tok;
+
+		nvbuf = malloc(nvcap, M_TEMP, M_WAITOK);
+		nvlen = brcm_sdio_nvram_strip(nvram_blob->data,
+		    (size_t)nvram_blob->datasize, nvbuf, nvcap);
+		if (nvlen == 0) {
+			device_printf(sc->sc_dev,
+			    "load_firmware: nvram strip failed\n");
+			free(nvbuf, M_TEMP);
+			err = EINVAL;
+			goto out;
+		}
+		/* stripped blob ends with the token; place it so the
+		 * token lands at ram_base + ramsize - 4. */
+		nvram_addr = r->ram_base + ramsize_43455 - nvlen;
+		err = brcm_sdio_socram_write(sc, nvram_addr, nvbuf, nvlen);
+		if (err != 0) {
+			device_printf(sc->sc_dev,
+			    "load_firmware: nvram upload failed err=%d\n", err);
+			free(nvbuf, M_TEMP);
+			goto out;
+		}
+		tok = nvbuf[nvlen - 4] | (nvbuf[nvlen - 3] << 8) |
+		    (nvbuf[nvlen - 2] << 16) | ((uint32_t)nvbuf[nvlen - 1] << 24);
 		device_printf(sc->sc_dev,
-		    "load_firmware: nvram upload failed err=%d\n", err);
-		goto out;
+		    "NVRAM upload OK: %zu B packed (%zu B raw) at chip "
+		    "0x%08x, token=0x%08x\n",
+		    nvlen, (size_t)nvram_blob->datasize, nvram_addr, tok);
+		free(nvbuf, M_TEMP);
 	}
-	device_printf(sc->sc_dev,
-	    "NVRAM upload OK: %zu B at chip 0x%08x\n",
-	    (size_t)nvram_blob->datasize, nvram_addr);
 
 	/*
-	 * BCM43455 fw integrity-check bypass.
-	 *
-	 * fw[0x4DB3C] runs a handshake against ROM at chip 0xFFE6C70C:
-	 * fw stores a static magic (fw[0x771D8] = 0x28DD9C8E) at sp[20],
-	 * calls ROM, then bne.n 0x4DC7E (panic loop) if returned value
-	 * != ~magic.  On our Pi 4 + FreeBSD path, ROM returns a different
-	 * value than fw expects, hanging the chip before HT/F2/sdpcm.
-	 * Linux brcmfmac does NOT need this bypass (investigation open
-	 * — likely a pre-release register write we still miss).
-	 *
-	 * Surgical NOP of the bne.n at fw[0x4DC1C]:
-	 *   bp_write32 truncates unaligned addresses; chip[0x1E5C1C] is
-	 *   word-aligned.  Write preserves fw[0x4DC1E..0x4DC1F] (ldr r2,
-	 *   [sp, #12] = bytes 0x03 0x9A) and overwrites bne.n bytes 0x2F
-	 *   0xD1 with nop bytes 0x00 0xBF.  Resulting word LE = 0x9A03BF00.
-	 *
-	 * See feedback_brcm_breakpoint_alignment for the alignment rule,
-	 * project_brcm_bypass_technical_note_2026_06_25 for security /
-	 * regulatory notes, and project_brcm_bisection_redo_2026_06_24
-	 * for the 10-probe discovery story.
+	 * No NVRAM pointer seed or firmware patch is needed: with the
+	 * NVRAM at the real end of RAM (see BRCM_43455_RAM_SIZE) the
+	 * firmware finds it by itself, as it does under Linux.
 	 */
-	{
-		uint32_t before = 0, after = 0;
-		(void)brcm_sdio_bp_read32(sc, r->ram_base + 0x4DC1C, &before);
-		if (before == 0x9A03D12Fu) {
-			/*
-			 * 488193 B brcmfmac43455-sdio.bin (md5
-			 * 0324fe9c…): integrity check is here and active.
-			 * Apply the patch.
-			 */
-			err = brcm_sdio_bp_write32(sc,
-			    r->ram_base + 0x4DC1C, 0x9A03BF00u);
-			if (err != 0) {
-				device_printf(sc->sc_dev,
-				    "load_firmware: bypass write failed "
-				    "err=%d\n", err);
-				goto out;
-			}
-			(void)brcm_sdio_bp_read32(sc,
-			    r->ram_base + 0x4DC1C, &after);
-			device_printf(sc->sc_dev,
-			    "BCM43455 integrity-check bypass: chip[0x%08x] "
-			    "0x%08x -> 0x%08x %s\n",
-			    r->ram_base + 0x4DC1C, before, after,
-			    after == 0x9A03BF00u ? "OK" : "MISMATCH");
-			if (after != 0x9A03BF00u) {
-				err = EIO;
-				goto out;
-			}
-		} else {
-			/*
-			 * Different fw blob — bytes don't match the
-			 * 488193 B variant we RE'd.  Likely the 637406 B
-			 * RPi-Distro firmware-nonfree blob.  Skip the
-			 * patch entirely; either this fw doesn't have the
-			 * check, or it's elsewhere we haven't located.
-			 */
-			device_printf(sc->sc_dev,
-			    "BCM43455 integrity-check bypass: chip[0x%08x] = "
-			    "0x%08x (not 0x9A03D12F) -- different fw blob, "
-			    "patch NOT applied\n",
-			    r->ram_base + 0x4DC1C, before);
-		}
-	}
 
 	device_printf(sc->sc_dev,
-	    "load_firmware: phase 8/8 DONE -- firmware + NVRAM + bypass in SOCRAM; "
+	    "load_firmware: phase 8/8 DONE -- firmware + NVRAM in SOCRAM; "
 	    "CR4 release path is the next phase\n");
 
 out:
@@ -1636,14 +1710,13 @@ out:
 }
 
 /*
- * brcm_chip ops adapter — let the bus-agnostic chip layer drive
- * register access through brcm_sdio's existing backplane window
- * helpers.  read32/write32 ignore EIO (returns 0xFFFFFFFF on failure,
- * mirrors Linux's BUSCORE_READ_FAILED sentinel); upper layers handle
- * the sentinel as needed.  prepare wraps buscoreprep so a fresh call
- * site (sysctl handler) can leave the chip in ALPAvail before any
- * indirect read.  activate is not used by phase-1 helpers but plumbed
- * for completeness — it writes the rstvec to chip[0].
+ * brcm_chip ops adapter: the bus-agnostic chip layer does its register
+ * access through the backplane window helpers.  read32 returns
+ * 0xFFFFFFFF on failure, the value Linux's sdio_readl returns on error
+ * and chip.c checks as READ_FAILED; write32 ignores errors.  prepare
+ * wraps buscoreprep so a fresh caller can put the chip in ALPAvail
+ * before any indirect read.  activate clears the SDIO core interrupts
+ * and writes the rstvec to chip address 0.
  */
 static uint32_t
 brcm_sdio_chip_read32(void *ctx, uint32_t addr)
@@ -1656,6 +1729,7 @@ brcm_sdio_chip_read32(void *ctx, uint32_t addr)
 	return (v);
 }
 
+/* write a 32-bit word to a chip address */
 static void
 brcm_sdio_chip_write32(void *ctx, uint32_t addr, uint32_t val)
 {
@@ -1664,6 +1738,7 @@ brcm_sdio_chip_write32(void *ctx, uint32_t addr, uint32_t val)
 	(void)brcm_sdio_bp_write32(sc, addr, val);
 }
 
+/* get the chip backplane ready to probe */
 static int
 brcm_sdio_chip_prepare(void *ctx)
 {
@@ -1672,6 +1747,7 @@ brcm_sdio_chip_prepare(void *ctx)
 	return (brcm_sdio_buscoreprep(sc));
 }
 
+/* clear SDIO interrupts and start the ARM core */
 static void
 brcm_sdio_chip_activate(void *ctx, struct brcm_chip *pub,
     uint32_t rstvec)
@@ -1680,7 +1756,7 @@ brcm_sdio_chip_activate(void *ctx, struct brcm_chip *pub,
 	struct brcm_chip_core *sdio_core;
 
 	/*
-	 * Mirror Linux brcmf_sdio_buscore_activate (sdio.c:3889): clear all
+	 * Mirror Linux brcmf_sdio_buscore_activate (sdio.c): clear all
 	 * SDIO-core interrupts before releasing the ARM.  Without this,
 	 * stale host intrs at fw startup can drive SDPCM to feed the dongle
 	 * before fw is ready.
@@ -1704,11 +1780,11 @@ static const struct brcm_chip_ops brcm_sdio_chip_ops = {
 
 /*
  * Lazy chip-object init.  Caller must hold sc_chip_sx.  Idempotent.
- * Assumes the chip is already in ALPAvail (buscoreprep ran in some
- * prior path -- typically the load_firmware_prelude sysctl).  Phase-1
- * only registers the chipcommon core at SI_ENUM_BASE_DEFAULT
- * (0x18000000 for every BCM43xxx we care about); the full EROM walk
- * port comes in phase 2.
+ * Assumes the chip is already in ALPAvail (buscoreprep has run,
+ * typically via the load_firmware_prelude sysctl).  Only the
+ * chipcommon core at SI_ENUM_BASE_DEFAULT (0x18000000 on every
+ * supported BCM43xxx) is registered here; the EROM walk is done later
+ * by brcm_chip_walk_erom.
  */
 static int
 brcm_sdio_chip_ensure(struct brcm_sdio_softc *sc)
@@ -1836,6 +1912,7 @@ brcm_sdio_sysctl_dump_otp(SYSCTL_HANDLER_ARGS)
 	return (err);
 }
 
+/* sysctl: load firmware into the chip */
 static int
 brcm_sdio_sysctl_load_firmware(SYSCTL_HANDLER_ARGS)
 {
@@ -1846,12 +1923,17 @@ brcm_sdio_sysctl_load_firmware(SYSCTL_HANDLER_ARGS)
 	err = sysctl_handle_int(oidp, &trigger, 0, req);
 	if (err != 0 || req->newptr == NULL || trigger == 0)
 		return (err);
+	if (sc->sc_autostart_running)
+		return (EBUSY);	/* autostart is bringing the chip up */
+	if (sc->bsc_base.sc_ic_attached)
+		return (EBUSY);	/* firmware running: reload the module */
 	sx_xlock(&sc->sc_chip_sx);
 	err = brcm_sdio_load_firmware_now(sc, true);
 	sx_xunlock(&sc->sc_chip_sx);
 	return (err);
 }
 
+/* sysctl: run the pre-firmware setup steps */
 static int
 brcm_sdio_sysctl_load_firmware_prelude(SYSCTL_HANDLER_ARGS)
 {
@@ -1862,12 +1944,17 @@ brcm_sdio_sysctl_load_firmware_prelude(SYSCTL_HANDLER_ARGS)
 	err = sysctl_handle_int(oidp, &trigger, 0, req);
 	if (err != 0 || req->newptr == NULL || trigger == 0)
 		return (err);
+	if (sc->sc_autostart_running)
+		return (EBUSY);	/* autostart is bringing the chip up */
+	if (sc->bsc_base.sc_ic_attached)
+		return (EBUSY);	/* firmware running: reload the module */
 	sx_xlock(&sc->sc_chip_sx);
 	err = brcm_sdio_load_firmware_now(sc, false);
 	sx_xunlock(&sc->sc_chip_sx);
 	return (err);
 }
 
+/* sysctl: read and report the chip id */
 static int
 brcm_sdio_sysctl_read_chipid(SYSCTL_HANDLER_ARGS)
 {
@@ -1880,6 +1967,10 @@ brcm_sdio_sysctl_read_chipid(SYSCTL_HANDLER_ARGS)
 		return (err);
 	if (trigger == 0)
 		return (0);
+	if (sc->sc_autostart_running)
+		return (EBUSY);	/* autostart is bringing the chip up */
+	if (sc->bsc_base.sc_ic_attached)
+		return (EBUSY);	/* firmware running: reload the module */
 	sx_xlock(&sc->sc_chip_sx);
 	err = brcm_sdio_read_chipid_now(sc);
 	sx_xunlock(&sc->sc_chip_sx);
@@ -1887,9 +1978,9 @@ brcm_sdio_sysctl_read_chipid(SYSCTL_HANDLER_ARGS)
 }
 
 /* ------------------------------------------------------------------
- * CR4 halt + release.  The EROM walker has moved into brcm_chip.c
- * (brcm_chip_walk_erom); we just consume the (id, base, wrap) tuples
- * it discovers and drive the CR4-specific wrap-register sequence.
+ * CR4 halt + release.  The EROM walker is in brcm_chip.c
+ * (brcm_chip_walk_erom); this code consumes the (id, base, wrap) tuples
+ * it discovers and drives the CR4-specific wrap-register sequence.
  *
  * Halt sequence: read current IOCTL, keep only CPUHALT, do the
  * resetcore trio (prereset / reset+RESET_CTL / postreset).  Leaves
@@ -1921,9 +2012,8 @@ brcm_sdio_halt_cr4(struct brcm_sdio_softc *sc, uint32_t cr4_wrap)
 	int err;
 
 	/*
-	 * Diagnostic dump before any chip-side writes.  We want a
-	 * fingerprint of the wrap state so we can tell whether subsequent
-	 * writes are landing or being dropped.
+	 * Diagnostic dump of the wrap state before any chip-side writes,
+	 * to tell whether later writes land or are dropped.
 	 *
 	 *   wrap+0x000  (wrap component id, ought to read 0x4bf80800-ish
 	 *                on AI cores with CR4's id 0x83e encoded in bits)
@@ -1932,11 +2022,9 @@ brcm_sdio_halt_cr4(struct brcm_sdio_softc *sc, uint32_t cr4_wrap)
 	 *   wrap+0x800  (BCMA_RESET_CTL, what halt also manipulates)
 	 *
 	 * If wrap+0/4 read sensibly but +408/+800 read as 0 with no
-	 * error, the wrap's status side is on a different clock domain
-	 * from the IOCTL/RESET_CTL side -- which would be the smoking
-	 * gun for "wrap clock not running".  Also dump CC.PMUCONTROL
-	 * which we know is writeable, to confirm chipcommon backplane
-	 * writes really do land.
+	 * error, the IOCTL/RESET_CTL side is on a clock domain that is
+	 * not running.  CC.PMUCONTROL, which is known to be writeable, is
+	 * dumped too, to confirm chipcommon backplane writes land.
 	 */
 	(void)brcm_sdio_bp_read32(sc, cr4_wrap + 0x000, &wrap_id);
 	(void)brcm_sdio_bp_read32(sc, cr4_wrap + 0x004, &wrap_state);
@@ -1954,15 +2042,13 @@ brcm_sdio_halt_cr4(struct brcm_sdio_softc *sc, uint32_t cr4_wrap)
 	    pmuctl_before);
 
 	/*
-	 * SOCRAM write/read probe.  Firmware lives in SOCRAM at chip
-	 * address 0x198000 on BCM43455.  Unlike the CR4 wrap, SOCRAM is
-	 * always-on (it's where firmware was upload-staged on the chips
-	 * brcmfmac was originally targeted at, and the chip's boot ROM
-	 * leaves it accessible).  Writing a recognisable pattern and
-	 * reading it back is the proof-of-life test for the firmware-
-	 * upload path -- if this round-trips, the next step is uploading
-	 * the actual brcmfmac43455-sdio.bin and triggering CR4 to boot
-	 * from it.
+	 * RAM write/read probe.  Firmware lives in chip RAM at address
+	 * 0x198000 on BCM43455.  On this CR4 chip that RAM is the CR4's
+	 * TCM (Linux sizes it from the CR4 core; there is no SOCRAM
+	 * core), though this driver calls it SOCRAM.  Unlike the CR4
+	 * wrap, it is always on (the boot ROM leaves it accessible).
+	 * Writing a pattern and reading it back checks the path the
+	 * firmware upload will use.
 	 */
 	{
 		uint32_t pattern, readback;
@@ -2057,11 +2143,10 @@ brcm_sdio_halt_cr4(struct brcm_sdio_softc *sc, uint32_t cr4_wrap)
 	    "(write DROPPED -- backplane writes are broken)");
 
 	/*
-	 * Reset/halt dance now lives in brcm_chip_disable_arm — same
-	 * sequence (prereset = CPUHALT bit preserved, in-reset configure
-	 * = CPUHALT, postreset = CPUHALT|CLK), just driven through the
-	 * chip layer's AI resetcore primitive so the next ARM-class chip
-	 * we add gets it for free.
+	 * The reset/halt sequence (prereset = CPUHALT bit preserved,
+	 * in-reset configure = CPUHALT, postreset = CPUHALT|CLK) is done by
+	 * brcm_chip_disable_arm through the chip layer's AI resetcore
+	 * primitive, so other ARM-class chips share it.
 	 */
 	err = brcm_chip_disable_arm(&sc->sc_chip, BCMA_CORE_ARM_CR4);
 	if (err != 0) {
@@ -2085,14 +2170,13 @@ brcm_sdio_halt_cr4(struct brcm_sdio_softc *sc, uint32_t cr4_wrap)
  * WL_REG_ON cold-reset via Raspberry Pi firmware mailbox.
  *
  * The BCM43455 on Pi 4 sits behind WL_REG_ON, a power-enable pin on the
- * firmware-side GPIO expander (NOT a chip-side BCM2711 GPIO).  When the
- * Pi boots, its boot ROM brings WL_REG_ON high and then runs the chip's
- * boot ROM, which leaves the chip in a state where Linux brcmfmac's
- * Linux-derived clock-gating preamble (CHIPCLKCSR FORCE_HW_CLKREQ_OFF |
- * ALP_AVAIL_REQ) actually wedges its backplane.  Empirically: the only
- * way to recover the "fresh chip" state Linux relies on is to drive
- * WL_REG_ON low and back high -- exactly what Linux's mmc-pwrseq-simple
- * does for free at boot via DT.
+ * firmware-side GPIO expander (not a BCM2711 GPIO).  At Pi boot the
+ * boot ROM raises WL_REG_ON and the chip's own boot ROM runs, leaving
+ * the chip in a state where the brcmfmac clock-gating preamble
+ * (CHIPCLKCSR FORCE_HW_CLKREQ_OFF | ALP_AVAIL_REQ) wedges its backplane.
+ * The only way back to the fresh-chip state Linux relies on is to drive
+ * WL_REG_ON low and back high, which Linux's mmc-pwrseq-simple does at
+ * boot via DT.
  *
  * Use bcm2835_firmware_property() rather than bcm2835_mbox_property()
  * directly: SET_GPIO_STATE has a known firmware quirk where the
@@ -2106,8 +2190,7 @@ brcm_sdio_halt_cr4(struct brcm_sdio_softc *sc, uint32_t cr4_wrap)
  *
  * The relevant tag is SET_GPIO_STATE (0x00038041), which addresses the
  * firmware GPIO expander -- not gpioc1, which the Pi firmware drives
- * autonomously and would panic the kernel if we wrote it directly (see
- * feedback_pi4_gpioc1_pin1.md).
+ * autonomously; writing it directly panics the kernel.
  *
  * Pin numbering: the firmware-side expander starts at gpio number 128.
  * WL_REG_ON is the second pin on the expander (BT_REG_ON is pin 0,
@@ -2173,6 +2256,7 @@ brcm_sdio_mbox_set_gpio(struct brcm_sdio_softc *sc, uint32_t gpio,
 }
 #endif
 
+/* power-cycle the chip's WL_REG_ON line */
 static int
 brcm_sdio_wl_reg_on_cycle(struct brcm_sdio_softc *sc)
 {
@@ -2192,15 +2276,18 @@ brcm_sdio_wl_reg_on_cycle(struct brcm_sdio_softc *sc)
 	/*
 	 * Hold ~150 ms before the next chip access.  The chip's boot ROM
 	 * runs in this window; trying CMD52 too early returns CRC errors
-	 * or undefined state.  Linux's mmc-pwrseq-simple defaults to a
-	 * 10 ms post-power-on delay but BCM43455 routinely needs more in
-	 * practice -- being generous is cheap.
+	 * or undefined state.  Linux's MMC core waits 10 ms after power-up
+	 * (power_delay_ms in mmc_power_up; mmc-pwrseq-simple adds nothing
+	 * unless the DT sets post-power-on-delay-ms, and the Pi 4 DT does
+	 * not), but BCM43455 routinely needs more in practice -- being
+	 * generous is cheap.
 	 */
 	pause("wlregon", hz / 7);
 	device_printf(sc->sc_dev, "WL_REG_ON cycle complete\n");
 	return (0);
 }
 
+/* sysctl: power-cycle WL_REG_ON */
 static int
 brcm_sdio_sysctl_wl_reg_on_cycle(SYSCTL_HANDLER_ARGS)
 {
@@ -2215,12 +2302,10 @@ brcm_sdio_sysctl_wl_reg_on_cycle(SYSCTL_HANDLER_ARGS)
 }
 
 /*
- * Non-toggling SET_GPIO_STATE.  Useful as a smoke test: writing
- * dev.brcm.N.wl_reg_on_set=1 should be a no-op for the chip (it was
- * already powered) but exercises the same mbox code path the cycle
- * uses.  If this returns 0, the message format is correct and the
- * cycle can be trusted.  If this returns EIO, the message format is
- * still wrong and we should not run the cycle.
+ * Non-toggling SET_GPIO_STATE.  Writing dev.brcm.N.wl_reg_on_set=1 is a
+ * no-op for an already-powered chip but exercises the same mailbox path
+ * as the cycle, so a 0 return shows the cycle can be trusted and EIO
+ * means it should not be run.
  *
  * Writing 0 powers the chip off without re-enabling it -- treat that
  * as destructive; once written, the SDIO chip is gone until either
@@ -2392,6 +2477,7 @@ brcm_sdio_chip_soft_reset(struct brcm_sdio_softc *sc)
 	return (0);
 }
 
+/* sysctl: soft-reset the chip */
 static int
 brcm_sdio_sysctl_soft_reset(SYSCTL_HANDLER_ARGS)
 {
@@ -2408,6 +2494,7 @@ brcm_sdio_sysctl_soft_reset(SYSCTL_HANDLER_ARGS)
 	return (err);
 }
 
+/* stop the CR4 core now */
 static int
 brcm_sdio_halt_cr4_now(struct brcm_sdio_softc *sc)
 {
@@ -2417,16 +2504,13 @@ brcm_sdio_halt_cr4_now(struct brcm_sdio_softc *sc)
 	sx_assert(&sc->sc_chip_sx, SA_XLOCKED);
 
 	/*
-	 * Soft-reset the chip first so we run the rest of the bring-up
-	 * against a freshly-booted silicon state instead of whatever the
-	 * Pi boot ROM has left in the PMU latches.  Before this was wired,
-	 * the buscoreprep CHIPCLKCSR write below would wedge the chip's
-	 * backplane on BCM43455 because the boot-ROM-stale PMU couldn't
-	 * tolerate the FORCE_HW_CLKREQ_OFF | ALP_AVAIL_REQ combo Linux
-	 * does at startup; CC.EROMPTR would read 0 and only a system
-	 * reboot recovered.  A soft reset puts the chip into the same
-	 * pristine state Linux gets from mmc-pwrseq-simple, so the Linux
-	 * preamble works as documented.
+	 * Soft-reset the chip first so the bring-up runs against freshly
+	 * booted silicon rather than whatever the Pi boot ROM left in the
+	 * PMU latches.  With that stale PMU state, the buscoreprep
+	 * CHIPCLKCSR write (FORCE_HW_CLKREQ_OFF | ALP_AVAIL_REQ, as Linux
+	 * does at startup) wedges the BCM43455 backplane; CC.EROMPTR reads
+	 * 0 and only a reboot recovers.  The soft reset gives the same
+	 * clean state Linux gets from mmc-pwrseq-simple.
 	 */
 	err = brcm_sdio_chip_soft_reset(sc);
 	if (err != 0)
@@ -2443,8 +2527,10 @@ brcm_sdio_halt_cr4_now(struct brcm_sdio_softc *sc)
 	 * what wakes the chip out of its deep idle so the PMU will
 	 * actually action a subsequent HT_AVAIL_REQ.  Without this
 	 * write, CHIPCLKCSR will ack HT_AVAIL_REQ (the request bit
-	 * stays set) but HT_AVAIL never asserts.  Linux brcmfmac's
-	 * brcmf_sdio_probe() does this as its very first chip access.
+	 * stays set) but HT_AVAIL never asserts.  Linux does not do this
+	 * at probe: it writes CARDCAP only later, in brcmf_sdio_sr_init(),
+	 * and uses CMD_NODEC only on 43751/43752/43012 (CMD14_SUPPORT |
+	 * CMD14_EXT otherwise).  We write CMD_NODEC early by choice.
 	 */
 	err = sdio_cccr_write_byte(sc->sc_dev, SDIO_CCCR_BRCM_CARDCAP,
 	    SDIO_CCCR_BRCM_CARDCAP_CMD_NODEC);
@@ -2467,15 +2553,16 @@ brcm_sdio_halt_cr4_now(struct brcm_sdio_softc *sc)
 		return (err);
 
 	/*
-	 * Buscoreprep -- force ALP, lock hw-clock-request off.  Wedged
-	 * the chip pre-soft-reset; works fine on a fresh chip.
+	 * Buscoreprep -- force ALP, lock hw-clock-request off.  This is
+	 * only safe on the freshly reset chip.
 	 */
 	err = brcm_sdio_buscoreprep(sc);
 	if (err != 0)
 		return (err);
 
 	/*
-	 * Two corrective writes the boot ROM leaves undone:
+	 * OpenBSD makes two corrective writes the boot ROM leaves undone
+	 * (only the second is done here; see below):
 	 *
 	 *   1. CCCR.BRCM_CARDCTRL |= WLANRESET resets the WLAN subsystem
 	 *      while keeping the SDIO/CCCR session intact.  The boot ROM
@@ -2491,21 +2578,20 @@ brcm_sdio_halt_cr4_now(struct brcm_sdio_softc *sc)
 	 *      RES_RELOAD the resource graph re-evaluates and FORCE_HT
 	 *      produces real HT.
 	 *
-	 * Sequence drawn from OpenBSD brcm_sdio_attach (sys/dev/sdmmc/
-	 * if_brcm_sdio.c); same chip facts apply.
+	 * Sequence drawn from OpenBSD bwfm_sdio_attach (sys/dev/sdmmc/
+	 * if_bwfm_sdio.c); same chip facts apply.
 	 */
 	{
 		uint32_t pmuctl;
 
 		/*
-		 * CCCR.BRCM_CARDCTRL |= WLANRESET (OpenBSD brcm_sdio_attach)
+		 * CCCR.BRCM_CARDCTRL |= WLANRESET (OpenBSD bwfm_sdio_attach)
 		 * is deliberately NOT done here: on BCM43455 on Pi 4 it
 		 * tears down the chip's WLAN-side backplane and the chip
 		 * stops servicing CMD53 for long enough that SDHCI's host
 		 * controller times out before we can resume.  The PMU
-		 * RES_RELOAD on its own gives us the resource-graph
-		 * reconfiguration we wanted from this whole pair; skip
-		 * WLANRESET unless a future chip needs it.
+		 * RES_RELOAD alone gives the resource-graph reconfiguration
+		 * the pair is for.
 		 */
 
 		err = brcm_sdio_bp_read32(sc,
@@ -2529,10 +2615,10 @@ brcm_sdio_halt_cr4_now(struct brcm_sdio_softc *sc)
 	}
 
 	/*
-	 * Release the FORCE_ALP lock and ask the PMU for HT.  With the
-	 * PMU resource table reloaded above this should now produce
-	 * real HT, unlike the pre-PMU-reload runs where the request bit
-	 * stuck in CHIPCLKCSR but HT_AVAIL never asserted.
+	 * Release the FORCE_ALP lock and ask the PMU for HT.  The resource
+	 * table reload above is what makes this produce real HT; without
+	 * it the request bit sticks in CHIPCLKCSR but HT_AVAIL never
+	 * asserts.
 	 */
 	err = brcm_sdio_request_ht_clock(sc);
 	if (err != 0)
@@ -2561,6 +2647,7 @@ brcm_sdio_halt_cr4_now(struct brcm_sdio_softc *sc)
 	return (brcm_sdio_halt_cr4(sc, cr4->wrap));
 }
 
+/* sysctl: halt the CR4 core */
 static int
 brcm_sdio_sysctl_halt_cr4(SYSCTL_HANDLER_ARGS)
 {
@@ -2596,13 +2683,12 @@ brcm_sdio_sysctl_halt_cr4(SYSCTL_HANDLER_ARGS)
  *   4. final IOCTL = postreset|CLK = CLK only (drop FGC; CR4 now
  *      runs on regular gated clock).
  *
- * Pre-conditions: firmware + NVRAM already uploaded (load_firmware
- * complete through phase 8).  Without that the CR4 will branch to
- * garbage and the chip wedges.
+ * Pre-condition: firmware + NVRAM already uploaded by load_firmware.
+ * Without that the CR4 branches to garbage and the chip wedges.
  *
- * Post-conditions: CR4 is fetching from SOCRAM and (eventually) the
- * firmware writes a SDPCM "boot_done" marker we can poll for.  That
- * second handshake is the next phase (not yet implemented).
+ * Post-condition: CR4 is fetching from SOCRAM; the firmware later
+ * publishes its sdpcm_shared pointer, which brcm_sdio_poll_boot_done
+ * waits for.
  */
 static int
 brcm_sdio_release_cr4_now(struct brcm_sdio_softc *sc)
@@ -2685,12 +2771,10 @@ brcm_sdio_release_cr4_now(struct brcm_sdio_softc *sc)
 	    chip_id, chip_rev, cr4_wrap, rstvec);
 
 	/*
-	 * Release dance now lives in brcm_chip_cr4_set_active — writes
-	 * rstvec to chip[0] via the transport's activate hook, then runs
-	 * the AI resetcore with prereset=CPUHALT / reset=0 / postreset=0
-	 * so the CR4 comes out of reset clean and starts fetching at
-	 * chip[0].  Same sequence the inline code did, factored through
-	 * the chip layer.
+	 * brcm_chip_cr4_set_active writes rstvec to chip[0] via the
+	 * transport's activate hook, then runs the AI resetcore with
+	 * prereset=CPUHALT / reset=0 / postreset=0 so the CR4 comes out of
+	 * reset clean and starts fetching at chip[0].
 	 */
 	err = brcm_chip_cr4_set_active(&sc->sc_chip, rstvec);
 	if (err != 0) {
@@ -2707,15 +2791,35 @@ brcm_sdio_release_cr4_now(struct brcm_sdio_softc *sc)
 	    "(expected 0x%08x)\n", ioctl_final, BCMA_IOCTL_CLK);
 
 	/*
-	 * Brief post-release poll for fw-alive indicators.  We give fw
-	 * 200 ms to start, then sample:
-	 *   - CHIPCLKCSR (F1 CCCR @ 0x1000E): healthy boot bumps from
-	 *     ALP-only (~0x42) to HT_AVAIL (0xC2) once fw requests it
-	 *   - chip[0x257ffc]: sdpcm_shared_ptr slot.  Pre-release we
-	 *     wrote NVRAM trailer here (0xfe4b01b4); fw clears or sets
-	 *     it once SDPCM init runs.
-	 *   - chip[ram_base + 0xb0000]: empirically active region for
-	 *     fw heap/stack — non-zero means CR4 is writing memory.
+	 * Unblock the firmware clock.  During upload the backplane is
+	 * held on FORCE_ALP | FORCE_HW_CLKREQ_OFF for stability.  Leave
+	 * it locked and the now-running firmware's hardware HT requests
+	 * are ignored, so it stalls in early init and never publishes
+	 * sdpcm_shared.  Clear the force bits and ask for HT so the PMU
+	 * services the firmware's clock requests.
+	 */
+	err = brcm_sdio_request_ht_clock(sc);
+	if (err != 0)
+		device_printf(sc->sc_dev,
+		    "release_cr4: HT clock request failed err=%d "
+		    "(continuing)\n", err);
+
+	{	/* Fast clock on, so the firmware runs at full speed. */
+		uint8_t ck = 0;
+		(void)sdio_read_byte(sc->sc_dev, SBSDIO_FUNC1_CHIPCLKCSR, &ck);
+		(void)sdio_write_byte(sc->sc_dev, SBSDIO_FUNC1_CHIPCLKCSR,
+		    ck | SBSDIO_FORCE_HT);
+	}
+
+	/*
+	 * Give the firmware 200 ms to start, then sample signs of life:
+	 *   - CHIPCLKCSR (F1 @ 0x1000E): goes from ALP-only (~0x42) to
+	 *     HT_AVAIL (0xC2) once the firmware requests HT
+	 *   - chip[0x25fffc]: the sdpcm_shared_ptr slot, which holds the
+	 *     NVRAM length token (0xfe4b01b4) until the firmware's SDPCM
+	 *     init overwrites it
+	 *   - chip[ram_base + 0xb0000]: in the firmware's heap/stack, so
+	 *     non-zero means CR4 is writing memory
 	 */
 	{
 		uint8_t clkcsr = 0;
@@ -2723,7 +2827,8 @@ brcm_sdio_release_cr4_now(struct brcm_sdio_softc *sc)
 		DELAY(200000);
 		(void)sdio_read_byte(sc->sc_dev, SBSDIO_FUNC1_CHIPCLKCSR,
 		    &clkcsr);
-		(void)brcm_sdio_bp_read32(sc, 0x257ffcu, &shared_ptr);
+		(void)brcm_sdio_bp_read32(sc, BRCM_43455_SHARED_SLOT,
+		    &shared_ptr);
 		(void)brcm_sdio_bp_read32(sc, r->ram_base + 0xb0000u,
 		    &heap_canary);
 		device_printf(sc->sc_dev,
@@ -2788,11 +2893,15 @@ brcm_sdio_release_cr4_now(struct brcm_sdio_softc *sc)
 					int br;
 
 					/*
-					 * Program F2 block size in CCCR FBR2.IOBLKSZ.
-					 * Linux brcmfmac uses 256 for BCM43455 (block-mode
-					 * CMD53 boundary on F2 = SDPCM frame boundary).
-					 * Without this, block-mode CMD53 to F2 fails with
-					 * CRC error — same root cause as the F1 fix above.
+					 * Program the F2 block size in
+					 * CCCR FBR2.IOBLKSZ.  We use 256
+					 * (block-mode CMD53 boundary on
+					 * F2 = SDPCM frame boundary).
+					 * Linux uses 512 for BCM43455
+					 * and 256 for 4354/4356/4359.
+					 * Without this, block-mode CMD53
+					 * to F2 fails with a CRC error,
+					 * as on F1.
 					 */
 					br = sdio_cccr_write_byte(sc->sc_dev, fbr2,
 					    f2_blksize & 0xff);
@@ -2838,11 +2947,25 @@ brcm_sdio_release_cr4_now(struct brcm_sdio_softc *sc)
 		    "unavailable\n");
 	}
 
+	/*
+	 * The firmware waits for these last writes before it finishes
+	 * coming up: tell it which signals we want and that the host is
+	 * ready.
+	 */
+	(void)brcm_sdio_bp_write32(sc, 0x18004024u, 0x200000f0u);	/* hostintmask */
+	(void)brcm_sdio_bp_write32(sc, 0x18004048u, 0x00040000u);	/* tosbmailboxdata */
+	(void)sdio_write_byte(sc->sc_dev, 0x10008u, 0x08u);
+	(void)brcm_sdio_bp_write32(sc, 0x18000650u, 0x00000003u);
+	device_printf(sc->sc_dev,
+	    "release_cr4: SDPCM datapath handshake written "
+	    "(hostintmask=0x200000f0, tosbmailboxdata=0x00040000)\n");
+
 	device_printf(sc->sc_dev,
 	    "release_cr4: next phase = poll SDPCM boot_done marker\n");
 	return (0);
 }
 
+/* sysctl: release the CR4 core from reset */
 static int
 brcm_sdio_sysctl_release_cr4(SYSCTL_HANDLER_ARGS)
 {
@@ -2853,6 +2976,10 @@ brcm_sdio_sysctl_release_cr4(SYSCTL_HANDLER_ARGS)
 	err = sysctl_handle_int(oidp, &trigger, 0, req);
 	if (err != 0 || req->newptr == NULL || trigger == 0)
 		return (err);
+	if (sc->sc_autostart_running)
+		return (EBUSY);	/* autostart is bringing the chip up */
+	if (sc->bsc_base.sc_ic_attached)
+		return (EBUSY);	/* firmware running: reload the module */
 	sx_xlock(&sc->sc_chip_sx);
 	err = brcm_sdio_release_cr4_now(sc);
 	sx_xunlock(&sc->sc_chip_sx);
@@ -2869,8 +2996,7 @@ brcm_sdio_sysctl_release_cr4(SYSCTL_HANDLER_ARGS)
  * reply from a previous iovar doesn't get returned to this caller.
  *
  * Reqid: each call bumps st->bcdc_reqid so back-to-back iovars do not
- * collide on the wire.  The response's dcmd ID is not yet checked
- * (M6/M8/M9) — single-flight in current code makes that fine.
+ * collide on the wire, and the reply is matched on its dcmd ID below.
  */
 static int
 brcm_sdio_iovar_xfer(struct brcm_sdio_softc *sc, uint8_t *req, size_t reqlen,
@@ -2922,57 +3048,89 @@ brcm_sdio_iovar_xfer(struct brcm_sdio_softc *sc, uint8_t *req, size_t reqlen,
 	 * matches the one we sent.  The BCM43455 0xff-swhdr fallback in
 	 * brcm_sdpcm_rx_frames can misclassify other frames as CONTROL,
 	 * and a slow ack to a prior request can still be in the ctrl
-	 * queue despite the drain above (e.g. fw replying to the previous
-	 * iovar after we'd timed out).  Reqid matching is what Linux
-	 * brcmfmac uses; without it the caller parses a stale/foreign
-	 * mbuf's first 16 bytes as a dcmd header and reports "fw error
-	 * status=<garbage>" (e.g. 0x24a36501) with the ERROR bit blindly
-	 * set in the cooked flags.
+	 * queue despite the drain above (e.g. the firmware replying to
+	 * the previous iovar after it timed out).  Linux brcmfmac matches
+	 * the reqid too; without it a stale mbuf's first 16 bytes would
+	 * be parsed as a dcmd header and reported as a garbage firmware
+	 * error status.
 	 */
 	/*
-	 * 100 × ~50 ms ≈ 5 s, matching Linux's BRCMF_DCMD_TIMEOUT_DEF.
-	 * Safe to extend now that each poll iteration uses pause() + a
-	 * cross-iter lock drop (see below) -- other threads can squeeze
-	 * in between polls, so a long timeout no longer starves the
-	 * watchdog.  Required because the "join" iovar / SET_SSID dcmd
-	 * doesn't ack until the chip has finished off-channel auth+assoc,
-	 * which can take 100s of ms on a busy 2.4 GHz band.
+	 * 100 × ~50 ms ≈ 5 s.  Linux SDIO waits 2.5 s for a dcmd reply
+	 * (DCMD_RESP_TIMEOUT in sdio.c); we allow longer for join, since
+	 * the "join" iovar / SET_SSID dcmd doesn't ack until the chip has
+	 * finished off-channel auth+assoc, which can take 100s of ms on a
+	 * busy 2.4 GHz band.  The long timeout doesn't starve the
+	 * watchdog because sc_chip_sx is dropped between polls.
 	 */
 	resp = NULL;
-	for (polls = 0; polls < 100; polls++) {
-		sx_xlock(&sc->sc_chip_sx);
-		(void)brcm_sdpcm_rx_frames(st, sc->sc_f2_dev);
-		sx_xunlock(&sc->sc_chip_sx);
+	{
 		/*
-		 * wait_ctrl_resp uses sp_lock + msleep internally, so it
-		 * doubles as our sleep + retry tick.  No extra pause() is
-		 * needed -- it returns either with the next CONTROL frame
-		 * (we may still need to drop it as stale) or NULL after
-		 * ~50 ms.  sc_chip_sx is dropped across the wait so any
-		 * other thread that needs the F2 FIFO (concurrent iovar,
-		 * cmd_scan poller, event_rx_cb pump) can run.
+		 * Bounded stale-response handling.  On BCM43455 the
+		 * 0xff-swhdr fallback in brcm_sdpcm_rx_frames can
+		 * misclassify an event frame as CONTROL, and the same
+		 * stale id then comes back on every poll.  Log it once
+		 * and fail fast if it repeats, rather than spending the
+		 * whole timeout on it.
 		 */
-		resp = brcm_sdpcm_wait_ctrl_resp(st, 50);
-		if (resp == NULL)
-			continue;
-		if (resp->m_pkthdr.len <
-		    (int)sizeof(struct brcm_bcdc_dcmd)) {
+		uint16_t last_stale_id = 0;
+		u_int same_id_repeats = 0;
+		bool logged_this_call = false;
+
+		for (polls = 0; polls < 100; polls++) {
+			sx_xlock(&sc->sc_chip_sx);
+			(void)brcm_sdpcm_rx_frames(st, sc->sc_f2_dev);
+			sx_xunlock(&sc->sc_chip_sx);
+			resp = brcm_sdpcm_wait_ctrl_resp(st, 50);
+			if (resp == NULL)
+				continue;
+			if (resp->m_pkthdr.len <
+			    (int)sizeof(struct brcm_bcdc_dcmd)) {
+				m_freem(resp);
+				resp = NULL;
+				continue;
+			}
+			m_copydata(resp, 8, sizeof(resp_flags),
+			    (caddr_t)&resp_flags);
+			resp_flags = le32toh(resp_flags);
+			resp_id = (uint16_t)(
+			    (resp_flags >> BRCM_BCDC_DCMD_ID_SHIFT) &
+			    BRCM_BCDC_DCMD_ID_MASK);
+			if (resp_id == req_id)
+				break;
+			/*
+			 * Stale id.  Log once per call for this id, and
+			 * if the same id comes back 4 times in a row,
+			 * bail early: the SDPCM parser has a stuck
+			 * frame and waiting out the 5 s window won't
+			 * help.
+			 */
+			if (resp_id != last_stale_id) {
+				last_stale_id = resp_id;
+				same_id_repeats = 1;
+				logged_this_call = false;
+			} else {
+				same_id_repeats++;
+			}
+			if (!logged_this_call) {
+				device_printf(sc->sc_dev,
+				    "iovar_xfer: dropping stale resp "
+				    "id=%u (want %u); further drops of "
+				    "this id in this call are silent\n",
+				    resp_id, req_id);
+				logged_this_call = true;
+			}
 			m_freem(resp);
 			resp = NULL;
-			continue;
+			if (same_id_repeats >= 4) {
+				device_printf(sc->sc_dev,
+				    "iovar_xfer: id=%u stuck in CTRL queue "
+				    "(%u repeats) — SDPCM 0xff-swhdr "
+				    "fallback likely misclassifying an "
+				    "event frame; bailing early\n",
+				    resp_id, same_id_repeats);
+				return (EIO);
+			}
 		}
-		m_copydata(resp, 8, sizeof(resp_flags),
-		    (caddr_t)&resp_flags);
-		resp_flags = le32toh(resp_flags);
-		resp_id = (uint16_t)((resp_flags >> BRCM_BCDC_DCMD_ID_SHIFT) &
-		    BRCM_BCDC_DCMD_ID_MASK);
-		if (resp_id == req_id)
-			break;
-		device_printf(sc->sc_dev,
-		    "iovar_xfer: dropping stale resp id=%u (want %u)\n",
-		    resp_id, req_id);
-		m_freem(resp);
-		resp = NULL;
 	}
 
 	if (resp == NULL)
@@ -2985,9 +3143,8 @@ brcm_sdio_iovar_xfer(struct brcm_sdio_softc *sc, uint8_t *req, size_t reqlen,
 /*
  * EVENT channel callback installed at sc_sdpcm allocation time.
  * Decodes the event code + status + reason + flags and prints a
- * single dmesg line per event.  Heavier work (forwarding to
- * net80211, dispatching to a per-event handler table) belongs in
- * a taskqueue follow-up; for now this is a discovery scope.
+ * single dmesg line per event.  Events reach net80211 through the
+ * raw-EVENT path (brcm_sdio_event_rx) instead.
  *
  * Called with no locks held (rx_frames doesn't hold sp_lock at
  * dispatch time).  Must be brief — see the prototype contract.
@@ -2996,8 +3153,10 @@ static const char *
 brcm_sdio_event_name(uint32_t code)
 {
 	/*
-	 * Codes mirror Linux brcmfmac fweh.h enum brcmf_fweh_event_code
-	 * (BRCMF_ENUM_DEF macro list).  Keep in sync when porting.
+	 * Codes follow Linux brcmfmac fweh.h enum brcmf_fweh_event_code
+	 * (BRCMF_ENUM_DEF macro list), with some names shortened.
+	 * Codes 76, 80 and 124 are not in Linux's list.  Keep in sync
+	 * when porting.
 	 */
 	switch (code) {
 	case 0:				return "SET_SSID";
@@ -3121,24 +3280,22 @@ brcm_sdio_print_escan_result(struct brcm_sdio_softc *sc, uint32_t status,
  */
 /*
  * Worker that drains the per-sc event queue and hands each mbuf to
- * brcm_rx_frame.  Runs on a dedicated taskqueue thread — never on
- * the SDPCM rx context — so brcm_rx_frame's re-entrant net80211
- * calls (ieee80211_input_all, ieee80211_new_state, taskqueue
- * enqueues) don't run inside the chip_sx sysctl thread that is
- * driving the scan poll loop.  Mirrors Linux brcmfmac's
- * event_worker workqueue split (see Pi 3B ftrace recon).
+ * brcm_rx_frame.  Runs on a dedicated taskqueue thread, never in the
+ * SDPCM rx context, so brcm_rx_frame's re-entrant net80211 calls
+ * (ieee80211_input_all, ieee80211_new_state, taskqueue enqueues)
+ * don't run inside the chip_sx thread driving the scan poll loop.
+ * Mirrors Linux brcmfmac's event_worker workqueue split.
  */
 /*
- * Per-sc EVENT delivery worker control.  Default ON now that the
- * sustained-scan panic (bss_count u32 read of u16 field, brcm.c
- * commit b75ea78) is fixed.  Tunable left in for debugging — set to
- * 0 to silence the brcm_rx_frame call without rebuilding.
+ * Event delivery switch, on by default.  Set to 0 to drop events
+ * instead of calling brcm_rx_frame, for debugging.
  */
 static int brcm_sdio_evrx_deliver = 1;
 SYSCTL_INT(_dev, OID_AUTO, brcm_evrx_deliver, CTLFLAG_RWTUN,
     &brcm_sdio_evrx_deliver, 0,
     "1 = SDIO event rx worker calls brcm_rx_frame (default); 0 = drop");
 
+/* deferred task that pushes rx frames up the stack */
 static void
 brcm_sdio_event_rx_worker(void *arg, int pending __unused)
 {
@@ -3158,6 +3315,7 @@ brcm_sdio_event_rx_worker(void *arg, int pending __unused)
 	}
 }
 
+/* queue a received raw frame for the worker */
 static void
 brcm_sdio_event_rx(void *arg, const void *body, size_t paylen)
 {
@@ -3170,8 +3328,8 @@ brcm_sdio_event_rx(void *arg, const void *body, size_t paylen)
 	 * brcm_rx_frame -> brcm_handle_event reads `p + evpos` with
 	 * `p = mtod(m, uint8_t *)` — assumes the mbuf data is one
 	 * contiguous run.  Cap at MCLBYTES and use m_getcl so we
-	 * always get a single 2 KB cluster.  Real BCM43455 events
-	 * stay well under 2 KB (largest seen so far: 530 B).
+	 * always get a single 2 KB cluster.  BCM43455 events stay
+	 * well under 2 KB (the largest are around 530 B).
 	 */
 	if (paylen == 0 || paylen > MCLBYTES)
 		return;
@@ -3194,6 +3352,7 @@ brcm_sdio_event_rx(void *arg, const void *body, size_t paylen)
 	taskqueue_enqueue(sc->sc_event_rx_tq, &sc->sc_event_rx_task);
 }
 
+/* log a decoded firmware event */
 static void
 brcm_sdio_event_handler(void *arg, const struct brcm_event_msg *msg,
     const void *data, size_t datalen)
@@ -3215,14 +3374,15 @@ brcm_sdio_event_handler(void *arg, const struct brcm_event_msg *msg,
 	    msg->ifidx);
 }
 
+/* make sure the SDPCM state is set up */
 static struct brcm_sdpcm_state *
 brcm_sdio_iovar_ensure_state(struct brcm_sdio_softc *sc)
 {
 	if (sc->sc_sdpcm == NULL) {
 		/*
 		 * F2 byte address 0x8000 = backplane offset 0 with the
-		 * SBSDIO_SB_ACCESS_2_4B_FLAG bit set; blksize 256 matches
-		 * what Linux brcmfmac programs for BCM43455.
+		 * SBSDIO_SB_ACCESS_2_4B_FLAG bit set; blksize 256 is what
+		 * we program on F2 (Linux uses 512 for BCM43455).
 		 */
 		sc->sc_sdpcm = brcm_sdpcm_alloc(0x8000u, 256u);
 		brcm_sdpcm_set_event_handler(sc->sc_sdpcm,
@@ -3265,7 +3425,9 @@ brcm_sdio_iovar_get(struct brcm_sdio_softc *sc, const char *name,
 	buf = malloc(bufsz, M_TEMP, M_WAITOK);
 
 	mtx_lock(&st->sp_lock);
-	reqid = ++st->bcdc_reqid;
+	if (++st->bcdc_reqid == 0)	/* skip 0 on wrap */
+		st->bcdc_reqid = 1;
+	reqid = st->bcdc_reqid;
 	mtx_unlock(&st->sp_lock);
 
 	reqlen = brcm_bcdc_build_getvar(buf, bufsz, name, outlen, reqid);
@@ -3336,7 +3498,9 @@ brcm_sdio_iovar_set(struct brcm_sdio_softc *sc, const char *name,
 	buf = malloc(bufsz, M_TEMP, M_WAITOK);
 
 	mtx_lock(&st->sp_lock);
-	reqid = ++st->bcdc_reqid;
+	if (++st->bcdc_reqid == 0)	/* skip 0 on wrap */
+		st->bcdc_reqid = 1;
+	reqid = st->bcdc_reqid;
 	mtx_unlock(&st->sp_lock);
 
 	reqlen = brcm_bcdc_build_setvar(buf, bufsz, name, val, vallen, reqid);
@@ -3365,8 +3529,8 @@ brcm_sdio_iovar_set(struct brcm_sdio_softc *sc, const char *name,
 }
 
 /*
- * dev.brcm.0.sdpcm_test=1 — original cur_etheraddr round-trip smoke
- * test, now driven through brcm_iovar_get.
+ * dev.brcm.0.sdpcm_test=1 — cur_etheraddr round-trip test through
+ * brcm_sdio_iovar_get.
  */
 static int
 brcm_sdio_sysctl_sdpcm_test(SYSCTL_HANDLER_ARGS)
@@ -3397,6 +3561,38 @@ brcm_sdio_sysctl_sdpcm_test(SYSCTL_HANDLER_ARGS)
 }
 
 /*
+ * dev.brcm.N.peek=<chip_addr> -- dump 8 words (32 bytes) from a chip /
+ * backplane address via bp_read32.  Diagnostic for firmware boot: read
+ * the sdpcm_shared slot, the firmware heap, etc.
+ */
+static int
+brcm_sdio_sysctl_peek(SYSCTL_HANDLER_ARGS)
+{
+	struct brcm_sdio_softc *sc = arg1;
+	uint32_t addr = 0, v;
+	int rc, i, e;
+
+	rc = sysctl_handle_int(oidp, &addr, 0, req);
+	if (rc != 0 || req->newptr == NULL || addr == 0)
+		return (rc);
+
+	sx_xlock(&sc->sc_chip_sx);
+	device_printf(sc->sc_dev, "peek: 8 words from chip 0x%08x:\n", addr);
+	for (i = 0; i < 8; i++) {
+		e = brcm_sdio_bp_read32(sc, addr + i * 4, &v);
+		if (e != 0) {
+			device_printf(sc->sc_dev,
+			    "  [0x%08x] read err=%d\n", addr + i * 4, e);
+			break;
+		}
+		device_printf(sc->sc_dev,
+		    "  [0x%08x] = 0x%08x\n", addr + i * 4, v);
+	}
+	sx_xunlock(&sc->sc_chip_sx);
+	return (0);
+}
+
+/*
  * dev.brcm.0.iovar_get=<name> — generic GET probe.  Reads up to
  * BRCM_IOVAR_PROBE_MAX bytes of response, prints a hex+ASCII dump
  * to dmesg.  Useful for poking at "ver", "country", "cur_etheraddr",
@@ -3404,6 +3600,7 @@ brcm_sdio_sysctl_sdpcm_test(SYSCTL_HANDLER_ARGS)
  */
 #define	BRCM_IOVAR_PROBE_MAX	256u
 
+/* sysctl: read a firmware variable by name */
 static int
 brcm_sdio_sysctl_iovar_get(SYSCTL_HANDLER_ARGS)
 {
@@ -3485,7 +3682,9 @@ brcm_sdio_dcmd_set(struct brcm_sdio_softc *sc, uint32_t cmd_id,
 	buf = malloc(bufsz, M_TEMP, M_WAITOK);
 
 	mtx_lock(&st->sp_lock);
-	reqid = ++st->bcdc_reqid;
+	if (++st->bcdc_reqid == 0)	/* skip 0 on wrap */
+		st->bcdc_reqid = 1;
+	reqid = st->bcdc_reqid;
 	mtx_unlock(&st->sp_lock);
 
 	reqlen = brcm_bcdc_build_dcmd(buf, bufsz, cmd_id, val, vallen, 1,
@@ -3562,34 +3761,101 @@ brcm_sdio_sysctl_iovar_set_mpc(SYSCTL_HANDLER_ARGS)
 /*
  * dev.brcm.0.net80211_attach=1 — bring up the net80211 ifnet.
  *
- * Phase 1A of the net80211 integration:
- *  - Capture cur_etheraddr into bsc_base.sc_macaddr (brcm_attach
- *    copies this into ic_macaddr).
- *  - Set bsc_base.sc_dev so brcm.c gets a device handle.
- *  - Call brcm_attach() which runs ieee80211_ifattach + installs the
- *    ic_vap_create / scan / transmit hooks.
+ * It captures cur_etheraddr into bsc_base.sc_macaddr (brcm_attach
+ * copies this into ic_macaddr), sets bsc_base.sc_dev so brcm.c has a
+ * device handle, and calls brcm_attach(), which runs
+ * ieee80211_ifattach and installs the ic_vap_create / scan / transmit
+ * hooks.
  *
- * Trigger AFTER load_firmware + release_cr4 + events_enable + cmd_up.
- *
- * KNOWN GAPS (next phases):
- *  - bs_txdata is still a stub; ic_transmit will fail until DATA path.
- *  - SDPCM EVENT handler still uses the local cb that prints to dmesg
- *    only.  EVENT -> brcm_handle_event routing (so scan results land
- *    in net80211's scan cache) is phase 1B.
- *  - ic_set_channel, scan_curchan are no-ops; OK for SCAN coverage,
- *    needed for join.
+ * Trigger after load_firmware + release_cr4 + events_enable + cmd_up.
  */
+/*
+ * Poll for the firmware boot-done handshake.
+ *
+ * After CR4 release the firmware boots; once its SDPCM layer is up it
+ * writes the chip address of its sdpcm_shared structure into the last
+ * word of RAM (0x25fffc on the 43455).  Until then that slot holds the
+ * NVRAM trailer (0xfe4b01b4) or zero.  Poll it for up to ~4 s, then read
+ * the sdpcm_shared flags to confirm the firmware is alive and did not
+ * trap.  net80211 attach must not run before this: its first BCDC iovar
+ * (cur_etheraddr) would block forever on a firmware that never answers.
+ * Caller holds sc_chip_sx.
+ */
+static int
+brcm_sdio_poll_boot_done(struct brcm_sdio_softc *sc)
+{
+	const uint32_t slot = BRCM_43455_SHARED_SLOT;
+	const uint32_t rambeg = BRCM_43455_RAM_BASE, ramend = BRCM_43455_RAM_END;
+	uint32_t shaddr = 0, flags = 0;
+	int i, err;
+
+	for (i = 0; i < 400; i++) {		/* ~4 s at 10 ms */
+		err = brcm_sdio_bp_read32(sc, slot, &shaddr);
+		if (err == 0 && shaddr != 0 && shaddr != 0xffffffffu &&
+		    shaddr != 0xfe4b01b4u &&
+		    shaddr >= rambeg && shaddr < ramend) {
+			if (brcm_sdio_bp_read32(sc, shaddr, &flags) != 0) {
+				DELAY(10000);
+				continue;
+			}
+			/*
+			 * Versions 1 to 3 are fine: Linux brcmfmac rejects only
+			 * a version newer than it knows, and the BCM43455's
+			 * 7.45.18 firmware publishes version 1.
+			 */
+			if ((flags & BRCM_SDPCM_SHARED_VERSION_MASK) == 0 ||
+			    (flags & BRCM_SDPCM_SHARED_VERSION_MASK) >
+			    BRCM_SDPCM_SHARED_VERSION) {
+				DELAY(10000);
+				continue;	/* still settling */
+			}
+			if (flags & BRCM_SDPCM_SHARED_TRAP) {
+				uint32_t tpc = 0;
+				(void)brcm_sdio_bp_read32(sc, shaddr + 4, &tpc);
+				device_printf(sc->sc_dev,
+				    "boot_done: firmware TRAP -- shared@0x%08x "
+				    "flags=0x%08x trap_addr=0x%08x\n",
+				    shaddr, flags, tpc);
+				return (EIO);
+			}
+			device_printf(sc->sc_dev,
+			    "boot_done: firmware ready -- shared@0x%08x "
+			    "flags=0x%08x after %d ms\n", shaddr, flags, i * 10);
+			return (0);
+		}
+		DELAY(10000);
+	}
+	device_printf(sc->sc_dev,
+	    "boot_done: TIMEOUT -- firmware did not publish sdpcm_shared "
+	    "(slot=0x%08x last=0x%08x)\n", slot, shaddr);
+	return (ETIMEDOUT);
+}
+
 static int
 brcm_sdio_sysctl_net80211_attach(SYSCTL_HANDLER_ARGS)
 {
 	struct brcm_sdio_softc *sc = arg1;
 	int trigger = 0;
-	uint8_t mac[6] = { 0 };
-	int err, rc;
+	int rc;
 
 	rc = sysctl_handle_int(oidp, &trigger, 0, req);
 	if (rc != 0 || req->newptr == NULL || trigger == 0)
 		return (rc);
+	if (sc->sc_autostart_running)
+		return (EBUSY);	/* autostart is bringing the chip up */
+	return (brcm_sdio_net80211_attach_now(sc));
+}
+
+/*
+ * Attach net80211 once the firmware is running: wait for its boot-done
+ * marker, read the MAC, then brcm_attach, the operator sysctls and the
+ * runtime iovars.  Used by the net80211_attach sysctl and autostart.
+ */
+static int
+brcm_sdio_net80211_attach_now(struct brcm_sdio_softc *sc)
+{
+	uint8_t mac[6] = { 0 };
+	int err;
 
 	if (sc->bsc_base.sc_ic_attached) {
 		device_printf(sc->sc_dev,
@@ -3598,6 +3864,12 @@ brcm_sdio_sysctl_net80211_attach(SYSCTL_HANDLER_ARGS)
 	}
 
 	sx_xlock(&sc->sc_chip_sx);
+	err = brcm_sdio_poll_boot_done(sc);
+	if (err != 0)
+		device_printf(sc->sc_dev,
+		    "net80211_attach: boot_done poll timed out (err=%d); this "
+		    "fw does not publish sdpcm_shared -- probing cur_etheraddr "
+		    "to confirm readiness\n", err);
 	err = brcm_sdio_iovar_get(sc, "cur_etheraddr", mac, sizeof(mac));
 	sx_xunlock(&sc->sc_chip_sx);
 	if (err != 0) {
@@ -3621,21 +3893,16 @@ brcm_sdio_sysctl_net80211_attach(SYSCTL_HANDLER_ARGS)
 		return (err);
 	}
 	/*
-	 * Register operator-facing sysctls (wpa_pmk, join_target,
-	 * scan_now, iovar_get/set, ...).  USB transport already does
-	 * this in its attach; SDIO was missing the call so wpa_pmk
-	 * etc. never appeared in `sysctl dev.brcm.0` even though the
-	 * code was wired.
+	 * Register the operator-facing sysctls (wpa_pmk, join_target,
+	 * scan_now, iovar_get/set, ...), as the USB transport does in
+	 * its attach.
 	 */
 	brcm_sysctl_attach(&sc->bsc_base);
 
 	/*
 	 * Bring the firmware to the operating point net80211 expects --
 	 * BRCM_C_UP + event_msgs + country=US + sup_wpa=0 + mpc=0 +
-	 * roam_off=1.  Without this each session needed five manual
-	 * sysctls (events_enable, cmd_up, ...).  USB transport has
-	 * always called brcm_runtime_iovars from its attach; SDIO was
-	 * the outlier.
+	 * roam_off=1 -- as the USB transport does from its attach.
 	 */
 	sx_xlock(&sc->sc_chip_sx);
 	brcm_runtime_iovars(&sc->bsc_base);
@@ -3672,6 +3939,10 @@ brcm_sdio_sysctl_bringup(SYSCTL_HANDLER_ARGS)
 	rc = sysctl_handle_int(oidp, &trigger, 0, req);
 	if (rc != 0 || req->newptr == NULL || trigger == 0)
 		return (rc);
+	if (sc->sc_autostart_running)
+		return (EBUSY);	/* autostart is bringing the chip up */
+	if (sc->bsc_base.sc_ic_attached)
+		return (EBUSY);	/* firmware running: reload the module */
 
 	device_printf(sc->sc_dev, "bringup: phase 1/3 load_firmware\n");
 	sx_xlock(&sc->sc_chip_sx);
@@ -3780,13 +4051,11 @@ brcm_sdio_sysctl_cmd_scan(SYSCTL_HANDLER_ARGS)
 	if (err == 0 && sc->sc_sdpcm != NULL) {
 		/*
 		 * Drain ESCAN_RESULT events.  Release sc_chip_sx between
-		 * polls and use pause() instead of DELAY() so we don't
-		 * busy-spin for 3 s holding the lock -- doing so wedged
-		 * the Pi 4 when concurrent net80211 / wpa_supplicant
-		 * traffic piled up behind us and tripped the in-kernel
-		 * watchdog.  pause() yields the CPU; the lock release
-		 * lets other iovar_xfer callers squeeze a request in
-		 * between our polls.
+		 * polls and pause() rather than DELAY(): busy-spinning for
+		 * 3 s with the lock held lets net80211 / wpa_supplicant
+		 * traffic pile up behind it until the kernel watchdog
+		 * trips.  The lock release lets other iovar_xfer callers
+		 * get a request in between polls.
 		 */
 		for (i = 0; i < 60 && sc->bsc_base.sc_scan_busy; i++) {
 			(void)brcm_sdpcm_rx_frames(sc->sc_sdpcm,
@@ -3895,9 +4164,11 @@ brcm_sdio_sysctl_cmd_dcmd(SYSCTL_HANDLER_ARGS)
 }
 
 /* ------------------------------------------------------------------
- * Bus ops — stubs until the backplane-window CMD53 path lands.
+ * Bus ops.  Control traffic goes through the iovar/dcmd ops below, so
+ * txctl and rxctl are not supported on SDIO.
  * ------------------------------------------------------------------ */
 
+/* send a control message (not supported yet) */
 static int
 brcm_sdio_txctl(struct brcm_softc *sc, const void *buf, size_t len)
 {
@@ -3905,6 +4176,7 @@ brcm_sdio_txctl(struct brcm_softc *sc, const void *buf, size_t len)
 	return (ENOTSUP);
 }
 
+/* receive a control message (not supported yet) */
 static int
 brcm_sdio_rxctl(struct brcm_softc *sc, void *buf, size_t *lenp, int timeout_ms)
 {
@@ -3912,6 +4184,68 @@ brcm_sdio_rxctl(struct brcm_softc *sc, void *buf, size_t *lenp, int timeout_ms)
 	return (ENOTSUP);
 }
 
+/* depth of the data transmit queue */
+#define	BRCM_SDIO_TXQ_LEN	128
+
+
+static void	brcm_sdio_hostmail(struct brcm_sdio_softc *);
+
+/* Send what brcm_sdio_txdata queued; may sleep. */
+static void
+brcm_sdio_tx_task(void *arg, int pending __unused)
+{
+	struct brcm_sdio_softc *sc = arg;
+	struct mbuf *m;
+	int w;
+
+	for (;;) {
+		mtx_lock(&sc->sc_tx_mtx);
+		m = mbufq_dequeue(&sc->sc_tx_q);
+		mtx_unlock(&sc->sc_tx_mtx);
+		if (m == NULL)
+			break;
+		if (sc->bsc_base.sc_dying || sc->sc_sdpcm == NULL ||
+		    sc->sc_f2_dev == NULL) {
+			m_freem(m);
+			continue;
+		}
+		/*
+		 * Wait for the firmware's credit (and for it to lift flow
+		 * control), polling for the frames that carry it.  After about
+		 * a second send anyway rather than stall the queue for good.
+		 */
+		for (w = 0; w < hz && !brcm_sdpcm_tx_credit(sc->sc_sdpcm);
+		    w++) {
+			sx_xlock(&sc->sc_chip_sx);
+			brcm_sdio_hostmail(sc);
+			(void)brcm_sdpcm_rx_frames(sc->sc_sdpcm,
+			    sc->sc_f2_dev);
+			sx_xunlock(&sc->sc_chip_sx);
+			if (brcm_sdpcm_tx_credit(sc->sc_sdpcm))
+				break;
+			pause("brcmcr", 1);
+		}
+		if (w > 0) {
+			uint32_t ms = (uint32_t)(w * 1000 / hz);
+
+			sc->st_credit_waits++;
+			if (ms > sc->st_credit_wait_max_ms)
+				sc->st_credit_wait_max_ms = ms;
+		}
+		if (w == hz)
+			DPRINTF(&sc->bsc_base, 0,
+			    "tx: no credit from the firmware after 1 s; "
+			    "sending anyway\n");
+		sx_xlock(&sc->sc_chip_sx);
+		(void)brcm_sdpcm_tx_dataframe(sc->sc_sdpcm, sc->sc_f2_dev, m);
+		sx_xunlock(&sc->sc_chip_sx);
+	}
+}
+
+/*
+ * Queue a data frame; never sleeps, so it is safe under net80211's TX
+ * lock.  ENOBUFS when the queue is full.
+ */
 static int
 brcm_sdio_txdata(struct brcm_softc *bsc, struct mbuf *m)
 {
@@ -3920,17 +4254,29 @@ brcm_sdio_txdata(struct brcm_softc *bsc, struct mbuf *m)
 
 	if (m == NULL)
 		return (EINVAL);
-	if (sc->sc_sdpcm == NULL || sc->sc_f2_dev == NULL) {
+	/* 802.11 from net80211 -> 802.3 for the firmware; see brcm.c. */
+	if ((err = brcm_deencap_80211(&m)) != 0) {
+		if (m != NULL)
+			m_freem(m);
+		return (err == EAGAIN ? 0 : err);	/* EAGAIN: mgmt, dropped */
+	}
+	if (sc->sc_sdpcm == NULL || sc->sc_f2_dev == NULL ||
+	    sc->sc_tx_tq == NULL) {
 		m_freem(m);
 		return (ENXIO);
 	}
-
-	sx_xlock(&sc->sc_chip_sx);
-	err = brcm_sdpcm_tx_dataframe(sc->sc_sdpcm, sc->sc_f2_dev, m);
-	sx_xunlock(&sc->sc_chip_sx);
-	return (err);
+	mtx_lock(&sc->sc_tx_mtx);
+	err = mbufq_enqueue(&sc->sc_tx_q, m);
+	mtx_unlock(&sc->sc_tx_mtx);
+	if (err != 0) {
+		m_freem(m);
+		return (ENOBUFS);
+	}
+	taskqueue_enqueue(sc->sc_tx_tq, &sc->sc_tx_task);
+	return (0);
 }
 
+/* stop the interface */
 static void
 brcm_sdio_stop(struct brcm_softc *sc)
 {
@@ -3939,9 +4285,8 @@ brcm_sdio_stop(struct brcm_softc *sc)
 
 /*
  * bus_ops bridge: route brcm.c's iovar/dcmd dispatch through the
- * SDIO transport wrappers we already validated against fw.  Casts
- * brcm_softc back to brcm_sdio_softc (bsc_base is the first member,
- * so the pointer is identical).
+ * SDIO transport wrappers.  Casts brcm_softc back to brcm_sdio_softc
+ * (bsc_base is the first member, so the pointer is identical).
  */
 static int
 brcm_sdio_bus_iovar_get(struct brcm_softc *bsc, const char *name,
@@ -3953,11 +4298,12 @@ brcm_sdio_bus_iovar_get(struct brcm_softc *bsc, const char *name,
 	if (lenp == NULL)
 		return (EINVAL);
 	err = brcm_sdio_iovar_get(sc, name, buf, *lenp);
-	/* SDIO wrapper zero-pads short replies; report the buffer size
-	 * back as actual length.  Tighten if/when callers need it. */
+	/* The SDIO wrapper zero-pads short replies, so *lenp is left as
+	 * the buffer size. */
 	return (err);
 }
 
+/* bus hook to set a firmware variable */
 static int
 brcm_sdio_bus_iovar_set(struct brcm_softc *bsc, const char *name,
     const void *buf, size_t len)
@@ -3966,6 +4312,7 @@ brcm_sdio_bus_iovar_set(struct brcm_softc *bsc, const char *name,
 	return (brcm_sdio_iovar_set(sc, name, buf, len));
 }
 
+/* bus hook to send a firmware command */
 static int
 brcm_sdio_bus_dcmd_set(struct brcm_softc *bsc, uint32_t cmd,
     const void *buf, size_t len)
@@ -3977,10 +4324,12 @@ brcm_sdio_bus_dcmd_set(struct brcm_softc *bsc, uint32_t cmd,
 /*
  * Periodic watchdog -- fires every BRCM_WD_POLL_MS via callout on
  * softclock, then hands off to sc_wd_task on taskqueue_thread which
- * does one SDIO F2 RX pump to keep the SDIO bus warm + drain any
- * events the ithread missed.  Mirrors Linux brcmf_sdio_bus_watchdog
- * (sdio.c:3669).  Without it BCM43455 fw 7.45.18 tears down LINK
- * within milliseconds of ASSOC when it sees zero host SDIO activity.
+ * does one SDIO F2 RX pump to keep the bus active and drain any events
+ * the ithread missed.  The timer + thread split follows Linux
+ * brcmf_sdio_watchdog / brcmf_sdio_bus_watchdog (sdio.c), but Linux
+ * does not pump RX there (bus->poll is false) and lets an idle bus
+ * sleep.  Without the pump, BCM43455 fw 7.45.18 tears down LINK within
+ * milliseconds of ASSOC when it sees no host SDIO activity.
  */
 static void
 brcm_sdio_watchdog_callout(void *arg)
@@ -3992,6 +4341,128 @@ brcm_sdio_watchdog_callout(void *arg)
 	(void)taskqueue_enqueue(taskqueue_thread, &sc->sc_wd_task);
 }
 
+/*
+ * Answer the firmware's host-mailbox interrupt, as Linux brcmfmac's
+ * brcmf_sdio_hostmail() and the intstatus handling in brcmf_sdio_dpc() do:
+ * read the reason from TOHOSTMAILBOXDATA, acknowledge with SMB_INT_ACK,
+ * clear the interrupt, and track the flow-control state, so that the
+ * firmware's mailbox requests are answered and its "stop sending" is
+ * honoured.  The driver has no SDIO interrupt handler; the watchdog poll
+ * and the TX task call this.  Caller holds sc_chip_sx.
+ */
+static void
+brcm_sdio_hostmail(struct brcm_sdio_softc *sc)
+{
+	struct brcm_chip_core *sd;
+	uint32_t is, clr = 0, hmb = 0, now;
+	bool fc;
+
+	sd = brcm_chip_get_core(&sc->sc_chip, BCMA_CORE_SDIO_DEV);
+	if (sd == NULL || sc->sc_sdpcm == NULL)
+		return;
+	if (brcm_sdio_bp_read32(sc, sd->base + BRCM_SD_REG_INTSTATUS,
+	    &is) != 0 || is == 0xffffffffu)
+		return;
+
+	if (is & BRCM_I_HMB_HOST_INT) {
+		int b;
+
+		sc->st_hmb_int++;
+		(void)brcm_sdio_bp_read32(sc,
+		    sd->base + BRCM_SD_REG_TOHOSTMAILBOXDATA, &hmb);
+		for (b = 0; b < 5; b++)
+			if (hmb & (1u << b))
+				sc->st_hmb_reason[b]++;
+		if (brcm_sdio_bp_write32(sc,
+		    sd->base + BRCM_SD_REG_TOSBMAILBOX, BRCM_SMB_INT_ACK) == 0)
+			sc->st_hmb_ack++;
+		clr |= BRCM_I_HMB_HOST_INT;
+		DPRINTF(&sc->bsc_base, 1, "hostmail: data=0x%08x%s%s%s\n",
+		    hmb, (hmb & BRCM_TOHOSTMBOX_NAKHANDLED) ? " NAKHANDLED" : "",
+		    (hmb & BRCM_TOHOSTMBOX_FC) ? " FC" : "",
+		    (hmb & BRCM_TOHOSTMBOX_FWHALT) ? " FWHALT" : "");
+		if (hmb & BRCM_TOHOSTMBOX_FWHALT)
+			device_printf(sc->sc_dev,
+			    "hostmail: firmware reports it has halted\n");
+	}
+	if (is & BRCM_I_HMB_FC_CHANGE) {
+		/* Clear the change first, then read the current state. */
+		(void)brcm_sdio_bp_write32(sc,
+		    sd->base + BRCM_SD_REG_INTSTATUS, BRCM_I_HMB_FC_CHANGE);
+		now = 0;
+		(void)brcm_sdio_bp_read32(sc,
+		    sd->base + BRCM_SD_REG_INTSTATUS, &now);
+		fc = (now & (BRCM_I_HMB_FC_STATE | BRCM_I_HMB_FC_CHANGE)) != 0;
+		mtx_lock(&sc->sc_sdpcm->sp_lock);
+		if (sc->sc_sdpcm->fc_off != fc) {
+			DPRINTF(&sc->bsc_base, 1, "flow control %s\n",
+			    fc ? "on (stop)" : "off (go)");
+			if (fc) {
+				sc->st_fc_on++;
+				sc->st_fc_since = ticks;
+			} else {
+				sc->st_fc_off++;
+				sc->st_fc_held_ms += (uint32_t)
+				    ((ticks - sc->st_fc_since) * 1000 / hz);
+			}
+		}
+		sc->sc_sdpcm->fc_off = fc;
+		mtx_unlock(&sc->sc_sdpcm->sp_lock);
+	}
+	if (clr != 0) {
+		uint32_t again = 0;
+
+		(void)brcm_sdio_bp_write32(sc,
+		    sd->base + BRCM_SD_REG_INTSTATUS, clr);
+		/*
+		 * The write-1-to-clear must have landed.  A new interrupt the
+		 * firmware raises in between also counts, so a few are normal;
+		 * one per interrupt means the clear is not working.
+		 */
+		if (brcm_sdio_bp_read32(sc, sd->base + BRCM_SD_REG_INTSTATUS,
+		    &again) == 0 && (again & clr & BRCM_I_HMB_HOST_INT) != 0)
+			sc->st_hmb_stuck++;
+	}
+}
+
+/* dev.brcm.N.sdio_stats: is the mailbox answered, are credits kept? */
+static int
+brcm_sdio_stats_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	static const char *rn[5] = { "NAKHANDLED", "DEVREADY", "FC",
+	    "FWREADY", "FWHALT" };
+	struct brcm_sdio_softc *sc = arg1;
+	struct brcm_sdpcm_state *st = sc->sc_sdpcm;
+	struct sbuf *sb;
+	int error, b;
+
+	sb = sbuf_new_for_sysctl(NULL, NULL, 512, req);
+	sbuf_printf(sb, "mailbox: host_int=%u acked=%u%s stuck=%u\n",
+	    sc->st_hmb_int, sc->st_hmb_ack,
+	    sc->st_hmb_int == sc->st_hmb_ack ? " (all acked)" : " (MISSING ACKS)",
+	    sc->st_hmb_stuck);
+	sbuf_printf(sb, "reasons:");
+	for (b = 0; b < 5; b++)
+		sbuf_printf(sb, " %s=%u", rn[b], sc->st_hmb_reason[b]);
+	sbuf_printf(sb, "\nflow control: on=%u off=%u held_ms=%u now=%s\n",
+	    sc->st_fc_on, sc->st_fc_off, sc->st_fc_held_ms,
+	    (st != NULL && st->fc_off) ? "STOP" : "go");
+	if (st != NULL)
+		sbuf_printf(sb, "credit: seen=%d updates=%u tx_seq=%u max_seq=%u "
+		    "room=%u\ndata: sent=%u outside_window=%u%s\n",
+		    st->credit_seen, st->max_seq_updates, st->tx_seq, st->max_seq,
+		    (unsigned)(uint8_t)(st->max_seq - st->tx_seq), st->data_tx,
+		    st->window_violations,
+		    st->window_violations == 0 ? " (ok)" : " (VIOLATIONS)");
+	sbuf_printf(sb, "credit waits=%u longest_ms=%u",
+	    sc->st_credit_waits, sc->st_credit_wait_max_ms);
+
+	error = sbuf_finish(sb);
+	sbuf_delete(sb);
+	return (error);
+}
+
+/* periodic watchdog work */
 static void
 brcm_sdio_watchdog_task(void *arg, int pending __unused)
 {
@@ -4000,6 +4471,7 @@ brcm_sdio_watchdog_task(void *arg, int pending __unused)
 	if (sc->sc_wd_stop || sc->sc_sdpcm == NULL || sc->sc_f2_dev == NULL)
 		goto rearm;
 	sx_xlock(&sc->sc_chip_sx);
+	brcm_sdio_hostmail(sc);
 	(void)brcm_sdpcm_rx_frames(sc->sc_sdpcm, sc->sc_f2_dev);
 	sx_xunlock(&sc->sc_chip_sx);
 rearm:
@@ -4009,6 +4481,7 @@ rearm:
 		    brcm_sdio_watchdog_callout, sc);
 }
 
+/* bus hook that drains pending rx frames */
 static void
 brcm_sdio_bus_pump_rx(struct brcm_softc *bsc, int max_ms,
     volatile int *until_clear)
@@ -4023,10 +4496,9 @@ brcm_sdio_bus_pump_rx(struct brcm_softc *bsc, int max_ms,
 	/*
 	 * Yield-friendly pump.  Each iteration holds sc_chip_sx only
 	 * across the one F2 read, then drops the lock and pause()s for
-	 * 50 ms.  Avoids the original DELAY()-while-holding-sx pattern
-	 * which busy-spun the CPU for max_ms milliseconds (up to 3 s on
-	 * the scan path) and starved every other iovar_xfer caller +
-	 * the kernel watchdog -- the Pi 4 wedge reproducer.
+	 * 50 ms.  A DELAY() with the sx held would busy-spin the CPU for
+	 * max_ms (up to 3 s on the scan path) and starve every other
+	 * iovar_xfer caller and the kernel watchdog.
 	 */
 	for (i = 0; i < iters; i++) {
 		sx_xlock(&sc->sc_chip_sx);
@@ -4053,6 +4525,7 @@ static const struct brcm_bus_ops brcm_sdio_bus_ops = {
  * Newbus glue
  * ------------------------------------------------------------------ */
 
+/* check whether this card is supported */
 static int
 brcm_sdio_probe(device_t dev)
 {
@@ -4067,8 +4540,9 @@ brcm_sdio_probe(device_t dev)
 
 	if (manfid != SDIO_VENDOR_BROADCOM)
 		return (ENXIO);
-	/* Only function 1 carries WLAN.  Funcs 2/3 (BCM43xxx management,
-	 * Bluetooth, etc.) are out of scope for this driver. */
+	/* Bind to function 1 (backplane) only.  Function 2 (WLAN frame
+	 * FIFO) is bound by the brcm_sdio_f2 sibling driver; function 3
+	 * (Bluetooth, where present) is out of scope. */
 	if (func_num != 1)
 		return (ENXIO);
 	m = brcm_sdio_lookup(prodid);
@@ -4084,11 +4558,9 @@ brcm_sdio_probe(device_t dev)
 /*
  * /dev/brcm0 raw SDIO transport cdev.
  *
- * Userspace (and, via a TCP bridge daemon, a QEMU Linux guest) can
- * drive CMD52/CMD53 + backplane-window operations directly through
- * ioctls.  This lets us hand the rest of the brcmfmac bring-up to a
- * Linux-side userspace port without depending on FreeBSD-side
- * sysctl plumbing for every step.
+ * Userspace tools (including a bridge that forwards the operations to
+ * a Linux guest) can drive CMD52/CMD53 + backplane-window operations
+ * directly through ioctls, without a sysctl for every step.
  *
  * All ioctl handlers take sc_chip_sx so they serialise against the
  * existing sysctls (load_firmware, halt_cr4, etc.).
@@ -4104,6 +4576,7 @@ static struct cdevsw brcm_cdevsw = {
 	.d_name		= "brcm",
 };
 
+/* open the /dev control device */
 static int
 brcm_cdev_open(struct cdev *cdev __unused, int flags __unused,
     int devtype __unused, struct thread *td __unused)
@@ -4111,6 +4584,7 @@ brcm_cdev_open(struct cdev *cdev __unused, int flags __unused,
 	return (0);
 }
 
+/* run a one-byte SDIO transfer for userland */
 static int
 brcm_cdev_do_cmd52(struct brcm_sdio_softc *sc, struct brcm_cmd52 *c)
 {
@@ -4143,6 +4617,7 @@ brcm_cdev_do_cmd52(struct brcm_sdio_softc *sc, struct brcm_cmd52 *c)
 	return (0);
 }
 
+/* run a multi-byte SDIO transfer for userland */
 static int
 brcm_cdev_do_cmd53(struct brcm_sdio_softc *sc, struct brcm_cmd53 *c)
 {
@@ -4224,15 +4699,31 @@ brcm_cdev_do_cmd53(struct brcm_sdio_softc *sc, struct brcm_cmd53 *c)
 	return (err);
 }
 
+/* handle ioctls on the control device */
 static int
 brcm_cdev_ioctl(struct cdev *cdev, u_long ioc, caddr_t arg, int flag __unused,
-    struct thread *td __unused)
+    struct thread *td)
 {
 	struct brcm_sdio_softc *sc = cdev->si_drv1;
 	int err;
 
 	if (sc == NULL)
 		return (ENXIO);
+
+	/*
+	 * Safety gate: CMD52/CMD53/backplane read/write are
+	 * raw SDIO transactions against F1/F2 with no bounds checks
+	 * beyond addr-space width.  Same rationale as the iovar_set
+	 * sysctl gate: opt-in flag + PRIV_DRIVER, so a jail's root
+	 * without PRIV_DRIVER can't wedge the chip.
+	 */
+#ifndef BRCM_UNSAFE_IOVARS_DEFAULT_ON
+	if (sc->bsc_base.sc_unsafe_iovars == 0)
+		return (EPERM);
+#endif
+	err = priv_check(td, PRIV_DRIVER);
+	if (err != 0)
+		return (err);
 
 	sx_xlock(&sc->sc_chip_sx);
 	switch (ioc) {
@@ -4332,6 +4823,7 @@ brcm_cdev_ioctl(struct cdev *cdev, u_long ioc, caddr_t arg, int flag __unused,
 	return (err);
 }
 
+/* set up the driver when the card is found */
 static int
 brcm_sdio_attach(device_t dev)
 {
@@ -4387,16 +4879,21 @@ brcm_sdio_attach(device_t dev)
 
 	/*
 	 * brcm_softc's sc_mtx / sc_ctl_mtx / sc_ctl_pending are
-	 * "owned by the transport attach" per brcm.c's contract.
-	 * The USB transport sets them up in its attach; we do it
-	 * here.  Without this brcm_rx_frame -> brcm_handle_event
-	 * paths hit mtx_lock on an uninitialized mutex and panic
-	 * with vm_fault_lookup on a kernel kstack address (phase 1B
-	 * smoke-test root cause).
+	 * "owned by the transport attach" per brcm.c's contract, so
+	 * they are set up here as the USB transport does in its
+	 * attach.  Otherwise the brcm_rx_frame -> brcm_handle_event
+	 * path locks an uninitialised mutex and panics.
 	 */
 	mtx_init(&sc->bsc_base.sc_mtx, "brcm", NULL, MTX_DEF);
 	mtx_init(&sc->bsc_base.sc_ctl_mtx, "brcm-ctl", NULL, MTX_DEF);
 	TAILQ_INIT(&sc->bsc_base.sc_ctl_pending);
+	/*
+	 * Seed the BCDC reqid to 1, as USB does.  reqid 0 is reserved
+	 * for event-shaped noise (brcm_rxctl drops responses with id=0),
+	 * so a request sent with id 0 would have its reply dropped and
+	 * time out at 5 s.  Every ++sc_bcdc_reqid site also skips 0.
+	 */
+	sc->bsc_base.sc_bcdc_reqid = 1;
 
 	/* EVENT rx delivery taskqueue + queue. */
 	mtx_init(&sc->sc_event_rx_mtx, "brcm-evrx", NULL, MTX_DEF);
@@ -4406,6 +4903,15 @@ brcm_sdio_attach(device_t dev)
 	    taskqueue_thread_enqueue, &sc->sc_event_rx_tq);
 	taskqueue_start_threads(&sc->sc_event_rx_tq, 1, PI_NET,
 	    "%s evrx", device_get_nameunit(dev));
+
+	/* Data transmit queue; see sc_tx_q. */
+	mtx_init(&sc->sc_tx_mtx, "brcm-tx", NULL, MTX_DEF);
+	mbufq_init(&sc->sc_tx_q, BRCM_SDIO_TXQ_LEN);
+	TASK_INIT(&sc->sc_tx_task, 0, brcm_sdio_tx_task, sc);
+	sc->sc_tx_tq = taskqueue_create("brcm_tx", M_WAITOK,
+	    taskqueue_thread_enqueue, &sc->sc_tx_tq);
+	taskqueue_start_threads(&sc->sc_tx_tq, 1, PI_NET,
+	    "%s tx", device_get_nameunit(dev));
 
 	/*
 	 * Periodic SDIO watchdog.  callout fires every BRCM_WD_POLL_MS
@@ -4421,12 +4927,17 @@ brcm_sdio_attach(device_t dev)
 	 * Expose dev.brcm.N.debug for ad-hoc bring-up tracing.  Default
 	 * silent; bump with `sysctl dev.brcm.0.debug=2` to follow CMD52
 	 * traffic without recompiling.  bsc_base.sc_debug is the same
-	 * field used by USB and PCIe transports — one knob, all paths.
+	 * field the USB and PCIe transports use.
 	 */
 	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
 	    OID_AUTO, "debug", CTLFLAG_RWTUN, &sc->bsc_base.sc_debug, 0,
 	    "DPRINTF level: 0=silent 1=milestones 2=protocol 3=hex");
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
+	    OID_AUTO, "sdio_stats", CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE,
+	    sc, 0, brcm_sdio_stats_sysctl, "A",
+	    "Mailbox answers, flow control and transmit credit counters");
 
 	/*
 	 * Write a non-zero value to dev.brcm.N.read_chipid to fire the
@@ -4440,6 +4951,17 @@ brcm_sdio_attach(device_t dev)
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 	    sc, 0, brcm_sdio_sysctl_read_chipid, "I",
 	    "Write 1: bring F1 up + read CC.CHIPID via backplane window");
+
+	/*
+	 * Diagnostic memory peek: `sysctl dev.brcm.N.peek=<addr>` dumps
+	 * 8 words from that chip address via bp_read32.
+	 */
+	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
+	    OID_AUTO, "peek",
+	    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    sc, 0, brcm_sdio_sysctl_peek, "IU",
+	    "Write a chip address: dump 8 words from it via backplane");
 
 	/*
 	 * Write a non-zero value to dev.brcm.N.halt_cr4 to fire the
@@ -4548,8 +5070,8 @@ brcm_sdio_attach(device_t dev)
 	    "Write 1: broadcast active escan + poll rx for results");
 
 	/*
-	 * Phase 1A net80211 attach.  Opt-in via sysctl so the kldload
-	 * smoke path stays minimal until the full DATA path is wired.
+	 * net80211 attach, run on demand once the firmware is up (the
+	 * bringup sysctl below chains it).
 	 */
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
@@ -4626,10 +5148,9 @@ brcm_sdio_attach(device_t dev)
 
 	/*
 	 * Run the prelude (soft-reset + F1 + CARDCAP + KSO + buscoreprep
-	 * + PMU reload + chipid recipe lookup) WITHOUT the firmware
-	 * upload.  Used as a safety gate: if this wedges the SD-card
-	 * controller (root FS) on Pi 4, we know the regression is in the
-	 * prelude rather than the upload.
+	 * + PMU reload + chipid recipe lookup) without the firmware
+	 * upload.  If this wedges the SD-card controller (root FS) on
+	 * Pi 4, the problem is in the prelude rather than the upload.
 	 */
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
@@ -4641,8 +5162,8 @@ brcm_sdio_attach(device_t dev)
 	/*
 	 * Upload firmware + NVRAM to SOCRAM and verify head/tail
 	 * round-trip.  Requires brcmfmac<chip>_fw.ko to be loaded so
-	 * firmware(9) can hand over the blobs.  Does NOT yet release
-	 * the CR4 from reset -- that's the next phase.
+	 * firmware(9) can hand over the blobs.  CR4 is released from
+	 * reset separately, by release_cr4.
 	 */
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
@@ -4652,11 +5173,10 @@ brcm_sdio_attach(device_t dev)
 	    "Write 1: upload firmware + NVRAM to SOCRAM with verification");
 
 	/*
-	 * Phase-1 chip layer (brcm_chip.c) test surface.  Run
+	 * Chip layer (brcm_chip.c) inspection.  Run
 	 * load_firmware_prelude first to leave the chip in ALPAvail,
 	 * then write N to either sysctl to dump that many
-	 * registers/words.  Cheaper than building brcm_drive for
-	 * debug-only OTP/chipcontrol inspection.
+	 * registers/words.
 	 */
 	SYSCTL_ADD_PROC(device_get_sysctl_ctx(dev),
 	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
@@ -4678,13 +5198,10 @@ brcm_sdio_attach(device_t dev)
 	    sc->sc_manfid, sc->sc_prodid, sc->sc_func_class, sc->sc_blksize);
 	DPRINTF(&sc->bsc_base, 1, "func_num=%u sdio_bus=%s\n",
 	    sc->sc_func_num, device_get_nameunit(sc->sc_sdio_bus));
-	device_printf(dev,
-	    "scaffold attach: firmware loader + brcm_attach() not yet wired\n");
 
 	/*
-	 * Expose /dev/brcm<unit> so userspace (and the RPC bridge daemon
-	 * that fronts a QEMU Linux guest) can drive raw CMD52/CMD53 +
-	 * backplane-window operations.  Same chip_sx serialises this
+	 * Expose /dev/brcm<unit> so userspace can drive raw CMD52/CMD53 +
+	 * backplane-window operations.  sc_chip_sx serialises this
 	 * against the sysctl path.
 	 */
 	sc->sc_cdev = make_dev(&brcm_cdevsw, device_get_unit(dev),
@@ -4696,28 +5213,91 @@ brcm_sdio_attach(device_t dev)
 		    device_get_unit(dev));
 
 	/*
-	 * Do NOT call brcm_attach() yet.  net80211 attach would try to
-	 * register an interface and immediately drive iovars to firmware
-	 * that hasn't been uploaded — guaranteed panic.  Phase 2 will
-	 * land the upload path (CMD53 backplane window + chip-id init +
-	 * brcmfmac firmware blob), and only then call brcm_attach().
+	 * brcm_attach() is not called here: net80211 attach drives iovars
+	 * at once, which needs running firmware.  The autostart thread (or
+	 * the bring-up sysctls) loads the firmware and then calls it.
 	 */
+	if (brcm_sdio_autostart_dflt) {
+		sc->sc_autostart_running = true;
+		if (kproc_create(brcm_sdio_autostart, sc, NULL, 0, 0,
+		    "%s autostart", device_get_nameunit(dev)) != 0) {
+			sc->sc_autostart_running = false;
+			device_printf(dev, "autostart: kproc_create failed; "
+			    "use the bring-up sysctls\n");
+		}
+	}
 	return (0);
 }
 
+/*
+ * The autostart thread.  The F2 sibling can attach after F1, so wait for
+ * it first; then run the bring-up steps under sc_chip_sx as the sysctls
+ * do.  A failed step is logged and left for the sysctls to retry.
+ */
+static void
+brcm_sdio_autostart(void *arg)
+{
+	struct brcm_sdio_softc *sc = arg;
+	const char *step;
+	int err, i;
+
+	for (i = 0; i < 100 && sc->sc_f2_dev == NULL &&
+	    !sc->bsc_base.sc_dying; i++)
+		pause("brcmf2w", hz / 10);
+	if (sc->bsc_base.sc_dying)
+		goto out;
+	if (sc->sc_f2_dev == NULL) {
+		device_printf(sc->sc_dev,
+		    "autostart: no F2 device after 10 s; not starting\n");
+		goto out;
+	}
+	device_printf(sc->sc_dev, "autostart: bringing the chip up\n");
+
+	step = "read_chipid";
+	sx_xlock(&sc->sc_chip_sx);
+	err = brcm_sdio_read_chipid_now(sc);
+	if (err == 0) {
+		step = "load_firmware";
+		err = brcm_sdio_load_firmware_now(sc, true);
+	}
+	if (err == 0) {
+		step = "release_cr4";
+		err = brcm_sdio_release_cr4_now(sc);
+	}
+	sx_xunlock(&sc->sc_chip_sx);
+	if (err == 0 && !sc->bsc_base.sc_dying) {
+		step = "net80211_attach";
+		err = brcm_sdio_net80211_attach_now(sc);
+	}
+	if (err != 0)
+		device_printf(sc->sc_dev, "autostart: %s failed (err=%d); "
+		    "retry with the dev.%s.%d sysctls\n", step, err,
+		    device_get_name(sc->sc_dev), device_get_unit(sc->sc_dev));
+	else
+		device_printf(sc->sc_dev, "autostart: chip up\n");
+out:
+	sc->sc_autostart_running = false;
+	wakeup(&sc->sc_autostart_running);
+	kproc_exit(0);
+}
+
+/* tear down the driver when the card is removed */
 static int
 brcm_sdio_detach(device_t dev)
 {
 	struct brcm_sdio_softc *sc = device_get_softc(dev);
 
+	/* Let a running autostart finish before anything is torn down. */
+	while (sc->sc_autostart_running)
+		tsleep(&sc->sc_autostart_running, 0, "brcmasw", hz / 10);
+
 	/*
 	 * Refuse to detach while net80211 still holds callbacks into
-	 * our module text.  Without this, `kldunload brcm_sdio` after
-	 * an `ifconfig wlan create wlandev brcm0 ...` panics the box
-	 * the next time net80211 dispatches an iv_op (the function
-	 * pointer is now stale).  Operator must `ifconfig wlan0
-	 * destroy` first to drop the vap, then re-run kldunload.
-	 * See feedback_no_kldunload_brcm_sdio.
+	 * our module text.  Otherwise `kldunload brcm_sdio` after an
+	 * `ifconfig wlan create wlandev brcm0 ...` panics the next time
+	 * net80211 dispatches an iv_op through the stale function
+	 * pointer.  The operator must `ifconfig wlan0 destroy` first to
+	 * drop the vap, then re-run kldunload.
 	 */
 	if (sc->bsc_base.sc_ic_attached) {
 		device_printf(dev,
@@ -4725,6 +5305,34 @@ brcm_sdio_detach(device_t dev)
 		    "(ifconfig wlan0 destroy first)\n");
 		return (EBUSY);
 	}
+
+	/*
+	 * Stop the SDIO watchdog callout + task FIRST — before the
+	 * common transport teardown.  brcm_transport_teardown sleeps
+	 * on sc_in_flight_dcmd, and while it sleeps the still-running
+	 * watchdog task can drive a fresh SDPCM RX pump that enqueues
+	 * a control frame back through the very sc_ctl_mtx path being
+	 * torn down.  Silencing the watchdog first eliminates that
+	 * race so teardown's sleep is guaranteed to reach zero.
+	 *
+	 * Order: set sc_wd_stop (both the callout and the task observe
+	 * it as a bail-early check), then callout_drain (waits for any
+	 * softclock callback in flight), then taskqueue_drain (waits
+	 * for the deferred task if softclock enqueued one before
+	 * observing sc_wd_stop).
+	 */
+	sc->sc_wd_stop = true;
+	callout_drain(&sc->sc_wd_callout);
+	taskqueue_drain(taskqueue_thread, &sc->sc_wd_task);
+
+	/*
+	 * Common transport-teardown prologue: flip sc_dying, wake any
+	 * sleepers parked on sc_ctl_pending, wait for in-flight dcmds
+	 * to drain BEFORE we destroy the mutex they sleep on; otherwise
+	 * mtx_destroy races an in-flight dcmd in mtx_sleep, which means
+	 * silent memory corruption or a panic.
+	 */
+	brcm_transport_teardown(&sc->bsc_base);
 
 	if (sc->sc_cdev != NULL) {
 		destroy_dev(sc->sc_cdev);
@@ -4735,8 +5343,15 @@ brcm_sdio_detach(device_t dev)
 		sc->sc_sdpcm = NULL;
 	}
 
-	/* Drain + tear down the EVENT rx taskqueue before freeing
-	 * anything brcm_rx_frame might touch. */
+	/* Drain + tear down the TX and EVENT rx taskqueues before
+	 * freeing anything brcm_rx_frame might touch. */
+	if (sc->sc_tx_tq != NULL) {
+		taskqueue_drain(sc->sc_tx_tq, &sc->sc_tx_task);
+		taskqueue_free(sc->sc_tx_tq);
+		sc->sc_tx_tq = NULL;
+		mbufq_drain(&sc->sc_tx_q);
+		mtx_destroy(&sc->sc_tx_mtx);
+	}
 	if (sc->sc_event_rx_tq != NULL) {
 		taskqueue_drain(sc->sc_event_rx_tq, &sc->sc_event_rx_task);
 		taskqueue_free(sc->sc_event_rx_tq);
@@ -4800,8 +5415,8 @@ MODULE_DEPEND(brcm_sdio, wlan, 1, 1, 1);
  * F2 detach also clears `sc->sc_f2_dev` only if it still points to
  * itself.
  *
- * SDPCM transport calls (brcm_sdpcm.c) reach F2 via the public
- * brcm_sdio_f2_write / brcm_sdio_f2_read helpers below.
+ * SDPCM transport calls (brcm_sdpcm.c) reach F2 by passing this
+ * device_t to brcm_sdpcm_f2_xfer.
  * ------------------------------------------------------------------ */
 
 struct brcm_sdio_f2_softc {
@@ -4809,6 +5424,7 @@ struct brcm_sdio_f2_softc {
 	struct brcm_sdio_softc *f2_parent;	/* F1 softc */
 };
 
+/* check the function-2 child device */
 static int
 brcm_sdio_f2_probe(device_t dev)
 {
@@ -4830,6 +5446,7 @@ brcm_sdio_f2_probe(device_t dev)
 	return (BUS_PROBE_DEFAULT);
 }
 
+/* set up the function-2 child device */
 static int
 brcm_sdio_f2_attach(device_t dev)
 {
@@ -4844,8 +5461,8 @@ brcm_sdio_f2_attach(device_t dev)
 	psc = brcm_sdio_global_softc;
 	if (psc == NULL) {
 		/* F2 attached before F1 — uncommon, but the sdio bus
-		 * doesn't guarantee enumeration order.  Defer: stash
-		 * ourselves in the global so F1 attach can pick us up. */
+		 * doesn't guarantee enumeration order.  F1 attach finds
+		 * us among the bus children. */
 		device_printf(dev,
 		    "F1 not yet attached; F2 device_t deferred\n");
 		return (0);
@@ -4860,13 +5477,13 @@ brcm_sdio_f2_attach(device_t dev)
 	 * firmware is uploaded and CR4 released — fw is the one that
 	 * brings up the F2 backend; touching FN_ENABLE before that just
 	 * makes the chip raise IO errors on the next CMD52.  The
-	 * load_firmware / release_cr4 path (or a future sdpcm_attach
-	 * hook) is the right place to flip the bit.
+	 * release_cr4 path flips the bit.
 	 */
 	(void)err;
 	return (0);
 }
 
+/* tear down the function-2 child device */
 static int
 brcm_sdio_f2_detach(device_t dev)
 {
@@ -4892,9 +5509,3 @@ static driver_t brcm_sdio_f2_driver = {
 };
 
 DRIVER_MODULE(brcm_sdio_f2, sdio, brcm_sdio_f2_driver, NULL, NULL);
-
-/*
- * F2 transport helpers used to live here; they were inlined into
- * brcm_sdpcm.c when the SDPCM API switched to taking (state, device_t)
- * directly instead of a softc.  See brcm_sdpcm_f2_xfer.
- */

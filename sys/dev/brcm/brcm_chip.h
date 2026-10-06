@@ -1,17 +1,21 @@
 /*-
- * SPDX-License-Identifier: BSD-2-Clause
+ * SPDX-License-Identifier: BSD-2-Clause AND ISC
  *
  * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
+ * Copyright (c) 2014 Broadcom Corporation
  *
- * Bus-neutral chip layer for Broadcom 802.11 chips (BCM43xxx).
+ * Chip layer for Broadcom 802.11 chips (BCM43xxx).
  *
- * Copies the shape of Linux brcmfmac chip.c, but in FreeBSD style
- * (no linuxkpi). A transport (SDIO/PCIe/USB) fills in brcm_chip_ops.
- * The chip layer then drives chipcommon, PMU indirect registers,
- * OTP, and the EROM walk on top of that ops table.
+ * Works with any bus. Shaped like Linux brcmfmac chip.c but
+ * written in FreeBSD style (no linuxkpi). A transport
+ * (SDIO, PCIe, USB) fills in brcm_chip_ops. The chip layer
+ * uses that vtable to drive chipcommon, PMU indirect
+ * registers, OTP, and the EROM walk.
  *
- * Naming: types and functions use the brcm_chip_* prefix. Register
- * macros use BRCM_CC_* (like brcmreg.h).
+ * Names: types and functions use brcm_chip_*.
+ * Register macros use BRCM_CC_* (like brcmreg.h).
+ *
+ * Portions derived from Linux brcmfmac chip.h are ISC licensed.
  */
 
 #ifndef _DEV_BRCM_BRCM_CHIP_H_
@@ -21,10 +25,11 @@
 #include <sys/queue.h>
 
 /*
- * ChipCommon register offsets (from CC core base). Checked against
- * linux/drivers/net/wireless/broadcom/brcm80211/include/chipcommon.h
- * struct chipcregs. Only the offsets used here are listed. The
- * full set lives in brcmreg.h.
+ * ChipCommon register offsets (from the CC core base).
+ * Cross-checked against Linux
+ * drivers/net/wireless/broadcom/brcm80211/include/chipcommon.h
+ * struct chipcregs. Only the ones the chip layer uses are
+ * here. The full set lives in brcmreg.h if needed.
  */
 /* BRCM_CC_CHIPID and BRCM_CC_EROMPTR live in brcm_sdio_regs.h. */
 #define	BRCM_CC_CAPABILITIES		0x004
@@ -37,10 +42,11 @@
 #define	BRCM_CC_CAPABILITIES_EXT	0x0ac
 
 /*
- * PMU register offsets (also CC-relative for the built-in PMU).
- * BRCM_CC_PMUCONTROL/CAPABILITIES/STATUS/RES_STATE/MIN_RES_MASK/MAX_RES_MASK
- * live in brcm_sdio_regs.h. Only the extra chip offsets that are
- * not in regs.h live here.
+ * PMU register offsets (CC-relative for the built-in PMU).
+ *
+ * BRCM_CC_PMUCONTROL / CAPABILITIES / STATUS / RES_STATE /
+ * MIN_RES_MASK / MAX_RES_MASK are in brcm_sdio_regs.h. Only
+ * the extra ones not in that file live here.
  */
 #define	BRCM_CC_PMU_CAPABILITIES_EXT	0x64c
 #define	BRCM_CC_PMU_CHIPCONTROL_ADDR	0x650
@@ -55,48 +61,50 @@
 #define	BRCM_CC_PMUCTL_RES_RELOAD	0x2u
 #define	BRCM_CC_PMUCTL_RES_SHIFT	13
 
-/* OTP area: srom/otp window at CC base + 0x800, 768 u16 words. */
+/* OTP window: at CC base + 0x800, holds 768 u16 words. */
 #define	BRCM_CC_SROMOTP_OFFSET		0x800
 #define	BRCM_CC_SROMOTP_WORDS		768
 
-/* OTPSTATUS / OTPCONTROL bits we care about. */
+/* OTPSTATUS / OTPCONTROL bits we use. */
 #define	BRCM_OTPSTATUS_OL_PRESENT	0x00000001u	/* OTP block present */
 #define	BRCM_OTPSTATUS_OL_PROGRAMMED	0x00000004u	/* HW-fuse rows valid */
 
 /*
- * PMU caps. Used to pick the right indirect-register layout for
- * chipcontrol / regcontrol probes. pmurev is in the low 8 bits.
+ * PMU capabilities. Used to pick the right indirect-register
+ * layout for chipcontrol / regcontrol probes. pmurev is in
+ * the low 8 bits.
  */
 #define	BRCM_PMUCAP_REV_MASK		0xffu
 
 /*
- * Chip object. Holds the state the chip layer keeps for one chip.
- * A transport makes one (usually inside its softc), sets `ops`,
- * `ctx`, and ID fields, then calls brcm_chip_attach(). The chip
- * layer fills public fields during attach. Transport code may
- * read them but should not write.
+ * Chip object. The bus-neutral state the chip layer owns.
+ *
+ * A transport allocates one (often inside its softc), sets
+ * ops, ctx, and identifying fields, then calls
+ * brcm_chip_attach(). The chip layer fills in the public
+ * fields during attach. Transports may read them, not write.
  */
 struct brcm_chip_core {
-	TAILQ_ENTRY(brcm_chip_core)	link;
-	uint16_t			id;
-	uint16_t			rev;
-	uint32_t			base;
-	uint32_t			wrap;
+	TAILQ_ENTRY(brcm_chip_core)	link;	/* list linkage */
+	uint16_t			id;	/* core id */
+	uint16_t			rev;	/* core revision */
+	uint32_t			base;	/* register base address */
+	uint32_t			wrap;	/* wrapper base address */
 };
 TAILQ_HEAD(brcm_chip_corelist, brcm_chip_core);
 
 /*
- * Transport hooks the bus driver fills in.
+ * Callbacks the bus driver supplies.
  *
- *   read32/write32:  plain 32-bit access to a chip-side address
- *                    (same space EROM uses; the bus driver handles
- *                    SBADDR window setup inside).
- *   prepare:         called once at attach before the chipid read.
- *                    Bus gets the chip into ALPAvail state, etc.
- *                    Returns 0 on success.
- *   activate:        write the rstvec to chip[0]. Transport-specific
- *                    because some transports do this via DMA, not
- *                    F1 word access. Called from set_active.
+ *   read32 / write32: 32-bit access to a chip-side address.
+ *     Same address space EROM uses. The bus driver handles
+ *     the SBADDR window on its own.
+ *   prepare: called once during attach, before the chipid
+ *     read. The bus gets the chip into ALPAvail state.
+ *     Returns 0 on success.
+ *   activate: writes rstvec to chip[0]. Bus-specific because
+ *     some transports use DMA instead of F1 word access.
+ *     Called from set_active.
  */
 struct brcm_chip;
 struct brcm_chip_ops {
@@ -108,7 +116,7 @@ struct brcm_chip_ops {
 };
 
 struct brcm_chip {
-	/* ID info, set by recognition. */
+	/* Chip identity (set by recognition). */
 	uint32_t			chip;		/* CID_ID */
 	uint32_t			chiprev;	/* CID_REV */
 	uint32_t			enum_base;	/* SI_ENUM_BASE */
@@ -119,60 +127,63 @@ struct brcm_chip {
 	uint32_t			ramsize;
 	uint32_t			rambase;
 
-	/* Cores found by the EROM walk. */
+	/* Cores found during the EROM walk. */
 	struct brcm_chip_corelist	cores;
 	uint32_t			ncores;
 
-	/* Transport hook. */
+	/* Hook back into the bus driver. */
 	const struct brcm_chip_ops	*ops;
 	void				*ctx;
 };
 
 /*
- * Public API. Life cycle:
+ * Public API. Lifecycle:
  *
- *   brcm_chip_init   -- transport sets up the chip object. Call once
- *                       before anything else. Sets ops/ctx and the
- *                       core list head. Safe to re-run on the list.
- *   brcm_chip_free   -- free core list memory.
+ *   brcm_chip_init -- set up the chip object. Call once,
+ *                     before anything else. Sets ops/ctx and
+ *                     the core list head. Safe on re-init.
+ *   brcm_chip_free -- free the core list memory.
  *
- * Core lookup (any time after the EROM walk):
- *   brcm_chip_get_core, brcm_chip_get_pmu, brcm_chip_get_chipcommon
+ * Inspect cores (after the EROM walk):
+ *   brcm_chip_get_core, brcm_chip_get_pmu,
+ *   brcm_chip_get_chipcommon
  *
- * Indirect PMU register helpers:
+ * PMU indirect register helpers:
  *   brcm_chip_cc_chipcontrol_read/write32  (PMU chipcontrol)
  *   brcm_chip_cc_regcontrol_read/write32   (PMU regcontrol)
  *   brcm_chip_cc_pllcontrol_read/write32   (PMU pllcontrol)
  *
- * OTP (one-time-programmable):
- *   brcm_chip_otp_present  -- otpstatus says fuse block is there + fused
- *   brcm_chip_otp_read16   -- read u16 at sromotp word index (0..767)
- *   brcm_chip_otp_dump     -- copy the sromotp window into caller buffer
+ * OTP (one-time-programmable) access:
+ *   brcm_chip_otp_present -- fuse block exists and is set
+ *   brcm_chip_otp_read16  -- read one word (index 0..767)
+ *   brcm_chip_otp_dump    -- bulk-read the OTP window
  *
- * All indirect helpers need cores set up (chipcommon + PMU). On a
- * chip with no separate PMU core, the PMU registers live in
- * chipcommon at the offsets above. brcm_chip_get_pmu() then
- * returns the chipcommon core.
+ * The indirect helpers need cores loaded (chipcommon + PMU).
+ * When the chip has no separate PMU core, PMU registers sit
+ * in chipcommon. brcm_chip_get_pmu() then returns chipcommon.
  */
 void	brcm_chip_init(struct brcm_chip *, const struct brcm_chip_ops *,
 	    void *ctx);
 void	brcm_chip_free(struct brcm_chip *);
 
 /*
- * Phase-1 helper. Add one core at the given base. Used by the
- * SDIO transport to install chipcommon (always at 0x18000000 on
- * BCM43xxx) so chipcontrol / OTP / sr_capable helpers can run
- * before the full EROM walk. Wrap address is optional (0 is fine
- * for chipcommon, which does not need its wrap touched). Returns
- * 0 on success. The chip layer owns the allocation from then on.
+ * Add one core at the given base address.
+ *
+ * The SDIO transport uses this to install chipcommon (always
+ * at 0x18000000 on BCM43xxx) so the chipcontrol, OTP and
+ * sr_capable helpers can run before the full EROM walk.
+ * The wrap address is optional (0 is fine for chipcommon).
+ * Returns 0 on success. The chip layer then owns the memory.
  */
 int	brcm_chip_add_core(struct brcm_chip *, uint16_t coreid, uint16_t rev,
 	    uint32_t base, uint32_t wrap);
 
 /*
- * Phase-1 helper. Read and cache CC + PMU caps. Run once after
- * the chipcommon core is added and the chip is in ALPAvail state.
- * Fills chip->chip, chiprev, cc_caps, cc_caps_ext, pmurev, pmu_caps.
+ * Probe and cache the CC and PMU capabilities.
+ *
+ * Run once after chipcommon has been added and the chip is
+ * in ALPAvail state. Fills chip->chip, chiprev, cc_caps,
+ * cc_caps_ext, pmurev, pmu_caps.
  */
 int	brcm_chip_probe_caps(struct brcm_chip *);
 
@@ -181,12 +192,14 @@ struct brcm_chip_core *brcm_chip_get_pmu(struct brcm_chip *);
 struct brcm_chip_core *brcm_chip_get_chipcommon(struct brcm_chip *);
 
 /*
- * PMU indirect register access. Linux brcmfmac uses these for
- * BCM4345 SR setup, drive strength, and many bug workarounds.
- * Chipcontrol reg N: write N to chipcontrol_addr, then read
- * chipcontrol_data. Write follows the same shape.
+ * PMU indirect register access.
  *
- * Returns 0 on success. All reads return the value in *out.
+ * Linux brcmfmac uses these to set up BCM4345 SR, drive
+ * strength, and workarounds. To read chipcontrol register N:
+ * write N to chipcontrol_addr, then read chipcontrol_data.
+ * Writes work the same way.
+ *
+ * Returns 0 on success. Reads return the value via *out.
  */
 int	brcm_chip_cc_chipcontrol_read32(struct brcm_chip *, uint32_t reg,
 	    uint32_t *out);
@@ -208,56 +221,65 @@ int	brcm_chip_otp_read16(struct brcm_chip *, uint32_t word_idx,
 int	brcm_chip_otp_dump(struct brcm_chip *, uint16_t *buf, uint32_t nwords);
 
 /*
- * Save-restore (SR) probe. Returns true only if the chip has the
- * SR engine and it is on right now. For BCM4345 (and the
- * 4354/4356/43454 family), this reads PMU chipcontrol[3] and
- * checks bit 2.
+ * Save-restore (SR) probe.
+ *
+ * Returns true if the chip has an SR engine and it is on
+ * right now. For BCM4345 (and the 4354 / 4356 / 43454
+ * family) this reads PMU chipcontrol[3] and checks bit 2.
  */
 bool	brcm_chip_sr_capable(struct brcm_chip *);
 
 /*
- * EROM walk. Reads CC.EROMPTR, walks the chip's Discoverable MMIO
- * Pointers table, and calls brcm_chip_add_core() for every part
- * with a (regbase, wrapbase) pair. After this returns 0, the
- * core list is full and brcm_chip_get_core() can find ARM_CR4,
- * SOCRAM, D11, etc.
+ * EROM walk.
  *
- * The caller must have added the chipcommon core first (usually
- * via brcm_chip_add_core in chip_ensure) so CC.EROMPTR is reachable.
+ * Reads CC.EROMPTR and walks the chip's Discoverable MMIO
+ * Pointers table. Calls brcm_chip_add_core() for each
+ * component with a (regbase, wrapbase) pair. When this
+ * returns 0 the core list is full, and brcm_chip_get_core()
+ * can find ARM_CR4, SOCRAM, D11, etc.
  *
- * NOT safe to run twice. A second call adds duplicates. The caller
- * should gate with its own ready flag.
+ * Caller must add the chipcommon core first (usually via
+ * brcm_chip_add_core in chip_ensure) so CC.EROMPTR works.
+ *
+ * Calling it twice appends duplicates, so a caller that might
+ * run it more than once must keep its own flag.
  */
 int	brcm_chip_walk_erom(struct brcm_chip *);
 
 /*
- * Stop and restart the ARM core. Port of Linux brcmf_chip_disable_arm
- * (chip.c:1068) and brcmf_chip_cr4_set_active (chip.c:1339).
+ * Stop and start the ARM core.
  *
- * brcm_chip_disable_arm  — drives the three resetcore steps so the
- *      ARM core (id = BCMA_CORE_ARM_CR4 or BCMA_CORE_ARM_CM3) ends
- *      up in reset with CPUHALT kept. After this returns 0, the
- *      core's TCM can be written by the host for firmware upload.
- * brcm_chip_cr4_set_active  — write rstvec to chip[0] via the
- *      transport's activate hook. Then resetcore with prereset=CPUHALT,
- *      reset=0, postreset=0. The CR4 leaves reset with CPUHALT off
- *      and starts fetching at chip[0].
+ * Port of Linux brcmf_chip_disable_arm (chip.c:1068) and
+ * brcmf_chip_cr4_set_active (chip.c:1339).
  *
- * Both need the EROM walk done so the ARM core can be found.
- * Return 0 on success, errno if the core is missing or backplane
- * IO fails.
+ * brcm_chip_disable_arm: for CR4/CA7, runs the resetcore
+ *   steps so the core comes out of reset still halted
+ *   (CPUHALT set). After this returns 0, the core's TCM is
+ *   writable by the host for firmware upload. For CM3 Linux
+ *   only runs coredisable (core left in reset); this port
+ *   runs a full resetcore instead.
+ *
+ * brcm_chip_cr4_set_active: writes rstvec to chip[0] via the
+ *   transport's activate hook, then resetcore with
+ *   prereset=CPUHALT, reset=0, postreset=0. The CR4 comes out
+ *   of reset with CPUHALT clear and starts fetching at chip[0].
+ *
+ * Both need the EROM walk done first so the ARM core is in
+ * the list. Return 0 on success, errno on missing core or
+ * backplane I/O error.
  */
 int	brcm_chip_disable_arm(struct brcm_chip *, uint16_t coreid);
 int	brcm_chip_cr4_set_active(struct brcm_chip *, uint32_t rstvec);
 
 /*
- * Generic wrap-register resetcore. Building block for both
- * _disable_arm and _cr4_set_active. Exposed for callers that
- * need to drive non-ARM cores (D11, SOCRAM).
+ * Basic wrap-register resetcore call.
  *
- *   prereset:  IOCTL bits during the pre-reset step (before assert)
- *   reset:     IOCTL bits during the in-reset step (after assert)
- *   postreset: IOCTL bits OR'd with CLK after RESET_CTL clears
+ * Used inside _disable_arm and _cr4_set_active. Exposed so
+ * callers can also drive non-ARM cores like D11 and SOCRAM.
+ *
+ *   prereset:  IOCTL bits set before reset is asserted.
+ *   reset:     IOCTL bits set while reset is held.
+ *   postreset: IOCTL bits OR'd with CLK after reset clears.
  *
  * Returns 0 on success.
  */

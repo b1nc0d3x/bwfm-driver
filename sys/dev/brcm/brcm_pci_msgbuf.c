@@ -3,23 +3,17 @@
  *
  * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
  *
- * Broadcom PCIe MSGBUF protocol code. Native FreeBSD.
+ * Broadcom PCIe MSGBUF protocol implementation.  Native FreeBSD.
  *
- * First-light scope (DCMD round-trip only):
- *   - init_share_ram_info (read shared struct in TCM)
- *   - init_ringbuffers (5 common rings via bus_dma coherent alloc)
- *   - init_scratchbuffers (D2H scratch + ringupd)
- *   - post 1 IOCTLRESP_BUF into H2D_CONTROL_SUBMIT
- *   - DCMD tx: IOCTLPTR_REQ into H2D_CONTROL_SUBMIT + doorbell
- *   - ISR: read MAILBOXINT, drain D2H_CONTROL_COMPLETE, wake
- *     the DCMD waiter
+ * Reads the shared structure the firmware leaves in chip RAM, sets up
+ * the five common rings and the per-peer TX flowrings in coherent DMA
+ * memory, and runs dcmds and iovars through IOCTLPTR requests on the
+ * control-submit ring.  The interrupt path drains the control, TX and
+ * RX completion rings, hands received frames and firmware events to
+ * brcm.c, and wakes waiting dcmds.  Ring indices are kept in chip RAM.
  *
- * Deferred (not in this file yet):
- *   - flowrings (TX path)
- *   - RXPOST_SUBMIT / RX_COMPLETE (data-plane RX)
- *   - Event dispatch (WL_EVENT)
- *   - Console log reader
- *   - DMA index optimization (uses TCM indices for first light)
+ * The protocol follows Linux brcmfmac msgbuf.c and commonring.c
+ * (Broadcom); the code was written for this driver.
  */
 
 #include <sys/param.h>
@@ -57,9 +51,8 @@
 #define	BAR2H(mb)	brcm_pci_msgbuf_bar2_handle((mb)->sc)
 
 /*
- * Silent-by-default trace print. Gated on the shared sc_debug
- * just like DPRINTF() in brcmvar.h. level==0 fires when
- * sc_debug > 0.
+ * Debug print, silent by default.  Gated on the shared sc_debug like
+ * DPRINTF() in brcmvar.h; level 0 fires when sc_debug > 0.
  */
 #define	MDPRINTF(mb, level, ...)	do {				\
 	if (DBG(mb) > (level))						\
@@ -68,15 +61,9 @@
 
 #define	MSGBUF_IOCTL_RESP_TIMEOUT_MS	2000
 
-/* -----------------------------------------------------------------
- * TCM (BAR2) helpers. No window movement needed (BAR2 is direct).
- * ----------------------------------------------------------------- */
-static inline uint8_t
-tcm_read8(struct brcm_pci_msgbuf *mb, uint32_t off)
-{
-	return (bus_space_read_1(BAR2T(mb), BAR2H(mb), off));
-}
-
+/*
+ * TCM (BAR2) accessors.  BAR2 maps TCM directly, so no window is needed.
+ */
 static inline uint16_t
 tcm_read16(struct brcm_pci_msgbuf *mb, uint32_t off)
 {
@@ -101,11 +88,11 @@ tcm_write32(struct brcm_pci_msgbuf *mb, uint32_t off, uint32_t val)
 	bus_space_write_4(BAR2T(mb), BAR2H(mb), off, val);
 }
 
-/* -----------------------------------------------------------------
- * PCIe2 register helpers — window must be set to PCIe2 core base
- * first.  Callers hold the softc window lock (implicit today; if_brcm_pci
- * serializes via chip_probe/etc. and msgbuf is single-caller for now).
- * ----------------------------------------------------------------- */
+/*
+ * PCIe2 core register accessors.  These point the BAR0 window at the
+ * PCIe2 core first.  There is no explicit window lock: if_brcm_pci
+ * serializes its own window users, and msgbuf has a single caller.
+ */
 static inline uint32_t
 pcie2_read32(struct brcm_pci_msgbuf *mb, uint32_t off)
 {
@@ -120,10 +107,10 @@ pcie2_write32(struct brcm_pci_msgbuf *mb, uint32_t off, uint32_t val)
 	bus_space_write_4(BAR0T(mb), BAR0H(mb), off, val);
 }
 
-/* -----------------------------------------------------------------
- * bus_dma coherent buffer helpers.  Buffer is single-segment,
- * aligned, and both cpu-visible + dma-visible.
- * ----------------------------------------------------------------- */
+/*
+ * Coherent DMA buffer helpers.  Each buffer is a single aligned segment
+ * visible to both the CPU and the device.
+ */
 static void
 dma_buf_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 {
@@ -143,9 +130,8 @@ brcm_pci_msgbuf_dma_alloc(struct brcm_pci_msgbuf *mb,
 	buf->size = size;
 	error = bus_dma_tag_create(bus_get_dma_tag(DEV(mb)),
 	    /* alignment */ 8, /* boundary */ 0,
-	    BUS_SPACE_MAXADDR_32BIT, /* fw is 32-bit-DMA-capable only per
-					BCM43602 (host addr split lo/hi;
-					hi is 0 unless we allocate above 4G) */
+	    BUS_SPACE_MAXADDR_32BIT, /* keep host addresses below 4G, so
+					the hi word fw sees is always 0 */
 	    BUS_SPACE_MAXADDR,
 	    NULL, NULL,
 	    size, 1, size,
@@ -198,10 +184,9 @@ brcm_pci_msgbuf_dma_free(struct brcm_pci_msgbuf *mb __unused,
 	buf->tag = NULL;
 }
 
-/* -----------------------------------------------------------------
- * Common ring mechanics.  Uses per-ring spin mutex (mtx MTX_DEF for
- * simplicity; can move to MTX_SPIN once we settle interrupt context).
- * ----------------------------------------------------------------- */
+/*
+ * Common ring mechanics.  Each ring has its own MTX_DEF mutex.
+ */
 static void
 ring_config(struct brcm_pci_ring *ring, uint16_t depth, uint16_t item_len,
     struct brcm_pci_msgbuf *mb)
@@ -219,10 +204,7 @@ ring_config(struct brcm_pci_ring *ring, uint16_t depth, uint16_t item_len,
 	ring->was_full = false;
 }
 
-/*
- * Push the last-written w_ptr (f_ptr) to fw via TCM index.
- * TCM index is a 16-bit value at ring->w_idx_addr.
- */
+/* Publish our w_ptr (producer) to fw via the 16-bit TCM index. */
 static void
 ring_publish_wptr(struct brcm_pci_ring *ring)
 {
@@ -250,7 +232,7 @@ ring_pull_rptr_from_fw(struct brcm_pci_ring *ring)
 	ring->r_ptr = tcm_read16(ring->mb, ring->r_idx_addr);
 }
 
-/* Ring the doorbell — H2D_MAILBOX_0 write kicks fw. */
+/* Ring the doorbell: a write to H2D_MAILBOX_0 kicks fw. */
 static void
 ring_bell(struct brcm_pci_ring *ring)
 {
@@ -320,15 +302,14 @@ ring_read_complete(struct brcm_pci_ring *ring, uint16_t n_items)
 	ring_publish_rptr(ring);
 }
 
-/* -----------------------------------------------------------------
+/*
  * Shared-info reader.
  *
- * Fw writes sharedram_addr at BAR2[rambase + ramsize - 4] after boot.
- * On BCM43602 v7.35.177.61, the address is a raw TCM offset,
- * expected to fall inside [rambase, rambase + ramsize).  We
- * tolerate values outside that range and log — helpful for
- * observing chip state on partially initialised fw.
- * ----------------------------------------------------------------- */
+ * After boot, fw writes sharedram_addr at BAR2[rambase + ramsize - 4].
+ * It is a raw TCM offset and should fall inside [rambase,
+ * rambase + ramsize).  A value outside that range is logged rather
+ * than silently rejected, which helps diagnose half-booted fw.
+ */
 static int
 msgbuf_read_shared_info(struct brcm_pci_msgbuf *mb)
 {
@@ -356,9 +337,9 @@ msgbuf_read_shared_info(struct brcm_pci_msgbuf *mb)
 		    shared_addr, rambase, rambase + ramsize);
 		/*
 		 * Some fw revisions (v7.35.177.61 on BCM43602) tag the
-		 * sharedram pointer with high bits (0xc0 seen).  Try
-		 * low-24-bit masking; validate by checking the version
-		 * field falls in the supported range 5..7.
+		 * sharedram pointer with high bits (e.g. 0xc0).  Try the
+		 * low 24 bits, and accept them only if the version field
+		 * there is in the supported range 5..7.
 		 */
 		if (candidate >= rambase && candidate < rambase + ramsize) {
 			uint32_t f = tcm_read32(mb,
@@ -422,13 +403,12 @@ validated:
 	return (0);
 }
 
-/* -----------------------------------------------------------------
- * Ring buffer + index initialisation.
+/*
+ * Ring buffer and index setup.
  *
- * For first light: TCM indices only (no DMA-idx optimisation).
- * Allocates 5 coherent ring buffers, publishes their DMA addresses
- * into the fw ringmem slots.
- * ----------------------------------------------------------------- */
+ * Allocates the five common rings as coherent buffers and publishes
+ * their DMA addresses into fw's ringmem slots.
+ */
 static const uint32_t brcm_ring_max_item[BRCM_NROF_COMMON_MSGRINGS] = {
 	BRCM_H2D_CONTROL_SUBMIT_MAX_ITEM,
 	BRCM_H2D_RXPOST_SUBMIT_MAX_ITEM,
@@ -516,8 +496,10 @@ msgbuf_init_rings(struct brcm_pci_msgbuf *mb)
 			return (error);
 		pa = ring->buf.paddr;
 
-		/* Write ring DMA addr + item count + item size into fw's
-		 * ringmem slot for this ring. */
+		/*
+		 * Write the ring's DMA address, item count and item size
+		 * into its ringmem slot.
+		 */
 		tcm_write32(mb, ring_mem_ptr + BRCM_RING_MEM_BASE_ADDR_OFFSET,
 		    (uint32_t)(pa & 0xffffffff));
 		tcm_write32(mb,
@@ -543,8 +525,7 @@ msgbuf_init_rings(struct brcm_pci_msgbuf *mb)
 		}
 		ring_mem_ptr += BRCM_RING_MEM_SZ;
 
-		/* Zero out the indices in TCM (fw already zeros on boot,
-		 * but be safe). */
+		/* Zero the TCM indices; fw does this at boot, but be safe. */
 		tcm_write16(mb, ring->w_idx_addr, 0);
 		tcm_write16(mb, ring->r_idx_addr, 0);
 
@@ -556,9 +537,9 @@ msgbuf_init_rings(struct brcm_pci_msgbuf *mb)
 	}
 
 	/*
-	 * Cursors: h2d_w/h2d_r now point to the FIRST H2D slot after
-	 * the 2 common H2D rings, i.e. the flowring[0] slot.  Same for
-	 * ring_mem_ptr (5 slots consumed).
+	 * h2d_w/h2d_r now point at the first H2D index slot after the two
+	 * common H2D rings, i.e. flowring 0.  ring_mem_ptr likewise points
+	 * past the five common ring slots.
 	 */
 	mb->flow_h2d_w_next = h2d_w;
 	mb->flow_h2d_r_next = h2d_r;
@@ -567,12 +548,12 @@ msgbuf_init_rings(struct brcm_pci_msgbuf *mb)
 	return (0);
 }
 
-/* -----------------------------------------------------------------
- * Scratch + ringupd — small coherent buffers fw uses for D2H
- * scratch space and ring update deltas.  Not strictly required for
- * a synchronous DCMD, but fw firmware asserts on missing scratch on
- * some versions.  Cheap; allocate.
- * ----------------------------------------------------------------- */
+/*
+ * Scratch and ringupd: small coherent buffers fw uses for D2H scratch
+ * space and ring update deltas.  A synchronous DCMD does not strictly
+ * need them, but some fw versions assert if scratch is missing, and
+ * they are cheap.
+ */
 #define	BRCM_D2H_SCRATCH_BUF_LEN	8
 #define	BRCM_D2H_RINGUPD_BUF_LEN	1024
 
@@ -614,12 +595,12 @@ msgbuf_init_scratch(struct brcm_pci_msgbuf *mb)
 	return (0);
 }
 
-/* -----------------------------------------------------------------
- * Post one IOCTLRESP_BUF into the H2D control ring so fw has
- * somewhere to write the DCMD reply.  Uses mb->ioctbuf as the
- * response staging buffer for first light (single outstanding
- * DCMD, we reuse the same 8KB coherent slot).
- * ----------------------------------------------------------------- */
+/*
+ * Post one IOCTLRESP_BUF into the H2D control ring so fw has somewhere
+ * to write the DCMD reply.  mb->ioctbuf is the response buffer; only
+ * one DCMD is outstanding at a time, so the same 8KB coherent slot is
+ * reused.
+ */
 static int
 msgbuf_post_ioctlresp(struct brcm_pci_msgbuf *mb)
 {
@@ -655,12 +636,12 @@ msgbuf_post_ioctlresp(struct brcm_pci_msgbuf *mb)
 	return (0);
 }
 
-/* -----------------------------------------------------------------
- * pktid table: track outstanding TX mbufs so we can free them when
- * fw acks via TX_STATUS.  Simple linear scan starting from a hint;
- * O(N) worst case but N=1024 and TX rate is bounded by fw.
- * Slot 0 is reserved (request_id 0 == "no id").
- * ----------------------------------------------------------------- */
+/*
+ * pktid table: tracks outstanding TX mbufs so they can be freed when fw
+ * acks them with TX_STATUS.  A linear scan from a hint is O(N) worst
+ * case, but N is 1024 and fw bounds the TX rate.  Slot 0 is reserved
+ * (request_id 0 means "no id").
+ */
 static int
 pktid_alloc(struct brcm_pci_msgbuf *mb, struct mbuf *m, uint16_t flowid,
     bool is_eapol, uint32_t *idx_out)
@@ -731,12 +712,11 @@ pktid_release(struct brcm_pci_msgbuf *mb, uint32_t idx,
 	return (m);
 }
 
-/* -----------------------------------------------------------------
- * RXPOST table: analogous to pktid table but for host mbufs POSTED
- * to fw as RX/event/ioctl-response landing zones.  Fw echoes the
- * pktid back in the RX_CMPLT / WL_EVENT descriptor so we can find
- * the buffer.
- * ----------------------------------------------------------------- */
+/*
+ * RXPOST table: like the pktid table, but for host mbufs posted to fw
+ * as RX, event or ioctl-response buffers.  Fw echoes the pktid in the
+ * RX_CMPLT or WL_EVENT descriptor so the buffer can be found.
+ */
 static int
 rxpost_alloc(struct brcm_pci_msgbuf *mb, struct mbuf *m, uint8_t type,
     uint32_t *idx_out)
@@ -808,18 +788,10 @@ rxbuf_load_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 }
 
 /*
- * Post ONE host mbuf as a receive landing zone.  Depending on `type`:
- *  BRCM_RXPOST_EVENT → msgtype EVENT_BUF_POST on H2D_CTRL_SUBMIT
- *  BRCM_RXPOST_DATA  → msgtype RXBUF_POST on H2D_RXPOST_SUBMIT
- * Returns 0 on success.  Caller responsible for doorbell burst if
- * posting many (we doorbell per-post here — simple, low-perf).
- */
-/*
- * Event-buf pktid: fw returns this in WL_EVENT.request_id so we can
- * find the source buffer.  Event bufs use a dedicated pktid range
- * that never overlaps with data rxpost pktids (data starts from 1
- * via rxpost_alloc's hint).  We encode the eventbuf slot index as
- * a high-bit tag so lookup is O(1).
+ * Event buffer pktids.  Fw returns the pktid in WL_EVENT.request_id so
+ * the source buffer can be found.  Event buffers use their own pktid
+ * range, tagged in the high bits with the slot index in the low byte,
+ * so it never overlaps the small data rxpost pktids and lookup is O(1).
  */
 #define	BRCM_EVENTBUF_PKTID_BASE	0xE0000000u
 #define	BRCM_EVENTBUF_PKTID(slot)	(BRCM_EVENTBUF_PKTID_BASE | (slot))
@@ -828,10 +800,10 @@ rxbuf_load_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 #define	BRCM_EVENTBUF_PKTID_SLOT(pktid)	((pktid) & 0xFFu)
 
 /*
- * Post ONE pre-allocated coherent event buffer to the H2D CTRL SUBMIT
- * ring.  Called at attach and after each WL_EVENT processing to refill
- * the slot.  Uses mb->eventbufs[slot] — no mbuf, no rxpost table.
- * Physaddr is guaranteed sub-4GB by the dma tag's lowaddr constraint.
+ * Post one preallocated coherent event buffer, mb->eventbufs[slot], to
+ * the H2D control ring.  Called at attach and after each WL_EVENT to
+ * refill the slot.  No mbuf or rxpost entry is involved, and the DMA
+ * tag's lowaddr keeps the buffer below 4GB.
  */
 static int
 msgbuf_post_event_slot(struct brcm_pci_msgbuf *mb, uint32_t slot)
@@ -848,7 +820,7 @@ msgbuf_post_event_slot(struct brcm_pci_msgbuf *mb, uint32_t slot)
 
 	ring = &mb->rings[BRCM_H2D_MSGRING_CONTROL_SUBMIT];
 
-	/* Zero the buffer so fw sees clean state; sync PREREAD after. */
+	/* Zero the buffer so fw sees clean state, then sync. */
 	memset(evb->vaddr, 0, evb->size);
 	bus_dmamap_sync(evb->tag, evb->map,
 	    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
@@ -871,6 +843,11 @@ msgbuf_post_event_slot(struct brcm_pci_msgbuf *mb, uint32_t slot)
 	return (0);
 }
 
+/*
+ * Post one host mbuf as an RX data buffer (RXBUF_POST on
+ * H2D_RXPOST_SUBMIT).  Event buffers go through msgbuf_post_event_slot
+ * instead.  The doorbell is rung for every post.  Returns 0 on success.
+ */
 static int
 msgbuf_post_one_rxbuf(struct brcm_pci_msgbuf *mb, uint8_t type)
 {
@@ -886,8 +863,8 @@ msgbuf_post_one_rxbuf(struct brcm_pci_msgbuf *mb, uint8_t type)
 	if (type == BRCM_RXPOST_EVENT) {
 		/*
 		 * Events use the coherent pool via msgbuf_post_event_slot.
-		 * Reject the mbuf path so no one silently posts an mbuf
-		 * with an above-4GB physaddr and gives fw a bad pointer.
+		 * Refuse the mbuf path so an mbuf above 4GB can never be
+		 * handed to fw as a bad pointer.
 		 */
 		return (EINVAL);
 	} else if (type == BRCM_RXPOST_DATA) {
@@ -899,13 +876,11 @@ msgbuf_post_one_rxbuf(struct brcm_pci_msgbuf *mb, uint8_t type)
 	}
 
 	/*
-	 * m_getjcl's `size` arg must be one of the exact cluster sizes:
-	 * MCLBYTES (2K), MJUMPAGESIZE (PAGE_SIZE, 4K on amd64), MJUM9BYTES
-	 * (9K), or MJUM16BYTES (16K).  Round bufsize up to the smallest
-	 * cluster that fits; otherwise the returned mbuf is short and the
-	 * subsequent bus_dmamap_load walks past the allocation.  This was
-	 * the "posted 0/8 event buffers" symptom — event bufs are 8K, we
-	 * asked for a 4K cluster to hold them.
+	 * m_getjcl's size must be one of the exact cluster sizes:
+	 * MCLBYTES (2K), MJUMPAGESIZE (PAGE_SIZE), MJUM9BYTES (9K) or
+	 * MJUM16BYTES (16K).  Round bufsize up to the smallest cluster
+	 * that fits; otherwise the mbuf is short and bus_dmamap_load
+	 * walks past the allocation.
 	 */
 	{
 		int cluster_size;
@@ -961,7 +936,7 @@ msgbuf_post_one_rxbuf(struct brcm_pci_msgbuf *mb, uint8_t type)
 	mb->rxposts[pktid].pa = pa;
 	mb->rxposts[pktid].buflen = (uint16_t)bufsize;
 
-	/* Sync so fw reads whatever host wrote (mostly zeros — fine). */
+	/* Sync before handing the buffer to fw. */
 	bus_dmamap_sync(mb->rx_mbuf_tag, map,
 	    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
 
@@ -1017,7 +992,7 @@ ring_full:
 			    type);
 	}
 	mtx_unlock(&ring->lock);
-	/* Roll back the rxpost slot + dmamap + mbuf. */
+	/* Roll back the rxpost slot, dmamap and mbuf. */
 	(void)rxpost_release(mb, pktid, NULL, NULL);
 	bus_dmamap_unload(mb->rx_mbuf_tag, map);
 	bus_dmamap_destroy(mb->rx_mbuf_tag, map);
@@ -1026,9 +1001,9 @@ ring_full:
 }
 
 /*
- * Post up to `count` event buffers from the coherent pool.  Slots
- * post/refill idempotently — a "refill" just re-posts the same slot
- * with fresh content.  Returns number successfully posted.
+ * Post up to `count` event buffers from the coherent pool.  Posting is
+ * idempotent: a refill just re-posts the same slot with fresh content.
+ * Returns the number posted.
  */
 static uint32_t
 msgbuf_post_event_bufs(struct brcm_pci_msgbuf *mb, uint32_t count)
@@ -1049,10 +1024,10 @@ msgbuf_post_event_bufs(struct brcm_pci_msgbuf *mb, uint32_t count)
 }
 
 /*
- * Deferred WL_EVENT dispatch task.  Runs on taskqueue_thread outside
- * any ISR / ring lock, so its downstream calls into net80211
- * (ieee80211_add_scan_result etc.) can safely take IEEE80211_LOCK.
- * See the queue-and-defer comment in msgbuf_process_wl_event.
+ * Deferred WL_EVENT dispatch.  Runs on taskqueue_thread outside any
+ * ISR or ring lock, so the net80211 calls it leads to (e.g.
+ * ieee80211_add_scan_result) can take IEEE80211_LOCK.  See
+ * msgbuf_process_wl_event.
  */
 static void
 msgbuf_event_task(void *arg, int pending __unused)
@@ -1085,8 +1060,10 @@ msgbuf_post_rx_bufs(struct brcm_pci_msgbuf *mb, uint32_t count)
 	return (i);
 }
 
-/* Refill the event/rxbuf pools up to their maxes.  Called from ISR
- * after consuming a slot. */
+/*
+ * Refill the event and RX buffer pools up to their maxima.  Called from
+ * the ISR after a slot is consumed.
+ */
 static void
 msgbuf_rxpost_refill(struct brcm_pci_msgbuf *mb)
 {
@@ -1106,19 +1083,20 @@ msgbuf_rxpost_refill(struct brcm_pci_msgbuf *mb)
 	}
 }
 
-/* -----------------------------------------------------------------
- * Flowring create: allocate coherent buffer, send FLOW_RING_CREATE
- * via H2D_CTRL, wait cv up to 2s.  Idempotent: subsequent create for
- * the same flowid returns 0 immediately if already OPEN.
+/*
+ * Flowring create: allocate a coherent buffer, send FLOW_RING_CREATE on
+ * the H2D control ring, and wait up to 2s for the completion.
  *
- * Local flowid semantics: caller passes back a small integer 0-based
- * into mb->flowrings[].  The fw sees `flowid + IDSTART`.  For first
- * light we serialize on flow_mtx (no concurrent creates).
- * ----------------------------------------------------------------- */
+ * The local flowid handed back to the caller is a 0-based index into
+ * mb->flowrings[]; fw sees flowid + IDSTART.  Slot allocation is
+ * serialized on flow_mtx.
+ */
 #define	FLOW_CREATE_TIMEOUT_MS	2000
 
-/* Map priority (0..7) → 802.1D TID.  Identity map for first light
- * since the AC<->TID mapping is 1:1 for prio 0..7. */
+/*
+ * Map priority (0..7) to 802.1D TID.  This is the identity, since
+ * priorities 0..7 map 1:1 onto TIDs.
+ */
 static inline uint8_t
 prio_to_tid(uint8_t prio)
 {
@@ -1140,7 +1118,7 @@ find_free_local_flowid(struct brcm_pci_msgbuf *mb, uint16_t *out)
 }
 
 /*
- * D3 / D0 mailbox helpers.  See brcm_pci_msgbuf.h banner.
+ * D3/D0 mailbox helpers; see brcm_pci_msgbuf.h.
  */
 int
 brcm_pci_msgbuf_send_mb_data(struct brcm_pci_softc *sc, uint32_t htod_val)
@@ -1164,8 +1142,10 @@ brcm_pci_msgbuf_send_mb_data(struct brcm_pci_softc *sc, uint32_t htod_val)
 	}
 	tcm_write32(mb, mb->htod_mb_data_addr, htod_val);
 	pci_write_config(dev, BRCM_PCI_REG_SBMBX, 1, 4);
-	/* Hardware workaround: PCIe2 core rev <= 13 needs the doorbell
-	 * fired twice.  Always safe to double-tap. */
+	/*
+	 * PCIe2 core rev <= 13 needs the doorbell written twice.  Doing
+	 * it on every core is harmless.
+	 */
 	pci_write_config(dev, BRCM_PCI_REG_SBMBX, 1, 4);
 	return (0);
 }
@@ -1183,7 +1163,7 @@ brcm_pci_msgbuf_wait_mb_ack(struct brcm_pci_softc *sc, uint32_t expect,
 	for (elapsed = 0; elapsed < timeout_ms; elapsed += 10) {
 		val = tcm_read32(mb, mb->dtoh_mb_data_addr);
 		if ((val & expect) == expect) {
-			/* clear so subsequent transactions see a fresh slot */
+			/* Clear it so the next exchange sees a fresh slot. */
 			tcm_write32(mb, mb->dtoh_mb_data_addr, 0);
 			return (0);
 		}
@@ -1193,15 +1173,14 @@ brcm_pci_msgbuf_wait_mb_ack(struct brcm_pci_softc *sc, uint32_t expect,
 }
 
 /*
- * Block up to timeout_ms milliseconds until every outstanding EAPOL TX
- * pktid has had a TX_STATUS.  Caller is brcm_fmop_set_key on the PTK
- * install path: wpa_supplicant issues write(M4) then SIOCS80211(WPAKEY)
- * back-to-back, and if the WPAKEY DCMD reaches fw before M4 drains the
- * TID-7 flowring the fw sometimes AES-encrypts M4 with the newly
- * installed PTK, the AP can't validate the MIC (its own PTK is only
- * installed once it accepts M4), and it deauths reason=6 four seconds
- * later.  Typical drain is well under a millisecond; the timeout is a
- * pathological-fw safety net.
+ * Wait up to timeout_ms for every outstanding EAPOL TX pktid to get its
+ * TX_STATUS.  brcm_fmop_set_key calls this when installing the PTK.
+ * wpa_supplicant writes M4 and then issues SIOCS80211(WPAKEY) back to
+ * back; if the WPAKEY DCMD reaches fw before M4 has drained from the
+ * TID-7 flowring, fw may encrypt M4 with the new PTK.  The AP cannot
+ * check that MIC (it installs its own PTK only after accepting M4) and
+ * deauths with reason 6.  The drain normally takes well under a
+ * millisecond; the timeout only guards against misbehaving fw.
  */
 int
 brcm_pci_msgbuf_wait_eapol_drain(struct brcm_pci_softc *sc, int timeout_ms)
@@ -1289,8 +1268,10 @@ brcm_pci_msgbuf_flowring_create(struct brcm_pci_softc *sc,
 	fr->ifidx = ifidx;
 	mtx_unlock(&mb->flow_mtx);
 
-	/* Allocate the flowring's DMA-coherent circular buffer.  Assigned
-	 * TCM index-slot addrs derived from cursor set in msgbuf_init_rings. */
+	/*
+	 * Allocate the flowring's coherent ring buffer.  Its TCM index
+	 * slots follow the cursors set up in msgbuf_init_rings.
+	 */
 	if (fr->ring.buf.tag == NULL) {
 		error = brcm_pci_msgbuf_dma_alloc(mb, &fr->ring.buf,
 		    BRCM_H2D_TXFLOWRING_MAX_ITEM * BRCM_H2D_TXFLOWRING_ITEMSIZE,
@@ -1394,11 +1375,11 @@ fail:
 	return (error);
 }
 
-/* -----------------------------------------------------------------
- * TX submission — takes an mbuf with an Ethernet header, maps it,
- * writes TX_POST into the flowring, doorbells.  Ownership of `m`
- * passes to us on success (freed on TX_STATUS ack).
- * ----------------------------------------------------------------- */
+/*
+ * TX submission: map an mbuf that starts with an Ethernet header, write
+ * a TX_POST into the flowring and ring the doorbell.  On success we own
+ * the mbuf and free it when fw acks it with TX_STATUS.
+ */
 static void
 tx_load_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 {
@@ -1433,7 +1414,7 @@ brcm_pci_msgbuf_txmbuf(struct brcm_pci_softc *sc, uint16_t flowid,
 	if (m->m_pkthdr.len < ETHER_HDR_LEN)
 		return (EINVAL);
 
-	/* Ensure single mbuf — first-light TX is unfragmented. */
+	/* TX_POST carries a single segment, so defragment the chain. */
 	if (m->m_next != NULL) {
 		struct mbuf *m2 = m_defrag(m, M_NOWAIT);
 		if (m2 == NULL)
@@ -1441,7 +1422,7 @@ brcm_pci_msgbuf_txmbuf(struct brcm_pci_softc *sc, uint16_t flowid,
 		m = m2;
 	}
 
-	/* bus_dmamap for this packet. */
+	/* DMA map for this packet. */
 	error = bus_dmamap_create(mb->tx_mbuf_tag, 0, &map);
 	if (error != 0)
 		return (error);
@@ -1496,11 +1477,10 @@ brcm_pci_msgbuf_txmbuf(struct brcm_pci_softc *sc, uint16_t flowid,
 	tx->seg_cnt = 1;
 	tx->data_len = htole16(datalen - 14);
 	/*
-	 * data_buf points to the payload AFTER the 14-byte Ethernet
-	 * header (which is copied into tx->txhdr).  Previously we set
-	 * data_buf = mbuf start + data_len = mbuf_len - 14, which made
-	 * fw read the first 14 bytes of the Ethernet header twice and
-	 * truncated the last 14 bytes of the payload — bad EAPOL M2.
+	 * The 14-byte Ethernet header travels in tx->txhdr, so data_buf
+	 * must point past it, at the payload.  Pointing it at the start of
+	 * the mbuf would make fw send the header twice and drop the last
+	 * 14 bytes of payload.
 	 */
 	tx->data_buf_addr.low_addr = htole32((uint32_t)((data_pa + 14) & 0xffffffff));
 	tx->data_buf_addr.high_addr = htole32((uint32_t)((data_pa + 14) >> 32));
@@ -1508,7 +1488,7 @@ brcm_pci_msgbuf_txmbuf(struct brcm_pci_softc *sc, uint16_t flowid,
 	tx->metadata_buf_addr.low_addr = 0;
 	tx->metadata_buf_addr.high_addr = 0;
 
-	/* Sync CPU-writes into the packet buffer visible to fw. */
+	/* Make CPU writes to the packet buffer visible to fw. */
 	bus_dmamap_sync(mb->tx_mbuf_tag, map, BUS_DMASYNC_PREWRITE);
 
 	ring_write_complete(ring);
@@ -1518,10 +1498,10 @@ brcm_pci_msgbuf_txmbuf(struct brcm_pci_softc *sc, uint16_t flowid,
 	return (0);
 }
 
-/* -----------------------------------------------------------------
- * Fw → host ctrl-ring processing for FLOW_RING_CREATE_CMPLT and
- * TX_STATUS.  Called from msgbuf_process_ctrl_msg dispatch.
- * ----------------------------------------------------------------- */
+/*
+ * D2H handling of FLOW_RING_CREATE_CMPLT and TX_STATUS, dispatched from
+ * msgbuf_process_ctrl_msg.
+ */
 static void
 msgbuf_process_flowring_create_cmplt(struct brcm_pci_msgbuf *mb, void *item)
 {
@@ -1559,9 +1539,8 @@ msgbuf_process_flowring_create_cmplt(struct brcm_pci_msgbuf *mb, void *item)
 }
 
 /*
- * FLOW_RING_DELETE_CMPLT: fw acknowledges a FLOW_RING_DELETE.  Marks
- * the local slot CLOSED so it can be reallocated on a subsequent
- * create.  Called from msgbuf_process_ctrl_msg.
+ * FLOW_RING_DELETE_CMPLT: fw acknowledges a FLOW_RING_DELETE.  Mark the
+ * local slot CLOSED so a later create can reuse it.
  */
 static void
 msgbuf_process_flowring_delete_cmplt(struct brcm_pci_msgbuf *mb, void *item)
@@ -1597,10 +1576,10 @@ msgbuf_process_flowring_delete_cmplt(struct brcm_pci_msgbuf *mb, void *item)
 }
 
 /*
- * Public API: synchronously delete a flowring.  Sends
- * FLOW_RING_DELETE on H2D_CTRL_SUBMIT and waits up to 2 s for the
- * fw's CMPLT (which marks the slot CLOSED so it can be reallocated).
- * Callers must hold no locks that the msgbuf ISR path needs.
+ * Synchronously delete a flowring: send FLOW_RING_DELETE on the H2D
+ * control ring and wait up to 2s for fw's completion, which marks the
+ * slot CLOSED for reuse.  Callers must not hold any lock the msgbuf ISR
+ * path needs.
  */
 int
 brcm_pci_msgbuf_flowring_delete(struct brcm_pci_softc *sc, uint16_t local_id)
@@ -1734,10 +1713,10 @@ msgbuf_process_txstatus(struct brcm_pci_msgbuf *mb, void *item)
 		mb->stat_tx_status_err++;
 }
 
-/* -----------------------------------------------------------------
- * DCMD wrappers.  All synchronous via brcm_pci_msgbuf_dcmd (which
- * owns dcmd_sx for serialization).
- * ----------------------------------------------------------------- */
+/*
+ * DCMD wrappers.  All are synchronous through brcm_pci_msgbuf_dcmd,
+ * which serializes on dcmd_sx.
+ */
 #define	BRCM_IOVAR_BUF_MAX	1024
 
 int
@@ -1832,21 +1811,17 @@ brcm_pci_msgbuf_dcmd_get_var(struct brcm_pci_softc *sc, const char *name,
 	return (0);
 }
 
-/* -----------------------------------------------------------------
- * DCMD round-trip.
+/*
+ * DCMD round trip:
  *
- * (a) Post 1 IOCTLRESP buffer.
- * (b) Enqueue IOCTLPTR_REQ into H2D_CONTROL_SUBMIT with:
- *     - cmd, ifidx=0, request_id=BRCM_IOCTL_REQ_PKTID
- *     - trans_id = ++dcmd_reqid
- *     - input_buf_len = params_len
- *     - output_buf_len = *resp_lenp
- *     - req_buf_addr = mb->ioctbuf physical address
- *     - copy params into mb->ioctbuf host memory
- * (c) Doorbell + wait on dcmd_cv up to 2s.
- * (d) On completion, copy mb->ioctbuf (fw wrote response there)
- *     into caller's resp.  Set *fwerr = dcmd_resp_status.
- * ----------------------------------------------------------------- */
+ * 1. Post one IOCTLRESP buffer.
+ * 2. Copy params into mb->ioctbuf and enqueue an IOCTLPTR_REQ on
+ *    H2D_CONTROL_SUBMIT with request_id BRCM_IOCTL_REQ_PKTID, a new
+ *    trans_id, and req_buf_addr pointing at mb->ioctbuf.
+ * 3. Ring the doorbell and wait on dcmd_cv for up to 2s.
+ * 4. On completion, copy the response fw wrote into mb->ioctbuf out to
+ *    the caller and return fw's status in *fwerr.
+ */
 int
 brcm_pci_msgbuf_dcmd(struct brcm_pci_softc *sc, uint32_t cmd, bool is_set,
     const void *params, size_t params_len, void *resp, size_t *resp_lenp,
@@ -1865,14 +1840,9 @@ brcm_pci_msgbuf_dcmd(struct brcm_pci_softc *sc, uint32_t cmd, bool is_set,
 	    (resp_lenp != NULL && *resp_lenp > BRCM_MSGBUF_MAX_CTL_PKT_SIZE))
 		return (E2BIG);
 
-	MDPRINTF(mb, 0,
-	    "SCAN_DBG: dcmd cmd=0x%x is_set=%d plen=%zu enter\n",
-	    cmd, is_set, params_len);
 	sx_xlock(&mb->dcmd_sx);
-	MDPRINTF(mb, 0,
-	    "SCAN_DBG: dcmd sx_xlock acquired\n");
 
-	/* Fresh IOCTLRESP buffer for fw to write reply into. */
+	/* Give fw a fresh IOCTLRESP buffer for the reply. */
 	error = msgbuf_post_ioctlresp(mb);
 	if (error != 0) {
 		sx_xunlock(&mb->dcmd_sx);
@@ -1887,11 +1857,11 @@ brcm_pci_msgbuf_dcmd(struct brcm_pci_softc *sc, uint32_t cmd, bool is_set,
 		memset(mb->ioctbuf.vaddr, 0, buf_len);
 
 	/*
-	 * Fw writes the response into the same ioctbuf slot the request
-	 * lives in.  output_buf_len must be the FULL caller buffer size,
-	 * not just the expected response length.  If we set
-	 * output_buf_len < input_buf_len, fw returns BCME_BUFTOOSHORT
-	 * (-14) even when the actual response is small.
+	 * Fw writes the response into the same ioctbuf slot as the
+	 * request, so output_buf_len must be the full buffer size, not
+	 * just the expected response length.  If output_buf_len is less
+	 * than input_buf_len, fw returns BCME_BUFTOOSHORT (-14) even when
+	 * the response is small.
 	 */
 	out_len = (uint16_t)MAX(buf_len,
 	    resp_lenp != NULL ? *resp_lenp : 0);
@@ -1932,8 +1902,6 @@ brcm_pci_msgbuf_dcmd(struct brcm_pci_softc *sc, uint32_t cmd, bool is_set,
 	mtx_unlock(&ring->lock);
 
 	mb->stat_dcmd_tx++;
-	MDPRINTF(mb, 0,
-	    "SCAN_DBG: dcmd cmd=0x%x submitted, waiting for cv\n", cmd);
 
 	/* Wait for ISR to signal completion. */
 	mtx_lock(&mb->dcmd_mtx);
@@ -1952,10 +1920,10 @@ brcm_pci_msgbuf_dcmd(struct brcm_pci_softc *sc, uint32_t cmd, bool is_set,
 				    "(consec=%u)\n", cmd,
 				    mb->stat_dcmd_timeout_consec);
 			/*
-			 * fw crash auto-recovery (item #13).  Defer the
-			 * threshold check to if_brcm_pci.c where the full
-			 * brcm_pci_softc definition is visible; msgbuf.c
-			 * only has a forward decl of the containing softc.
+			 * Fw crash recovery.  The threshold check lives in
+			 * if_brcm_pci.c, where struct brcm_pci_softc is
+			 * fully defined; this file only sees a forward
+			 * declaration.
 			 */
 			brcm_pci_maybe_queue_crash_recover(sc);
 			sx_xunlock(&mb->dcmd_sx);
@@ -1978,20 +1946,19 @@ brcm_pci_msgbuf_dcmd(struct brcm_pci_softc *sc, uint32_t cmd, bool is_set,
 	if (fwerr != NULL)
 		*fwerr = mb->dcmd_resp_status;
 
-	/* fw responded — clear consecutive-timeout run (item #13). */
+	/* Fw responded, so reset the consecutive-timeout count. */
 	mb->stat_dcmd_timeout_consec = 0;
 
 	sx_xunlock(&mb->dcmd_sx);
 	return (0);
 }
 
-/* -----------------------------------------------------------------
- * ISR filter.  Runs in interrupt context.  If a bit is set in
- * MAILBOXINT, mask the chip's interrupt source (MAILBOXMASK=0) and
- * schedule the ithread; the ithread will read, ACK, drain, and
- * re-enable.  This avoids re-entering the filter while the thread
- * processes.
- * ----------------------------------------------------------------- */
+/*
+ * Interrupt filter.  If MAILBOXINT has a bit set, mask the chip's
+ * interrupt source (MAILBOXMASK = 0) and schedule the ithread, which
+ * reads, acks, drains and re-enables.  This keeps the filter from
+ * re-entering while the thread is working.
+ */
 int
 brcm_pci_msgbuf_isr_filter(void *arg)
 {
@@ -2002,19 +1969,19 @@ brcm_pci_msgbuf_isr_filter(void *arg)
 	if (status == 0 || status == 0xffffffff)
 		return (FILTER_STRAY);
 
-	/* Mask off — thread will re-enable after draining. */
+	/* Mask; the thread re-enables after draining. */
 	pcie2_write32(mb, BRCM_PCIE2REG_MAILBOXMASK, 0);
 	mb->stat_isr_hits++;
 	return (FILTER_SCHEDULE_THREAD);
 }
 
-/* -----------------------------------------------------------------
- * WL_EVENT payload processing.  Fw hands us a `msgbuf_rx_event`
- * descriptor whose request_id names an event-buffer pktid.  The
- * actual event payload lives in the host mbuf pinned by that pktid
- * (fw DMA'd it there).  For first-light we decode a minimal
- * bcmevent header for logging; full fweh-style dispatch is deferred.
- * ----------------------------------------------------------------- */
+/*
+ * WL_EVENT processing.  Fw hands us a msgbuf_rx_event descriptor whose
+ * request_id names an event buffer pktid; fw has DMA'd the event
+ * payload into that coherent event buffer.  The bcmevent header is
+ * decoded for debug logging and the payload is queued for
+ * msgbuf_event_task.
+ */
 /* Human-readable event-code lookup. */
 static const char *
 bcmevent_name(uint32_t code)
@@ -2165,20 +2132,14 @@ msgbuf_process_wl_event(struct brcm_pci_msgbuf *mb, void *item)
 		    be16dec(&eh->usr_subtype));
 	}
 	/*
-	 * Queue payload for deferred dispatch on taskqueue_thread.
-	 * Direct dispatch here would deadlock: ISR holds ring->lock,
+	 * Queue the payload for dispatch on taskqueue_thread.  Direct
+	 * dispatch here would deadlock: the ISR holds ring->lock, and
 	 * brcm_pci_msgbuf_event_up -> brcm_handle_event ->
-	 * ieee80211_add_scan_result acquires IEEE80211_LOCK, and the
-	 * scan-trigger path (fmac_scan_start_shim -> DCMD) holds
-	 * IEEE80211_LOCK across cv_wait for IOCTL_CMPLT.  If any
-	 * WL_EVENT lands between the DCMD dispatch and cv_signal, the
-	 * ISR takes ring->lock, waits for IEEE80211_LOCK held by the
-	 * scan thread — scan thread cv_wait's for IOCTL_CMPLT which
-	 * this same ISR is meant to deliver.  Textbook AB-BA deadlock.
-	 *
-	 * Deferring dispatch runs it AFTER the DCMD thread releases
-	 * IEEE80211_LOCK, so no lock ordering issue.  Cost: one malloc
-	 * + memcpy per event.
+	 * ieee80211_add_scan_result takes IEEE80211_LOCK.  Meanwhile the
+	 * scan path (fmac_scan_start_shim -> DCMD) holds IEEE80211_LOCK
+	 * while it waits for the IOCTL_CMPLT that this same ISR has to
+	 * deliver.  Deferring runs dispatch after the DCMD thread drops
+	 * IEEE80211_LOCK, at the cost of one malloc and memcpy per event.
 	 */
 	{
 		struct brcm_pci_event *ep;
@@ -2200,17 +2161,16 @@ msgbuf_process_wl_event(struct brcm_pci_msgbuf *mb, void *item)
 	}
 
 refill:
-	/* Re-post the same slot; buf lifetime = driver lifetime. */
+	/* Re-post the same slot; event buffers live as long as the driver. */
 	mb->cur_eventbuf--;
 	(void)msgbuf_post_event_slot(mb, slot);
 	mb->cur_eventbuf++;
 }
 
-/* -----------------------------------------------------------------
- * RX_CMPLT: fw completed a receive into one of our data buffers.
- * For first-light we log length + first bytes + release the mbuf.
- * Wiring to a net80211 rx sink is deferred.
- * ----------------------------------------------------------------- */
+/*
+ * RX_CMPLT: fw completed a receive into one of our data buffers.  Trim
+ * the mbuf, pass it up, and refill the RX pool.
+ */
 static void
 msgbuf_process_rx_complete(struct brcm_pci_msgbuf *mb, void *item)
 {
@@ -2247,11 +2207,10 @@ msgbuf_process_rx_complete(struct brcm_pci_msgbuf *mb, void *item)
 		uint16_t flags = le16toh(rc->flags);
 
 		/*
-		 * Strip fw-provided rx metadata offset if any, trim to
-		 * datalen, and hand the mbuf to net80211 via the shared
-		 * brcm.c core.  For first light we ignore monitor-mode
-		 * 802.11 frames — chip is fullmac-STA, all frames come
-		 * as 802.3.
+		 * Strip fw's RX data offset, if any, trim to datalen and
+		 * pass the mbuf to net80211 through the shared brcm.c
+		 * core.  As a fullmac STA, fw delivers 802.3 frames;
+		 * monitor-mode 802.11 frames are dropped.
 		 */
 		if (data_off > 0 && data_off <= m->m_len)
 			m_adj(m, data_off);
@@ -2261,7 +2220,7 @@ msgbuf_process_rx_complete(struct brcm_pci_msgbuf *mb, void *item)
 		}
 		if ((flags & BRCM_MSGBUF_PKT_FLAGS_FRAME_MASK) ==
 		    BRCM_MSGBUF_PKT_FLAGS_FRAME_802_11) {
-			/* Monitor-mode 802.11 frame — not yet handled. */
+			/* Monitor-mode 802.11 frames are not handled. */
 			m_freem(m);
 		} else {
 			brcm_pci_msgbuf_rx_up(mb->sc, m, -50);
@@ -2271,11 +2230,10 @@ msgbuf_process_rx_complete(struct brcm_pci_msgbuf *mb, void *item)
 	msgbuf_rxpost_refill(mb);
 }
 
-/* -----------------------------------------------------------------
- * ithread — drains D2H_CONTROL_COMPLETE, wakes DCMD waiter on
- * MSGBUF_TYPE_IOCTL_CMPLT.  Other message types (WL_EVENT,
- * RING_STATUS, GEN_STATUS) are logged and dropped for first light.
- * ----------------------------------------------------------------- */
+/*
+ * D2H message dispatch for the ithread.  IOCTL_CMPLT wakes the DCMD
+ * waiter; GEN_STATUS, RING_STATUS and IOCTLPTR_REQ_ACK are only logged.
+ */
 static void
 msgbuf_process_ctrl_msg(struct brcm_pci_msgbuf *mb, void *item)
 {
@@ -2354,30 +2312,31 @@ brcm_pci_msgbuf_isr_thread(void *arg)
 	struct brcm_pci_msgbuf *mb = arg;
 	uint32_t status;
 
-	/* Read + ACK chip-side status.  Done in thread context. */
+	/* Read and ack the chip's interrupt status. */
 	status = pcie2_read32(mb, BRCM_PCIE2REG_MAILBOXINT);
 	if (status != 0 && status != 0xffffffff)
 		pcie2_write32(mb, BRCM_PCIE2REG_MAILBOXINT, status);
 
-	/* Drain BOTH D2H rings we care about.  D2H_CTRL carries IOCTL
-	 * completions + FLOW_RING_CREATE_CMPLT + async events; D2H_TX
-	 * carries TX_STATUS.  Fw signals via D2H_DB0/1 bits but for
-	 * first-light we poll both rings regardless of which bit set. */
+	/*
+	 * Drain all three D2H rings.  D2H_CTRL carries IOCTL completions,
+	 * FLOW_RING_CREATE_CMPLT and async events, D2H_TX carries
+	 * TX_STATUS, and D2H_RX carries RX_CMPLT.  Fw indicates which ring
+	 * with the D2H_DB bits, but every ring is polled regardless.
+	 */
 	drain_d2h_ring(mb, BRCM_D2H_MSGRING_CONTROL_COMPLETE);
 	drain_d2h_ring(mb, BRCM_D2H_MSGRING_TX_COMPLETE);
 	drain_d2h_ring(mb, BRCM_D2H_MSGRING_RX_COMPLETE);
 
-	/* Re-arm chip interrupt (unless we're tearing down). */
+	/* Re-arm the chip interrupt unless we are tearing down. */
 	if (mb->attached)
 		pcie2_write32(mb, BRCM_PCIE2REG_MAILBOXMASK,
 		    BRCM_PCIE_MB_INT_D2H_DB | BRCM_PCIE_MB_INT_FN0);
 }
 
-/* -----------------------------------------------------------------
- * Public attach — must be called after fw has been released
- * (armcr4_release succeeded, fw is running).  This function is
- * idempotent for double-attach requests.
- * ----------------------------------------------------------------- */
+/*
+ * Attach.  Must be called after fw has been released and is running
+ * (armcr4_release succeeded).  A second attach is a no-op.
+ */
 int
 brcm_pci_msgbuf_attach(struct brcm_pci_softc *sc)
 {
@@ -2426,21 +2385,19 @@ brcm_pci_msgbuf_attach(struct brcm_pci_softc *sc)
 	if (error != 0)
 		goto fail;
 
-	/* IOCTL request buffer — host memory fw reads request payload from. */
+	/* IOCTL request buffer: host memory fw reads the request from. */
 	error = brcm_pci_msgbuf_dma_alloc(mb, &mb->ioctbuf,
 	    BRCM_MSGBUF_MAX_CTL_PKT_SIZE, "ioctbuf");
 	if (error != 0)
 		goto fail;
 
 	/*
-	 * Event-buf coherent pool.  Sub-4GB physaddr guaranteed by the
-	 * dma tag inside dma_alloc.  Persist for driver lifetime; fw
-	 * writes here, we process, we re-post the same slot.
+	 * Coherent event buffer pool, kept below 4GB by the DMA tag in
+	 * dma_alloc.  The buffers live as long as the driver: fw writes
+	 * one, we process it and re-post the same slot.
 	 *
-	 * Uses BRCM_MSGBUF_MAX_EVENTBUF_POST literal (not mb->max_eventbuf)
-	 * because mb->max_eventbuf is set much later in this function.
-	 * Allocating 0 bufs here silently made post_event_slot return
-	 * ENOMEM for every slot → "posted 0/8" wall.
+	 * Use BRCM_MSGBUF_MAX_EVENTBUF_POST rather than mb->max_eventbuf,
+	 * which is not set until later in this function.
 	 */
 	{
 		uint32_t i;
@@ -2478,9 +2435,8 @@ brcm_pci_msgbuf_attach(struct brcm_pci_softc *sc)
 	mb->pktid_next_hint = 1;
 
 	/*
-	 * TX-mbuf DMA tag: maps single-frag Ethernet frames, host memory,
-	 * 32-bit DMA (BCM43602 is 32-bit-only).  4 bytes alignment; max
-	 * one segment for first-light (m_defrag before load).
+	 * TX mbuf DMA tag: single-segment Ethernet frames (txmbuf
+	 * defragments first), 4-byte aligned, 32-bit DMA addresses.
 	 */
 	error = bus_dma_tag_create(bus_get_dma_tag(DEV(mb)),
 	    /* alignment */ 4, /* boundary */ 0,
@@ -2494,7 +2450,7 @@ brcm_pci_msgbuf_attach(struct brcm_pci_softc *sc)
 		goto fail;
 	}
 
-	/* RX-mbuf DMA tag: same constraints but max size = ctl pkt (8K). */
+	/* RX mbuf DMA tag: same constraints, up to the 8K ctl pkt size. */
 	error = bus_dma_tag_create(bus_get_dma_tag(DEV(mb)),
 	    /* alignment */ 4, /* boundary */ 0,
 	    BUS_SPACE_MAXADDR_32BIT, BUS_SPACE_MAXADDR,
@@ -2517,23 +2473,22 @@ brcm_pci_msgbuf_attach(struct brcm_pci_softc *sc)
 	}
 	mb->rxpost_next_hint = 1;
 	mb->max_eventbuf = BRCM_MSGBUF_MAX_EVENTBUF_POST;
-	/* max_rxbufpost was already read from shared info; clamp to a
-	 * reasonable working value for first light. */
+	/* Clamp the max_rxbufpost fw advertised to a reasonable value. */
 	if (mb->max_rxbufpost > 128)
 		mb->max_rxbufpost = 128;
 
 	/*
-	 * Mark attached BEFORE binding ISR — the ithread's re-arm branch
-	 * checks mb->attached and skips if false (detach path).
+	 * Mark attached before binding the interrupt: the ithread only
+	 * re-arms when mb->attached is set, which is how detach stops it.
 	 */
 	mb->attached = true;
 
 	/*
-	 * Clear stale MAILBOXINT bits from earlier boot.  W1C: write back
-	 * only bits that are currently set.  Writing all-ones (0xffffffff)
-	 * risks setting reserved bits on chips that aren't strict W1C
-	 * -- suspected root cause of non-deterministic msgbuf_attach
-	 * wedge.  Match the ISR's read-then-write pattern.
+	 * Clear stale MAILBOXINT bits left from an earlier boot.  The
+	 * register is W1C, so write back only the bits that are set, as
+	 * the ISR does.  Writing all-ones risks setting reserved bits on
+	 * chips that are not strictly W1C, and is suspected of wedging
+	 * attach.
 	 */
 	pcie2_write32(mb, BRCM_PCIE2REG_MAILBOXMASK, 0);
 	{
@@ -2549,15 +2504,15 @@ brcm_pci_msgbuf_attach(struct brcm_pci_softc *sc)
 		goto fail;
 	}
 
-	/* Chip-side interrupt unmask. */
+	/* Unmask the chip's interrupts. */
 	pcie2_write32(mb, BRCM_PCIE2REG_MAILBOXMASK,
 	    BRCM_PCIE_MB_INT_D2H_DB | BRCM_PCIE_MB_INT_FN0);
 
 	/*
-	 * Now that the ISR is armed, prime the RX pools.  Event bufs go
-	 * on the ctrl ring (fw picks one per WL_EVENT); rxbufs go on the
-	 * rxpost ring (fw picks one per incoming data frame).  Fw needs
-	 * these to be posted BEFORE any event/data DMA can occur.
+	 * With the interrupt armed, prime the RX pools.  Event buffers go
+	 * on the control ring (fw uses one per WL_EVENT) and data buffers
+	 * on the rxpost ring (one per received frame).  They must be
+	 * posted before fw can DMA any event or data.
 	 */
 	{
 		uint32_t posted;
@@ -2567,11 +2522,10 @@ brcm_pci_msgbuf_attach(struct brcm_pci_softc *sc)
 		    posted, mb->max_eventbuf);
 		if (posted == 0) {
 			/*
-			 * Fw needs at least one WL_EVENT landing zone.  If
-			 * we have zero, the FIRST DCMD trip triggers a
-			 * hard-wedge (fw sends a spontaneous event, has
-			 * nowhere to write it, host wedges on next MMIO).
-			 * Fail cleanly rather than let caller fire DCMD.
+			 * Fw needs at least one WL_EVENT buffer.  With none,
+			 * the first DCMD hard-wedges the host: fw sends an
+			 * unsolicited event, has nowhere to write it, and
+			 * the next MMIO hangs.  Fail attach instead.
 			 */
 			device_printf(DEV(mb),
 			    "msgbuf: refusing attach: event-buf pool "
@@ -2610,7 +2564,7 @@ brcm_pci_msgbuf_detach(struct brcm_pci_softc *sc)
 
 	was_attached = mb->attached;
 
-	/* Mask chip interrupt + tear down before touching softc DMA. */
+	/* Mask the chip interrupt and unbind before freeing DMA memory. */
 	if (was_attached) {
 		pcie2_write32(mb, BRCM_PCIE2REG_MAILBOXMASK, 0);
 		mb->attached = false;
@@ -2640,7 +2594,7 @@ brcm_pci_msgbuf_detach(struct brcm_pci_softc *sc)
 		mb->rx_mbuf_tag = NULL;
 	}
 
-	/* Reclaim in-flight TX mbufs first (before killing tx_mbuf_tag). */
+	/* Reclaim in-flight TX mbufs before destroying tx_mbuf_tag. */
 	if (mb->pktids != NULL) {
 		uint32_t k;
 		for (k = 1; k < BRCM_MSGBUF_MAX_PKTID; k++) {
@@ -2662,10 +2616,12 @@ brcm_pci_msgbuf_detach(struct brcm_pci_softc *sc)
 		mb->tx_mbuf_tag = NULL;
 	}
 
-	/* Flowrings: free coherent buffers.  Fw retains ring state on
-	 * chip until a FLOW_RING_DELETE, but for host teardown we just
-	 * unpublish (tag=NULL) — chip will fault if it tries to DMA.
-	 * Real teardown path (future): send DELETE_REQ before free. */
+	/*
+	 * Free the flowring buffers.  Fw keeps ring state until it sees
+	 * FLOW_RING_DELETE (brcm_pci_msgbuf_flowring_delete_all); detach
+	 * only frees the host side, and the chip faults if it DMAs to a
+	 * freed ring.
+	 */
 	if (mb->flowrings != NULL) {
 		uint32_t k;
 		for (k = 0; k < mb->max_flowrings; k++) {
