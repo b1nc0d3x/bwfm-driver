@@ -10,7 +10,7 @@
  * register access (chipcontrol / regcontrol / pllcontrol),
  * OTP read, the EROM walk, AI core reset, and ARM halt /
  * CR4 set-active.  The rest of the SDIO set_passive /
- * set_active sequence is still in if_brcm_sdio.c.
+ * set_active sequence is still in if_bwfm_sdio.c.
  *
  * Portions derived from Linux brcmfmac chip.c are ISC licensed.
  */
@@ -21,10 +21,10 @@
 #include <sys/malloc.h>
 #include <sys/queue.h>
 
-#include "brcm_sdio_regs.h"
-#include "brcm_chip.h"
+#include "bwfm_sdio_regs.h"
+#include "bwfm_chip.h"
 
-static MALLOC_DEFINE(M_BRCM_CHIP, "brcm_chip", "Broadcom 802.11 chip layer");
+static MALLOC_DEFINE(M_BWFM_CHIP, "bwfm_chip", "Broadcom 802.11 chip layer");
 
 /*
  * Small read/write helpers.
@@ -34,7 +34,7 @@ static MALLOC_DEFINE(M_BRCM_CHIP, "brcm_chip", "Broadcom 802.11 chip layer");
  * backplane window. The transport handles reentrancy.
  */
 static inline uint32_t
-chip_r32(struct brcm_chip *chip, uint32_t addr)
+chip_r32(struct bwfm_chip *chip, uint32_t addr)
 {
 
 	return (chip->ops->read32(chip->ctx, addr));
@@ -42,7 +42,7 @@ chip_r32(struct brcm_chip *chip, uint32_t addr)
 
 /* write a 32-bit chip register */
 static inline void
-chip_w32(struct brcm_chip *chip, uint32_t addr, uint32_t val)
+chip_w32(struct bwfm_chip *chip, uint32_t addr, uint32_t val)
 {
 
 	chip->ops->write32(chip->ctx, addr, val);
@@ -50,7 +50,7 @@ chip_w32(struct brcm_chip *chip, uint32_t addr, uint32_t val)
 
 /* set up the chip object */
 void
-brcm_chip_init(struct brcm_chip *chip, const struct brcm_chip_ops *ops,
+bwfm_chip_init(struct bwfm_chip *chip, const struct bwfm_chip_ops *ops,
     void *ctx)
 {
 
@@ -62,25 +62,25 @@ brcm_chip_init(struct brcm_chip *chip, const struct brcm_chip_ops *ops,
 
 /* free the core list */
 void
-brcm_chip_free(struct brcm_chip *chip)
+bwfm_chip_free(struct bwfm_chip *chip)
 {
-	struct brcm_chip_core *core, *tmp;
+	struct bwfm_chip_core *core, *tmp;
 
 	TAILQ_FOREACH_SAFE(core, &chip->cores, link, tmp) {
 		TAILQ_REMOVE(&chip->cores, core, link);
-		free(core, M_BRCM_CHIP);
+		free(core, M_BWFM_CHIP);
 	}
 	chip->ncores = 0;
 }
 
 /* add one core to the list */
 int
-brcm_chip_add_core(struct brcm_chip *chip, uint16_t coreid, uint16_t rev,
+bwfm_chip_add_core(struct bwfm_chip *chip, uint16_t coreid, uint16_t rev,
     uint32_t base, uint32_t wrap)
 {
-	struct brcm_chip_core *core;
+	struct bwfm_chip_core *core;
 
-	core = malloc(sizeof(*core), M_BRCM_CHIP, M_NOWAIT | M_ZERO);
+	core = malloc(sizeof(*core), M_BWFM_CHIP, M_NOWAIT | M_ZERO);
 	if (core == NULL)
 		return (ENOMEM);
 	core->id = coreid;
@@ -97,7 +97,7 @@ brcm_chip_add_core(struct brcm_chip *chip, uint16_t coreid, uint16_t rev,
  * core and save the decoded fields on the chip object.
  *
  * The chipcommon core MUST be added first (via
- * brcm_chip_add_core or the full EROM walk).
+ * bwfm_chip_add_core or the full EROM walk).
  *
  * Linux's brcmf_chip_setup does this as part of
  * brcmf_chip_attach. We split it out so callers that only
@@ -108,39 +108,39 @@ brcm_chip_add_core(struct brcm_chip *chip, uint16_t coreid, uint16_t rev,
 #define	CID_REV_MASK		0x000f0000u
 #define	CID_REV_SHIFT		16
 #define	CC_CAP_PMU		0x10000000u
-#define	BRCM_PCAP_REV_MASK	0xffu
+#define	BWFM_PCAP_REV_MASK	0xffu
 
 int
-brcm_chip_probe_caps(struct brcm_chip *chip)
+bwfm_chip_probe_caps(struct bwfm_chip *chip)
 {
-	struct brcm_chip_core *cc;
+	struct bwfm_chip_core *cc;
 	uint32_t v;
 
-	cc = brcm_chip_get_chipcommon(chip);
+	cc = bwfm_chip_get_chipcommon(chip);
 	if (cc == NULL)
 		return (ENXIO);
 
-	v = chip_r32(chip, cc->base + BRCM_CC_CHIPID);
+	v = chip_r32(chip, cc->base + BWFM_CC_CHIPID);
 	chip->chip = v & CID_ID_MASK;
 	chip->chiprev = (v & CID_REV_MASK) >> CID_REV_SHIFT;
 	chip->enum_base = cc->base;
 
-	chip->cc_caps = chip_r32(chip, cc->base + BRCM_CC_CAPABILITIES);
-	chip->cc_caps_ext = chip_r32(chip, cc->base + BRCM_CC_CAPABILITIES_EXT);
+	chip->cc_caps = chip_r32(chip, cc->base + BWFM_CC_CAPABILITIES);
+	chip->cc_caps_ext = chip_r32(chip, cc->base + BWFM_CC_CAPABILITIES_EXT);
 
 	if (chip->cc_caps & CC_CAP_PMU) {
-		v = chip_r32(chip, cc->base + BRCM_CC_PMUCAPABILITIES);
+		v = chip_r32(chip, cc->base + BWFM_CC_PMUCAPABILITIES);
 		chip->pmu_caps = v;
-		chip->pmurev = v & BRCM_PCAP_REV_MASK;
+		chip->pmurev = v & BWFM_PCAP_REV_MASK;
 	}
 	return (0);
 }
 
 /* find a core by its id */
-struct brcm_chip_core *
-brcm_chip_get_core(struct brcm_chip *chip, uint16_t coreid)
+struct bwfm_chip_core *
+bwfm_chip_get_core(struct bwfm_chip *chip, uint16_t coreid)
 {
-	struct brcm_chip_core *core;
+	struct bwfm_chip_core *core;
 
 	TAILQ_FOREACH(core, &chip->cores, link) {
 		if (core->id == coreid)
@@ -150,11 +150,11 @@ brcm_chip_get_core(struct brcm_chip *chip, uint16_t coreid)
 }
 
 /* get the chipcommon core */
-struct brcm_chip_core *
-brcm_chip_get_chipcommon(struct brcm_chip *chip)
+struct bwfm_chip_core *
+bwfm_chip_get_chipcommon(struct bwfm_chip *chip)
 {
 
-	return (brcm_chip_get_core(chip, BCMA_CORE_CHIPCOMMON));
+	return (bwfm_chip_get_core(chip, BCMA_CORE_CHIPCOMMON));
 }
 
 /*
@@ -163,21 +163,21 @@ brcm_chip_get_chipcommon(struct brcm_chip *chip)
  * Its registers live at CC + 0x600..CC + 0x67f. A separate
  * PMU core in EROM is the exception.
  *
- * brcm_chip_get_pmu() is like brcmf_chip_get_pmu(): return
+ * bwfm_chip_get_pmu() is like brcmf_chip_get_pmu(): return
  * the chipcommon core when there is no standalone PMU core.
  * Linux also requires ccrev >= 35 and the AOB capability
  * before using the PMU core; we use it whenever the EROM
  * lists one.
  */
-struct brcm_chip_core *
-brcm_chip_get_pmu(struct brcm_chip *chip)
+struct bwfm_chip_core *
+bwfm_chip_get_pmu(struct bwfm_chip *chip)
 {
-	struct brcm_chip_core *pmu;
+	struct bwfm_chip_core *pmu;
 
-	pmu = brcm_chip_get_core(chip, BCMA_CORE_PMU);
+	pmu = bwfm_chip_get_core(chip, BCMA_CORE_PMU);
 	if (pmu != NULL)
 		return (pmu);
-	return (brcm_chip_get_chipcommon(chip));
+	return (bwfm_chip_get_chipcommon(chip));
 }
 
 /*
@@ -195,12 +195,12 @@ brcm_chip_get_pmu(struct brcm_chip *chip)
  * caller must treat the indirect register pair as atomic.
  */
 static int
-pmu_indirect_read(struct brcm_chip *chip, uint32_t addr_reg,
+pmu_indirect_read(struct bwfm_chip *chip, uint32_t addr_reg,
     uint32_t data_reg, uint32_t reg, uint32_t *out)
 {
-	struct brcm_chip_core *pmu;
+	struct bwfm_chip_core *pmu;
 
-	pmu = brcm_chip_get_pmu(chip);
+	pmu = bwfm_chip_get_pmu(chip);
 	if (pmu == NULL)
 		return (ENXIO);
 	chip_w32(chip, pmu->base + addr_reg, reg);
@@ -210,12 +210,12 @@ pmu_indirect_read(struct brcm_chip *chip, uint32_t addr_reg,
 
 /* write one PMU indirect register */
 static int
-pmu_indirect_write(struct brcm_chip *chip, uint32_t addr_reg,
+pmu_indirect_write(struct bwfm_chip *chip, uint32_t addr_reg,
     uint32_t data_reg, uint32_t reg, uint32_t val)
 {
-	struct brcm_chip_core *pmu;
+	struct bwfm_chip_core *pmu;
 
-	pmu = brcm_chip_get_pmu(chip);
+	pmu = bwfm_chip_get_pmu(chip);
 	if (pmu == NULL)
 		return (ENXIO);
 	chip_w32(chip, pmu->base + addr_reg, reg);
@@ -225,62 +225,62 @@ pmu_indirect_write(struct brcm_chip *chip, uint32_t addr_reg,
 
 /* read a PMU chipcontrol register */
 int
-brcm_chip_cc_chipcontrol_read32(struct brcm_chip *chip, uint32_t reg,
+bwfm_chip_cc_chipcontrol_read32(struct bwfm_chip *chip, uint32_t reg,
     uint32_t *out)
 {
 
-	return (pmu_indirect_read(chip, BRCM_CC_PMU_CHIPCONTROL_ADDR,
-	    BRCM_CC_PMU_CHIPCONTROL_DATA, reg, out));
+	return (pmu_indirect_read(chip, BWFM_CC_PMU_CHIPCONTROL_ADDR,
+	    BWFM_CC_PMU_CHIPCONTROL_DATA, reg, out));
 }
 
 /* write a PMU chipcontrol register */
 int
-brcm_chip_cc_chipcontrol_write32(struct brcm_chip *chip, uint32_t reg,
+bwfm_chip_cc_chipcontrol_write32(struct bwfm_chip *chip, uint32_t reg,
     uint32_t val)
 {
 
-	return (pmu_indirect_write(chip, BRCM_CC_PMU_CHIPCONTROL_ADDR,
-	    BRCM_CC_PMU_CHIPCONTROL_DATA, reg, val));
+	return (pmu_indirect_write(chip, BWFM_CC_PMU_CHIPCONTROL_ADDR,
+	    BWFM_CC_PMU_CHIPCONTROL_DATA, reg, val));
 }
 
 /* read a PMU regcontrol register */
 int
-brcm_chip_cc_regcontrol_read32(struct brcm_chip *chip, uint32_t reg,
+bwfm_chip_cc_regcontrol_read32(struct bwfm_chip *chip, uint32_t reg,
     uint32_t *out)
 {
 
-	return (pmu_indirect_read(chip, BRCM_CC_PMU_REGCONTROL_ADDR,
-	    BRCM_CC_PMU_REGCONTROL_DATA, reg, out));
+	return (pmu_indirect_read(chip, BWFM_CC_PMU_REGCONTROL_ADDR,
+	    BWFM_CC_PMU_REGCONTROL_DATA, reg, out));
 }
 
 /* write a PMU regcontrol register */
 int
-brcm_chip_cc_regcontrol_write32(struct brcm_chip *chip, uint32_t reg,
+bwfm_chip_cc_regcontrol_write32(struct bwfm_chip *chip, uint32_t reg,
     uint32_t val)
 {
 
-	return (pmu_indirect_write(chip, BRCM_CC_PMU_REGCONTROL_ADDR,
-	    BRCM_CC_PMU_REGCONTROL_DATA, reg, val));
+	return (pmu_indirect_write(chip, BWFM_CC_PMU_REGCONTROL_ADDR,
+	    BWFM_CC_PMU_REGCONTROL_DATA, reg, val));
 }
 
 /* read a PMU pllcontrol register */
 int
-brcm_chip_cc_pllcontrol_read32(struct brcm_chip *chip, uint32_t reg,
+bwfm_chip_cc_pllcontrol_read32(struct bwfm_chip *chip, uint32_t reg,
     uint32_t *out)
 {
 
-	return (pmu_indirect_read(chip, BRCM_CC_PMU_PLLCONTROL_ADDR,
-	    BRCM_CC_PMU_PLLCONTROL_DATA, reg, out));
+	return (pmu_indirect_read(chip, BWFM_CC_PMU_PLLCONTROL_ADDR,
+	    BWFM_CC_PMU_PLLCONTROL_DATA, reg, out));
 }
 
 /* write a PMU pllcontrol register */
 int
-brcm_chip_cc_pllcontrol_write32(struct brcm_chip *chip, uint32_t reg,
+bwfm_chip_cc_pllcontrol_write32(struct bwfm_chip *chip, uint32_t reg,
     uint32_t val)
 {
 
-	return (pmu_indirect_write(chip, BRCM_CC_PMU_PLLCONTROL_ADDR,
-	    BRCM_CC_PMU_PLLCONTROL_DATA, reg, val));
+	return (pmu_indirect_write(chip, BWFM_CC_PMU_PLLCONTROL_ADDR,
+	    BWFM_CC_PMU_PLLCONTROL_DATA, reg, val));
 }
 
 /*
@@ -292,14 +292,14 @@ brcm_chip_cc_pllcontrol_write32(struct brcm_chip *chip, uint32_t reg,
  * save-restore at all, so return false.
  */
 bool
-brcm_chip_sr_capable(struct brcm_chip *chip)
+bwfm_chip_sr_capable(struct bwfm_chip *chip)
 {
 	uint32_t reg;
 	int err;
 
 	if (chip->pmurev < 17)
 		return (false);
-	err = brcm_chip_cc_chipcontrol_read32(chip, 3, &reg);
+	err = bwfm_chip_cc_chipcontrol_read32(chip, 3, &reg);
 	if (err != 0)
 		return (false);
 	return ((reg & (1u << 2)) != 0);
@@ -328,7 +328,7 @@ brcm_chip_sr_capable(struct brcm_chip *chip)
  * (0x18105000) instead of the live MWRAP (0x18102000).
  */
 static uint32_t
-dmp_get_desc(struct brcm_chip *chip, uint32_t *eromaddr, uint8_t *type)
+dmp_get_desc(struct bwfm_chip *chip, uint32_t *eromaddr, uint8_t *type)
 {
 	uint32_t val;
 
@@ -351,7 +351,7 @@ dmp_get_desc(struct brcm_chip *chip, uint32_t *eromaddr, uint8_t *type)
 
 /* find a core register and wrapper base */
 static int
-dmp_get_regaddr(struct brcm_chip *chip, uint32_t *eromaddr,
+dmp_get_regaddr(struct bwfm_chip *chip, uint32_t *eromaddr,
     uint32_t *regbase, uint32_t *wrapbase)
 {
 	uint32_t val, szdesc;
@@ -420,19 +420,19 @@ dmp_get_regaddr(struct brcm_chip *chip, uint32_t *eromaddr,
 
 /* walk the EROM and record every core */
 int
-brcm_chip_walk_erom(struct brcm_chip *chip)
+bwfm_chip_walk_erom(struct bwfm_chip *chip)
 {
-	struct brcm_chip_core *cc;
+	struct bwfm_chip_core *cc;
 	uint32_t eromaddr, val, base, wrap;
 	uint8_t desc_type, nmw, nsw, rev;
 	uint16_t id;
 	int outer, err;
 
-	cc = brcm_chip_get_chipcommon(chip);
+	cc = bwfm_chip_get_chipcommon(chip);
 	if (cc == NULL)
 		return (ENXIO);
 
-	eromaddr = chip_r32(chip, cc->base + BRCM_CC_EROMPTR);
+	eromaddr = chip_r32(chip, cc->base + BWFM_CC_EROMPTR);
 
 	for (outer = 0; outer < 256; outer++) {
 		val = dmp_get_desc(chip, &eromaddr, &desc_type);
@@ -472,7 +472,7 @@ brcm_chip_walk_erom(struct brcm_chip *chip)
 			continue;
 
 		if (base != 0 || nmw + nsw > 0)
-			(void)brcm_chip_add_core(chip, id, rev, base, wrap);
+			(void)bwfm_chip_add_core(chip, id, rev, base, wrap);
 	}
 	return (0);
 }
@@ -501,7 +501,7 @@ brcm_chip_walk_erom(struct brcm_chip *chip)
  * so sleeping would be wrong anyway.
  */
 bool
-brcm_chip_ai_iscoreup(struct brcm_chip *chip, struct brcm_chip_core *core)
+bwfm_chip_ai_iscoreup(struct bwfm_chip *chip, struct bwfm_chip_core *core)
 {
 	uint32_t v;
 	bool ok;
@@ -515,7 +515,7 @@ brcm_chip_ai_iscoreup(struct brcm_chip *chip, struct brcm_chip_core *core)
 
 /* put a core into reset */
 static void
-ai_coredisable(struct brcm_chip *chip, struct brcm_chip_core *core,
+ai_coredisable(struct bwfm_chip *chip, struct bwfm_chip_core *core,
     uint32_t prereset, uint32_t reset)
 {
 	uint32_t v;
@@ -551,7 +551,7 @@ in_reset_configure:
 
 /* reset a core and bring it back up */
 int
-brcm_chip_ai_resetcore(struct brcm_chip *chip, struct brcm_chip_core *core,
+bwfm_chip_ai_resetcore(struct bwfm_chip *chip, struct bwfm_chip_core *core,
     uint32_t prereset, uint32_t reset, uint32_t postreset)
 {
 	uint32_t v;
@@ -590,23 +590,23 @@ brcm_chip_ai_resetcore(struct brcm_chip *chip, struct brcm_chip_core *core,
  * while we run a full resetcore.
  */
 int
-brcm_chip_disable_arm(struct brcm_chip *chip, uint16_t coreid)
+bwfm_chip_disable_arm(struct bwfm_chip *chip, uint16_t coreid)
 {
-	struct brcm_chip_core *core;
+	struct bwfm_chip_core *core;
 	uint32_t val;
 
-	core = brcm_chip_get_core(chip, coreid);
+	core = bwfm_chip_get_core(chip, coreid);
 	if (core == NULL)
 		return (ENXIO);
 
 	switch (coreid) {
 	case BCMA_CORE_ARM_CM3:
-		return (brcm_chip_ai_resetcore(chip, core, 0, 0, 0));
+		return (bwfm_chip_ai_resetcore(chip, core, 0, 0, 0));
 	case BCMA_CORE_ARM_CR4:
 	case BCMA_CORE_ARM_CA7:
 		val = chip_r32(chip, core->wrap + BCMA_IOCTL);
 		val &= ARMCR4_BCMA_IOCTL_CPUHALT;
-		return (brcm_chip_ai_resetcore(chip, core, val,
+		return (bwfm_chip_ai_resetcore(chip, core, val,
 		    ARMCR4_BCMA_IOCTL_CPUHALT, ARMCR4_BCMA_IOCTL_CPUHALT));
 	default:
 		return (EINVAL);
@@ -623,18 +623,18 @@ brcm_chip_disable_arm(struct brcm_chip *chip, uint16_t coreid)
  * port of brcmf_chip_cr4_set_active (chip.c:1339).
  */
 int
-brcm_chip_cr4_set_active(struct brcm_chip *chip, uint32_t rstvec)
+bwfm_chip_cr4_set_active(struct bwfm_chip *chip, uint32_t rstvec)
 {
-	struct brcm_chip_core *cr4;
+	struct bwfm_chip_core *cr4;
 
-	cr4 = brcm_chip_get_core(chip, BCMA_CORE_ARM_CR4);
+	cr4 = bwfm_chip_get_core(chip, BCMA_CORE_ARM_CR4);
 	if (cr4 == NULL)
 		return (ENXIO);
 
 	if (chip->ops->activate != NULL)
 		chip->ops->activate(chip->ctx, chip, rstvec);
 
-	return (brcm_chip_ai_resetcore(chip, cr4,
+	return (bwfm_chip_ai_resetcore(chip, cr4,
 	    ARMCR4_BCMA_IOCTL_CPUHALT, 0, 0));
 }
 
@@ -655,34 +655,34 @@ brcm_chip_cr4_set_active(struct brcm_chip *chip, uint32_t rstvec)
  * sromotp[2n+1] is in the high half-word (bits 16..31).
  */
 bool
-brcm_chip_otp_present(struct brcm_chip *chip)
+bwfm_chip_otp_present(struct bwfm_chip *chip)
 {
-	struct brcm_chip_core *cc;
+	struct bwfm_chip_core *cc;
 	uint32_t st;
 
-	cc = brcm_chip_get_chipcommon(chip);
+	cc = bwfm_chip_get_chipcommon(chip);
 	if (cc == NULL)
 		return (false);
-	st = chip_r32(chip, cc->base + BRCM_CC_OTPSTATUS);
-	return ((st & (BRCM_OTPSTATUS_OL_PRESENT |
-	    BRCM_OTPSTATUS_OL_PROGRAMMED)) ==
-	    (BRCM_OTPSTATUS_OL_PRESENT | BRCM_OTPSTATUS_OL_PROGRAMMED));
+	st = chip_r32(chip, cc->base + BWFM_CC_OTPSTATUS);
+	return ((st & (BWFM_OTPSTATUS_OL_PRESENT |
+	    BWFM_OTPSTATUS_OL_PROGRAMMED)) ==
+	    (BWFM_OTPSTATUS_OL_PRESENT | BWFM_OTPSTATUS_OL_PROGRAMMED));
 }
 
 /* read one OTP word */
 int
-brcm_chip_otp_read16(struct brcm_chip *chip, uint32_t word_idx,
+bwfm_chip_otp_read16(struct bwfm_chip *chip, uint32_t word_idx,
     uint16_t *out)
 {
-	struct brcm_chip_core *cc;
+	struct bwfm_chip_core *cc;
 	uint32_t addr, w;
 
-	if (word_idx >= BRCM_CC_SROMOTP_WORDS)
+	if (word_idx >= BWFM_CC_SROMOTP_WORDS)
 		return (EINVAL);
-	cc = brcm_chip_get_chipcommon(chip);
+	cc = bwfm_chip_get_chipcommon(chip);
 	if (cc == NULL)
 		return (ENXIO);
-	addr = cc->base + BRCM_CC_SROMOTP_OFFSET + (word_idx & ~1u) * 2u;
+	addr = cc->base + BWFM_CC_SROMOTP_OFFSET + (word_idx & ~1u) * 2u;
 	w = chip_r32(chip, addr);
 	if ((word_idx & 1u) == 0)
 		*out = (uint16_t)(w & 0xffffu);
@@ -693,18 +693,18 @@ brcm_chip_otp_read16(struct brcm_chip *chip, uint32_t word_idx,
 
 /* read many OTP words at once */
 int
-brcm_chip_otp_dump(struct brcm_chip *chip, uint16_t *buf, uint32_t nwords)
+bwfm_chip_otp_dump(struct bwfm_chip *chip, uint16_t *buf, uint32_t nwords)
 {
-	struct brcm_chip_core *cc;
+	struct bwfm_chip_core *cc;
 	uint32_t i, w;
 
-	if (nwords > BRCM_CC_SROMOTP_WORDS)
-		nwords = BRCM_CC_SROMOTP_WORDS;
-	cc = brcm_chip_get_chipcommon(chip);
+	if (nwords > BWFM_CC_SROMOTP_WORDS)
+		nwords = BWFM_CC_SROMOTP_WORDS;
+	cc = bwfm_chip_get_chipcommon(chip);
 	if (cc == NULL)
 		return (ENXIO);
 	for (i = 0; i < nwords; i += 2) {
-		w = chip_r32(chip, cc->base + BRCM_CC_SROMOTP_OFFSET + i * 2u);
+		w = chip_r32(chip, cc->base + BWFM_CC_SROMOTP_OFFSET + i * 2u);
 		buf[i] = (uint16_t)(w & 0xffffu);
 		if (i + 1 < nwords)
 			buf[i + 1] = (uint16_t)((w >> 16) & 0xffffu);

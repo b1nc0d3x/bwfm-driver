@@ -1,6 +1,6 @@
 # Firmware module for BCM43455 / CYW43455 (Pi 4B, Pi 3B+).
 #
-# Wraps three blobs into one kld so brcm_sdio can get them through
+# Wraps three blobs into one kld so bwfm_sdio can get them through
 # firmware(9) without needing the root file system at attach time:
 #
 #   brcmfmac43455-sdio.bin       Cortex-R4 firmware, 7.45.18 (r538002)

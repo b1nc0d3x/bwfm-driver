@@ -1,6 +1,6 @@
 # Firmware-only kld for the BCM4360 (14e4:43a0, 43a2) PCIe transport.
 #
-# brcm_pci(4) calls firmware_get("brcmfmac4360_pcie") to fetch the
+# bwfm_pci(4) calls firmware_get("brcmfmac4360_pcie") to fetch the
 # ARM-CR4 image during bring-up.  This module wraps whatever blob is
 # placed in this directory as brcmfmac4360-pcie.bin.
 #
@@ -22,11 +22,11 @@
 #
 #   2. The broadcom-wl Linux driver is SoftMAC.  Its BCM4360 support
 #      is D11 MAC ucode built into the binary, not an ARM-CR4 image,
-#      so it gives brcm_pci nothing to load.
+#      so it gives bwfm_pci nothing to load.
 #
 #   3. b43-fwcutter and similar tools extract D11 ucode for b43 from
 #      the Windows Boot Camp driver, which likewise is not an image
-#      brcm_pci can upload.  See
+#      bwfm_pci can upload.  See
 #      https://wireless.wiki.kernel.org/en/users/drivers/b43/firmware
 #
 # With a blob in hand, put it here as brcmfmac4360-pcie.bin and run
@@ -48,7 +48,7 @@ brcmfmac4360-pcie.bin:
 	@:> ${.CURDIR}/brcmfmac4360-pcie.bin
 .endif
 
-KMOD=		brcm_pci_fw_4360
+KMOD=		bwfm_pci_fw_4360
 FIRMWS=		brcmfmac4360-pcie.bin:brcmfmac4360_pcie:1
 
 .include <bsd.kmod.mk>

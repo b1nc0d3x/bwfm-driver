@@ -17,8 +17,8 @@
  * OpenBSD sys/dev/pci/if_bwfm_pci.h are ISC licensed.
  */
 
-#ifndef _DEV_BRCM_BRCM_PCI_MSGBUF_H_
-#define _DEV_BRCM_BRCM_PCI_MSGBUF_H_
+#ifndef _DEV_BWFM_BWFM_PCI_MSGBUF_H_
+#define _DEV_BWFM_BWFM_PCI_MSGBUF_H_
 
 #include <sys/types.h>
 #include <sys/mutex.h>
@@ -37,66 +37,66 @@ struct mbuf;
  * context with ring->lock held, and msgbuf_event_task delivers it from
  * taskqueue_thread with no interrupt-side lock held.
  *
- * Event delivery (brcm_handle_event -> ieee80211_add_scan_result) takes
+ * Event delivery (bwfm_handle_event -> ieee80211_add_scan_result) takes
  * IEEE80211_LOCK, while net80211's ic_scan_start holds IEEE80211_LOCK
  * across the wait for the scan DCMD's IOCTL_CMPLT.  Delivering events
  * inline from the interrupt path would therefore deadlock.
  */
-struct brcm_pci_event {
-	STAILQ_ENTRY(brcm_pci_event) link;
+struct bwfm_pci_event {
+	STAILQ_ENTRY(bwfm_pci_event) link;
 	uint16_t datalen;
-	uint8_t  data[8192];	/* BRCM_MSGBUF_MAX_CTL_PKT_SIZE */
+	uint8_t  data[8192];	/* BWFM_MSGBUF_MAX_CTL_PKT_SIZE */
 };
 
 /* -----------------------------------------------------------------
  * Common ring constants (matches Linux msgbuf.h:10-24).
  * ----------------------------------------------------------------- */
-#define	BRCM_H2D_CONTROL_SUBMIT_MAX_ITEM	64
-#define	BRCM_H2D_RXPOST_SUBMIT_MAX_ITEM		1024
-#define	BRCM_D2H_CONTROL_COMPLETE_MAX_ITEM	64
-#define	BRCM_D2H_TX_COMPLETE_MAX_ITEM		1024
-#define	BRCM_D2H_RX_COMPLETE_MAX_ITEM		1024
-#define	BRCM_H2D_TXFLOWRING_MAX_ITEM		512
+#define	BWFM_H2D_CONTROL_SUBMIT_MAX_ITEM	64
+#define	BWFM_H2D_RXPOST_SUBMIT_MAX_ITEM		1024
+#define	BWFM_D2H_CONTROL_COMPLETE_MAX_ITEM	64
+#define	BWFM_D2H_TX_COMPLETE_MAX_ITEM		1024
+#define	BWFM_D2H_RX_COMPLETE_MAX_ITEM		1024
+#define	BWFM_H2D_TXFLOWRING_MAX_ITEM		512
 
-#define	BRCM_H2D_CONTROL_SUBMIT_ITEMSIZE	40
-#define	BRCM_H2D_RXPOST_SUBMIT_ITEMSIZE		32
-#define	BRCM_D2H_CONTROL_COMPLETE_ITEMSIZE	24
-#define	BRCM_D2H_TX_COMPLETE_ITEMSIZE_PRE_V7	16
-#define	BRCM_D2H_TX_COMPLETE_ITEMSIZE		24
-#define	BRCM_D2H_RX_COMPLETE_ITEMSIZE_PRE_V7	32
-#define	BRCM_D2H_RX_COMPLETE_ITEMSIZE		40
-#define	BRCM_H2D_TXFLOWRING_ITEMSIZE		48
+#define	BWFM_H2D_CONTROL_SUBMIT_ITEMSIZE	40
+#define	BWFM_H2D_RXPOST_SUBMIT_ITEMSIZE		32
+#define	BWFM_D2H_CONTROL_COMPLETE_ITEMSIZE	24
+#define	BWFM_D2H_TX_COMPLETE_ITEMSIZE_PRE_V7	16
+#define	BWFM_D2H_TX_COMPLETE_ITEMSIZE		24
+#define	BWFM_D2H_RX_COMPLETE_ITEMSIZE_PRE_V7	32
+#define	BWFM_D2H_RX_COMPLETE_ITEMSIZE		40
+#define	BWFM_H2D_TXFLOWRING_ITEMSIZE		48
 
 /* Ring IDs — index into commonrings[] (pcie.c:408-430). */
-#define	BRCM_H2D_MSGRING_CONTROL_SUBMIT		0
-#define	BRCM_H2D_MSGRING_RXPOST_SUBMIT		1
-#define	BRCM_D2H_MSGRING_CONTROL_COMPLETE	2
-#define	BRCM_D2H_MSGRING_TX_COMPLETE		3
-#define	BRCM_D2H_MSGRING_RX_COMPLETE		4
-#define	BRCM_NROF_COMMON_MSGRINGS		5
+#define	BWFM_H2D_MSGRING_CONTROL_SUBMIT		0
+#define	BWFM_H2D_MSGRING_RXPOST_SUBMIT		1
+#define	BWFM_D2H_MSGRING_CONTROL_COMPLETE	2
+#define	BWFM_D2H_MSGRING_TX_COMPLETE		3
+#define	BWFM_D2H_MSGRING_RX_COMPLETE		4
+#define	BWFM_NROF_COMMON_MSGRINGS		5
 
 /* -----------------------------------------------------------------
  * Shared-info struct offsets (Linux pcie.c:223-233).
  * Read via BAR2[sharedram_addr + N].
  * ----------------------------------------------------------------- */
-#define	BRCM_SHARED_FLAGS_OFFSET		0	/* u32 */
-#define	BRCM_SHARED_CONSOLE_ADDR_OFFSET		20	/* u32 */
-#define	BRCM_SHARED_MAX_RXBUFPOST_OFFSET	34	/* u16 */
-#define	BRCM_SHARED_RX_DATAOFFSET_OFFSET	36	/* u32 */
-#define	BRCM_SHARED_HTOD_MB_DATA_ADDR_OFFSET	40	/* u32 */
-#define	BRCM_SHARED_DTOH_MB_DATA_ADDR_OFFSET	44	/* u32 */
-#define	BRCM_SHARED_RING_INFO_ADDR_OFFSET	48	/* u32 */
-#define	BRCM_SHARED_DMA_SCRATCH_LEN_OFFSET	52	/* u32 */
-#define	BRCM_SHARED_DMA_SCRATCH_ADDR_OFFSET	56	/* u64 (lo,hi) */
-#define	BRCM_SHARED_DMA_RINGUPD_LEN_OFFSET	64	/* u32 */
-#define	BRCM_SHARED_DMA_RINGUPD_ADDR_OFFSET	68	/* u64 (lo,hi) */
+#define	BWFM_SHARED_FLAGS_OFFSET		0	/* u32 */
+#define	BWFM_SHARED_CONSOLE_ADDR_OFFSET		20	/* u32 */
+#define	BWFM_SHARED_MAX_RXBUFPOST_OFFSET	34	/* u16 */
+#define	BWFM_SHARED_RX_DATAOFFSET_OFFSET	36	/* u32 */
+#define	BWFM_SHARED_HTOD_MB_DATA_ADDR_OFFSET	40	/* u32 */
+#define	BWFM_SHARED_DTOH_MB_DATA_ADDR_OFFSET	44	/* u32 */
+#define	BWFM_SHARED_RING_INFO_ADDR_OFFSET	48	/* u32 */
+#define	BWFM_SHARED_DMA_SCRATCH_LEN_OFFSET	52	/* u32 */
+#define	BWFM_SHARED_DMA_SCRATCH_ADDR_OFFSET	56	/* u64 (lo,hi) */
+#define	BWFM_SHARED_DMA_RINGUPD_LEN_OFFSET	64	/* u32 */
+#define	BWFM_SHARED_DMA_RINGUPD_ADDR_OFFSET	68	/* u64 (lo,hi) */
 
-#define	BRCM_PCIE_SHARED_VERSION_MASK		0x000000FF
-#define	BRCM_PCIE_MIN_SHARED_VERSION		5
-#define	BRCM_PCIE_MAX_SHARED_VERSION		7
-#define	BRCM_PCIE_SHARED_DMA_INDEX		0x00010000
-#define	BRCM_PCIE_SHARED_DMA_2B_IDX		0x00100000
-#define	BRCM_PCIE_SHARED_HOSTRDY_DB1		0x10000000
+#define	BWFM_PCIE_SHARED_VERSION_MASK		0x000000FF
+#define	BWFM_PCIE_MIN_SHARED_VERSION		5
+#define	BWFM_PCIE_MAX_SHARED_VERSION		7
+#define	BWFM_PCIE_SHARED_DMA_INDEX		0x00010000
+#define	BWFM_PCIE_SHARED_DMA_2B_IDX		0x00100000
+#define	BWFM_PCIE_SHARED_HOSTRDY_DB1		0x10000000
 
 /*
  * D3 / D0 mailbox values written to htod_mb_data_addr in TCM and read
@@ -104,64 +104,64 @@ struct brcm_pci_event {
  * doorbell (offset 0x98 in PCI config space) to notify fw.  Reference:
  * brcmfmac pcie.c BRCMF_H2D_HOST_D3_INFORM / BRCMF_D2H_DEV_D3_ACK.
  */
-#define	BRCM_H2D_HOST_D3_INFORM			0x00000001
-#define	BRCM_D2H_DEV_D3_ACK			0x00000001
-#define	BRCM_H2D_HOST_D0_INFORM_IN_USE		0x00000008
-#define	BRCM_H2D_HOST_D0_INFORM			0x00000010
-#define	BRCM_PCI_REG_SBMBX			0x98
+#define	BWFM_H2D_HOST_D3_INFORM			0x00000001
+#define	BWFM_D2H_DEV_D3_ACK			0x00000001
+#define	BWFM_H2D_HOST_D0_INFORM_IN_USE		0x00000008
+#define	BWFM_H2D_HOST_D0_INFORM			0x00000010
+#define	BWFM_PCI_REG_SBMBX			0x98
 
 /* Ring-info struct offsets within the ringinfo TCM block. */
-#define	BRCM_RINGINFO_RINGMEM_OFFSET		0	/* u32 */
-#define	BRCM_RINGINFO_H2D_W_IDX_PTR_OFFSET	4	/* u32 */
-#define	BRCM_RINGINFO_H2D_R_IDX_PTR_OFFSET	8	/* u32 */
-#define	BRCM_RINGINFO_D2H_W_IDX_PTR_OFFSET	12	/* u32 */
-#define	BRCM_RINGINFO_D2H_R_IDX_PTR_OFFSET	16	/* u32 */
-#define	BRCM_RINGINFO_H2D_W_IDX_HOST_OFFSET	20	/* u64 */
-#define	BRCM_RINGINFO_H2D_R_IDX_HOST_OFFSET	28	/* u64 */
-#define	BRCM_RINGINFO_D2H_W_IDX_HOST_OFFSET	36	/* u64 */
-#define	BRCM_RINGINFO_D2H_R_IDX_HOST_OFFSET	44	/* u64 */
-#define	BRCM_RINGINFO_MAX_FLOWRINGS_OFFSET	52	/* u16 */
-#define	BRCM_RINGINFO_MAX_SUBMISSIONRINGS_OFFSET 54	/* u16 */
-#define	BRCM_RINGINFO_MAX_COMPLETIONRINGS_OFFSET 56	/* u16 */
+#define	BWFM_RINGINFO_RINGMEM_OFFSET		0	/* u32 */
+#define	BWFM_RINGINFO_H2D_W_IDX_PTR_OFFSET	4	/* u32 */
+#define	BWFM_RINGINFO_H2D_R_IDX_PTR_OFFSET	8	/* u32 */
+#define	BWFM_RINGINFO_D2H_W_IDX_PTR_OFFSET	12	/* u32 */
+#define	BWFM_RINGINFO_D2H_R_IDX_PTR_OFFSET	16	/* u32 */
+#define	BWFM_RINGINFO_H2D_W_IDX_HOST_OFFSET	20	/* u64 */
+#define	BWFM_RINGINFO_H2D_R_IDX_HOST_OFFSET	28	/* u64 */
+#define	BWFM_RINGINFO_D2H_W_IDX_HOST_OFFSET	36	/* u64 */
+#define	BWFM_RINGINFO_D2H_R_IDX_HOST_OFFSET	44	/* u64 */
+#define	BWFM_RINGINFO_MAX_FLOWRINGS_OFFSET	52	/* u16 */
+#define	BWFM_RINGINFO_MAX_SUBMISSIONRINGS_OFFSET 54	/* u16 */
+#define	BWFM_RINGINFO_MAX_COMPLETIONRINGS_OFFSET 56	/* u16 */
 
 /* Per-ring "ringmem" entry — 16 bytes each (pcie.c:240-244). */
-#define	BRCM_RING_MAX_ITEM_OFFSET		4	/* u16 */
-#define	BRCM_RING_LEN_ITEMS_OFFSET		6	/* u16 */
-#define	BRCM_RING_MEM_BASE_ADDR_OFFSET		8	/* u64 (lo,hi) */
-#define	BRCM_RING_MEM_SZ			16
-#define	BRCM_RING_STATE_SZ			8
+#define	BWFM_RING_MAX_ITEM_OFFSET		4	/* u16 */
+#define	BWFM_RING_LEN_ITEMS_OFFSET		6	/* u16 */
+#define	BWFM_RING_MEM_BASE_ADDR_OFFSET		8	/* u64 (lo,hi) */
+#define	BWFM_RING_MEM_SZ			16
+#define	BWFM_RING_STATE_SZ			8
 
 /* -----------------------------------------------------------------
  * PCIe2 core register offsets (Linux pcie.c:134-149,
  * brcmf_reginfo_default, which covers BCM43602).  All are relative
  * to the PCIe2 core base found by the EROM walk.
  * ----------------------------------------------------------------- */
-#define	BRCM_PCIE2REG_INTMASK			0x24
-#define	BRCM_PCIE2REG_MAILBOXINT		0x48
-#define	BRCM_PCIE2REG_MAILBOXMASK		0x4C
-#define	BRCM_PCIE2REG_H2D_MAILBOX_0		0x140
-#define	BRCM_PCIE2REG_H2D_MAILBOX_1		0x144
+#define	BWFM_PCIE2REG_INTMASK			0x24
+#define	BWFM_PCIE2REG_MAILBOXINT		0x48
+#define	BWFM_PCIE2REG_MAILBOXMASK		0x4C
+#define	BWFM_PCIE2REG_H2D_MAILBOX_0		0x140
+#define	BWFM_PCIE2REG_H2D_MAILBOX_1		0x144
 
-#define	BRCM_PCIE_MB_INT_FN0_0			0x0100
-#define	BRCM_PCIE_MB_INT_FN0_1			0x0200
-#define	BRCM_PCIE_MB_INT_FN0			(BRCM_PCIE_MB_INT_FN0_0 | \
-						 BRCM_PCIE_MB_INT_FN0_1)
-#define	BRCM_PCIE_MB_INT_D2H0_DB0		0x00010000
-#define	BRCM_PCIE_MB_INT_D2H0_DB1		0x00020000
-#define	BRCM_PCIE_MB_INT_D2H1_DB0		0x00040000
-#define	BRCM_PCIE_MB_INT_D2H1_DB1		0x00080000
-#define	BRCM_PCIE_MB_INT_D2H2_DB0		0x00100000
-#define	BRCM_PCIE_MB_INT_D2H2_DB1		0x00200000
-#define	BRCM_PCIE_MB_INT_D2H3_DB0		0x00400000
-#define	BRCM_PCIE_MB_INT_D2H3_DB1		0x00800000
-#define	BRCM_PCIE_MB_INT_D2H_DB			(BRCM_PCIE_MB_INT_D2H0_DB0 | \
-						 BRCM_PCIE_MB_INT_D2H0_DB1 | \
-						 BRCM_PCIE_MB_INT_D2H1_DB0 | \
-						 BRCM_PCIE_MB_INT_D2H1_DB1 | \
-						 BRCM_PCIE_MB_INT_D2H2_DB0 | \
-						 BRCM_PCIE_MB_INT_D2H2_DB1 | \
-						 BRCM_PCIE_MB_INT_D2H3_DB0 | \
-						 BRCM_PCIE_MB_INT_D2H3_DB1)
+#define	BWFM_PCIE_MB_INT_FN0_0			0x0100
+#define	BWFM_PCIE_MB_INT_FN0_1			0x0200
+#define	BWFM_PCIE_MB_INT_FN0			(BWFM_PCIE_MB_INT_FN0_0 | \
+						 BWFM_PCIE_MB_INT_FN0_1)
+#define	BWFM_PCIE_MB_INT_D2H0_DB0		0x00010000
+#define	BWFM_PCIE_MB_INT_D2H0_DB1		0x00020000
+#define	BWFM_PCIE_MB_INT_D2H1_DB0		0x00040000
+#define	BWFM_PCIE_MB_INT_D2H1_DB1		0x00080000
+#define	BWFM_PCIE_MB_INT_D2H2_DB0		0x00100000
+#define	BWFM_PCIE_MB_INT_D2H2_DB1		0x00200000
+#define	BWFM_PCIE_MB_INT_D2H3_DB0		0x00400000
+#define	BWFM_PCIE_MB_INT_D2H3_DB1		0x00800000
+#define	BWFM_PCIE_MB_INT_D2H_DB			(BWFM_PCIE_MB_INT_D2H0_DB0 | \
+						 BWFM_PCIE_MB_INT_D2H0_DB1 | \
+						 BWFM_PCIE_MB_INT_D2H1_DB0 | \
+						 BWFM_PCIE_MB_INT_D2H1_DB1 | \
+						 BWFM_PCIE_MB_INT_D2H2_DB0 | \
+						 BWFM_PCIE_MB_INT_D2H2_DB1 | \
+						 BWFM_PCIE_MB_INT_D2H3_DB0 | \
+						 BWFM_PCIE_MB_INT_D2H3_DB1)
 
 /* -----------------------------------------------------------------
  * MSGBUF packet layouts.  The wire format is little-endian (__le32 in
@@ -169,25 +169,25 @@ struct brcm_pci_event {
  * done at the use sites where it matters.
  * ----------------------------------------------------------------- */
 
-#define	BRCM_MSGBUF_TYPE_GEN_STATUS		0x1
-#define	BRCM_MSGBUF_TYPE_RING_STATUS		0x2
-#define	BRCM_MSGBUF_TYPE_FLOW_RING_CREATE	0x3
-#define	BRCM_MSGBUF_TYPE_FLOW_RING_CREATE_CMPLT	0x4
-#define	BRCM_MSGBUF_TYPE_FLOW_RING_DELETE	0x5
-#define	BRCM_MSGBUF_TYPE_FLOW_RING_DELETE_CMPLT	0x6
-#define	BRCM_MSGBUF_TYPE_IOCTLPTR_REQ		0x9
-#define	BRCM_MSGBUF_TYPE_IOCTLPTR_REQ_ACK	0xA
-#define	BRCM_MSGBUF_TYPE_IOCTLRESP_BUF_POST	0xB
-#define	BRCM_MSGBUF_TYPE_IOCTL_CMPLT		0xC
-#define	BRCM_MSGBUF_TYPE_EVENT_BUF_POST		0xD
-#define	BRCM_MSGBUF_TYPE_WL_EVENT		0xE
-#define	BRCM_MSGBUF_TYPE_TX_POST		0xF
-#define	BRCM_MSGBUF_TYPE_TX_STATUS		0x10
-#define	BRCM_MSGBUF_TYPE_RXBUF_POST		0x11
-#define	BRCM_MSGBUF_TYPE_RX_CMPLT		0x12
+#define	BWFM_MSGBUF_TYPE_GEN_STATUS		0x1
+#define	BWFM_MSGBUF_TYPE_RING_STATUS		0x2
+#define	BWFM_MSGBUF_TYPE_FLOW_RING_CREATE	0x3
+#define	BWFM_MSGBUF_TYPE_FLOW_RING_CREATE_CMPLT	0x4
+#define	BWFM_MSGBUF_TYPE_FLOW_RING_DELETE	0x5
+#define	BWFM_MSGBUF_TYPE_FLOW_RING_DELETE_CMPLT	0x6
+#define	BWFM_MSGBUF_TYPE_IOCTLPTR_REQ		0x9
+#define	BWFM_MSGBUF_TYPE_IOCTLPTR_REQ_ACK	0xA
+#define	BWFM_MSGBUF_TYPE_IOCTLRESP_BUF_POST	0xB
+#define	BWFM_MSGBUF_TYPE_IOCTL_CMPLT		0xC
+#define	BWFM_MSGBUF_TYPE_EVENT_BUF_POST		0xD
+#define	BWFM_MSGBUF_TYPE_WL_EVENT		0xE
+#define	BWFM_MSGBUF_TYPE_TX_POST		0xF
+#define	BWFM_MSGBUF_TYPE_TX_STATUS		0x10
+#define	BWFM_MSGBUF_TYPE_RXBUF_POST		0x11
+#define	BWFM_MSGBUF_TYPE_RX_CMPLT		0x12
 
-#define	BRCM_IOCTL_REQ_PKTID			0xFFFE
-#define	BRCM_MSGBUF_MAX_CTL_PKT_SIZE		8192
+#define	BWFM_IOCTL_REQ_PKTID			0xFFFE
+#define	BWFM_MSGBUF_MAX_CTL_PKT_SIZE		8192
 
 struct msgbuf_buf_addr {
 	uint32_t	low_addr;
@@ -336,29 +336,29 @@ struct msgbuf_rx_bufpost {
 } __packed;
 
 /* RXPOST/EVENT/IOCTLRESP constants (Linux msgbuf.c:56-60). */
-#define	BRCM_MSGBUF_MAX_PKT_SIZE		2048	/* rx data buf */
-#define	BRCM_MSGBUF_RXBUFPOST_THRESHOLD		32
-#define	BRCM_MSGBUF_MAX_EVENTBUF_POST		8
-#define	BRCM_MSGBUF_MAX_IOCTLRESPBUF_POST	8
-#define	BRCM_MSGBUF_MAX_RXPOST			256	/* our tunable */
+#define	BWFM_MSGBUF_MAX_PKT_SIZE		2048	/* rx data buf */
+#define	BWFM_MSGBUF_RXBUFPOST_THRESHOLD		32
+#define	BWFM_MSGBUF_MAX_EVENTBUF_POST		8
+#define	BWFM_MSGBUF_MAX_IOCTLRESPBUF_POST	8
+#define	BWFM_MSGBUF_MAX_RXPOST			256	/* our tunable */
 
 /* Flags in msgbuf_rx_complete indicating packet framing. */
-#define	BRCM_MSGBUF_PKT_FLAGS_FRAME_MASK	0x07
-#define	BRCM_MSGBUF_PKT_FLAGS_FRAME_802_11	0x02
+#define	BWFM_MSGBUF_PKT_FLAGS_FRAME_MASK	0x07
+#define	BWFM_MSGBUF_PKT_FLAGS_FRAME_802_11	0x02
 
 /* -----------------------------------------------------------------
  * bcmevent packet layout inside a WL_EVENT buffer (Linux fweh.h):
- *   [ethhdr] [brcm_ethhdr] [brcmf_event_msg_be] [event data...]
+ *   [ethhdr] [bwfm_ethhdr] [brcmf_event_msg_be] [event data...]
  * The header fields are big-endian on the wire.
  * ----------------------------------------------------------------- */
-#define	BRCM_ETH_TYPE_EVENT		0x886c
-#define	BRCM_BCMILCP_SUBTYPE_VENDOR_LONG	32769
-#define	BRCM_BCM_OUI0			0x00
-#define	BRCM_BCM_OUI1			0x10
-#define	BRCM_BCM_OUI2			0x18
+#define	BWFM_ETH_TYPE_EVENT		0x886c
+#define	BWFM_BCMILCP_SUBTYPE_VENDOR_LONG	32769
+#define	BWFM_BCM_OUI0			0x00
+#define	BWFM_BCM_OUI1			0x10
+#define	BWFM_BCM_OUI2			0x18
 
-/* brcm_ethhdr (10 B, all BE; Linux fweh.h struct brcm_ethhdr). */
-struct brcm_bcm_ethhdr {
+/* bwfm_ethhdr (10 B, all BE; Linux fweh.h struct bwfm_ethhdr). */
+struct bwfm_bcm_ethhdr {
 	uint16_t	subtype;
 	uint16_t	length;
 	uint8_t		version;
@@ -367,7 +367,7 @@ struct brcm_bcm_ethhdr {
 } __packed;
 
 /* brcmf_event_msg_be (48 B, all BE). */
-struct brcm_bcm_event_msg {
+struct bwfm_bcm_event_msg {
 	uint16_t	version;
 	uint16_t	flags;
 	uint32_t	event_type;
@@ -382,77 +382,77 @@ struct brcm_bcm_event_msg {
 } __packed;
 
 /* Event codes we care about (Linux fweh.h BRCMF_E_*). */
-#define	BRCM_PCI_E_SET_SSID			0
-#define	BRCM_PCI_E_JOIN			1
-#define	BRCM_PCI_E_START			2
-#define	BRCM_PCI_E_AUTH			3
-#define	BRCM_PCI_E_AUTH_IND			4
-#define	BRCM_PCI_E_DEAUTH			5
-#define	BRCM_PCI_E_DEAUTH_IND		6
-#define	BRCM_PCI_E_ASSOC			7
-#define	BRCM_PCI_E_ASSOC_IND		8
-#define	BRCM_PCI_E_REASSOC			9
-#define	BRCM_PCI_E_REASSOC_IND		10
-#define	BRCM_PCI_E_DISASSOC			11
-#define	BRCM_PCI_E_DISASSOC_IND		12
-#define	BRCM_PCI_E_LINK			16
-#define	BRCM_PCI_E_MIC_ERROR		17
-#define	BRCM_PCI_E_ROAM			19
-#define	BRCM_PCI_E_PMKID_CACHE		21
-#define	BRCM_PCI_E_EAPOL_MSG		25
-#define	BRCM_PCI_E_SCAN_COMPLETE		26
-#define	BRCM_PCI_E_JOIN_START		36
-#define	BRCM_PCI_E_ROAM_START		37
-#define	BRCM_PCI_E_ASSOC_START		38
-#define	BRCM_PCI_E_PSK_SUP			46
-#define	BRCM_PCI_E_COUNTRY_CODE_CHANGED	47
-#define	BRCM_PCI_E_ACTION_FRAME		59
-#define	BRCM_PCI_E_ESCAN_RESULT		69
-#define	BRCM_PCI_E_PROBERESP_MSG		71
-#define	BRCM_PCI_E_FIFO_CREDIT_MAP		74
-#define	BRCM_PCI_E_IF			54
-#define	BRCM_PCI_E_RSSI			56
-#define	BRCM_PCI_E_TRACE		52
-#define	BRCM_PCI_E_BEACON_RX		15
-#define	BRCM_PCI_E_TXFAIL		20
-#define	BRCM_PCI_E_RADIO		40
-#define	BRCM_PCI_E_PSM_WATCHDOG	41
-#define	BRCM_PCI_E_LAST			139
+#define	BWFM_PCI_E_SET_SSID			0
+#define	BWFM_PCI_E_JOIN			1
+#define	BWFM_PCI_E_START			2
+#define	BWFM_PCI_E_AUTH			3
+#define	BWFM_PCI_E_AUTH_IND			4
+#define	BWFM_PCI_E_DEAUTH			5
+#define	BWFM_PCI_E_DEAUTH_IND		6
+#define	BWFM_PCI_E_ASSOC			7
+#define	BWFM_PCI_E_ASSOC_IND		8
+#define	BWFM_PCI_E_REASSOC			9
+#define	BWFM_PCI_E_REASSOC_IND		10
+#define	BWFM_PCI_E_DISASSOC			11
+#define	BWFM_PCI_E_DISASSOC_IND		12
+#define	BWFM_PCI_E_LINK			16
+#define	BWFM_PCI_E_MIC_ERROR		17
+#define	BWFM_PCI_E_ROAM			19
+#define	BWFM_PCI_E_PMKID_CACHE		21
+#define	BWFM_PCI_E_EAPOL_MSG		25
+#define	BWFM_PCI_E_SCAN_COMPLETE		26
+#define	BWFM_PCI_E_JOIN_START		36
+#define	BWFM_PCI_E_ROAM_START		37
+#define	BWFM_PCI_E_ASSOC_START		38
+#define	BWFM_PCI_E_PSK_SUP			46
+#define	BWFM_PCI_E_COUNTRY_CODE_CHANGED	47
+#define	BWFM_PCI_E_ACTION_FRAME		59
+#define	BWFM_PCI_E_ESCAN_RESULT		69
+#define	BWFM_PCI_E_PROBERESP_MSG		71
+#define	BWFM_PCI_E_FIFO_CREDIT_MAP		74
+#define	BWFM_PCI_E_IF			54
+#define	BWFM_PCI_E_RSSI			56
+#define	BWFM_PCI_E_TRACE		52
+#define	BWFM_PCI_E_BEACON_RX		15
+#define	BWFM_PCI_E_TXFAIL		20
+#define	BWFM_PCI_E_RADIO		40
+#define	BWFM_PCI_E_PSM_WATCHDOG	41
+#define	BWFM_PCI_E_LAST			139
 
 /* Status codes (subset). */
-#define	BRCM_PCI_E_STATUS_SUCCESS		0
-#define	BRCM_PCI_E_STATUS_FAIL		1
-#define	BRCM_PCI_E_STATUS_TIMEOUT		2
-#define	BRCM_PCI_E_STATUS_NO_NETWORKS	3
-#define	BRCM_PCI_E_STATUS_ABORT		4
-#define	BRCM_PCI_E_STATUS_NO_ACK		5
-#define	BRCM_PCI_E_STATUS_UNSOLICITED	6
-#define	BRCM_PCI_E_STATUS_ATTEMPT		7
-#define	BRCM_PCI_E_STATUS_PARTIAL		8
-#define	BRCM_PCI_E_STATUS_NEWSCAN		9
-#define	BRCM_PCI_E_STATUS_NEWASSOC		10
-#define	BRCM_PCI_E_STATUS_ERROR		16
+#define	BWFM_PCI_E_STATUS_SUCCESS		0
+#define	BWFM_PCI_E_STATUS_FAIL		1
+#define	BWFM_PCI_E_STATUS_TIMEOUT		2
+#define	BWFM_PCI_E_STATUS_NO_NETWORKS	3
+#define	BWFM_PCI_E_STATUS_ABORT		4
+#define	BWFM_PCI_E_STATUS_NO_ACK		5
+#define	BWFM_PCI_E_STATUS_UNSOLICITED	6
+#define	BWFM_PCI_E_STATUS_ATTEMPT		7
+#define	BWFM_PCI_E_STATUS_PARTIAL		8
+#define	BWFM_PCI_E_STATUS_NEWSCAN		9
+#define	BWFM_PCI_E_STATUS_NEWASSOC		10
+#define	BWFM_PCI_E_STATUS_ERROR		16
 
 /* Flags in event_msg->flags. */
-#define	BRCM_EVENT_MSG_LINK		0x01
-#define	BRCM_EVENT_MSG_FLUSHTXQ		0x02
-#define	BRCM_EVENT_MSG_GROUP		0x04
+#define	BWFM_EVENT_MSG_LINK		0x01
+#define	BWFM_EVENT_MSG_FLUSHTXQ		0x02
+#define	BWFM_EVENT_MSG_GROUP		0x04
 
 /* Offsets inside the raw payload buffer we posted to fw. */
-#define	BRCM_EVT_OFFSET_ETHHDR		0
-#define	BRCM_EVT_OFFSET_BCM_ETHHDR	14	/* eth hdr size */
-#define	BRCM_EVT_OFFSET_MSG		24	/* +brcm_ethhdr (10) */
-#define	BRCM_EVT_OFFSET_DATA		72	/* +brcm_event_msg (48) */
+#define	BWFM_EVT_OFFSET_ETHHDR		0
+#define	BWFM_EVT_OFFSET_BCM_ETHHDR	14	/* eth hdr size */
+#define	BWFM_EVT_OFFSET_MSG		24	/* +bwfm_ethhdr (10) */
+#define	BWFM_EVT_OFFSET_DATA		72	/* +bwfm_event_msg (48) */
 
 /* Flowring IDs — fw sees `local_id + IDSTART`. */
-#define	BRCM_H2D_MSGRING_FLOWRING_IDSTART	2
+#define	BWFM_H2D_MSGRING_FLOWRING_IDSTART	2
 
 /* TX_POST flags (Linux msgbuf.c:62-65). */
-#define	BRCM_MSGBUF_PKT_FLAGS_FRAME_802_3	0x01
-#define	BRCM_MSGBUF_PKT_FLAGS_PRIO_SHIFT	5
+#define	BWFM_MSGBUF_PKT_FLAGS_FRAME_802_3	0x01
+#define	BWFM_MSGBUF_PKT_FLAGS_PRIO_SHIFT	5
 
 /* Max concurrent outstanding TX packets — pktid table depth. */
-#define	BRCM_MSGBUF_MAX_PKTID			1024
+#define	BWFM_MSGBUF_MAX_PKTID			1024
 
 /* -----------------------------------------------------------------
  * Ring buffers and msgbuf state.
@@ -461,7 +461,7 @@ struct brcm_bcm_event_msg {
  * address handed to the firmware, vaddr the CPU pointer used to
  * enqueue and dequeue.
  * ----------------------------------------------------------------- */
-struct brcm_pci_dma_buf {
+struct bwfm_pci_dma_buf {
 	bus_dma_tag_t	tag;
 	bus_dmamap_t	map;
 	void		*vaddr;
@@ -469,7 +469,7 @@ struct brcm_pci_dma_buf {
 	size_t		size;
 };
 
-struct brcm_pci_ring {
+struct bwfm_pci_ring {
 	/* Layout state, in items (protected by lock). */
 	uint16_t	depth;
 	uint16_t	item_len;
@@ -481,7 +481,7 @@ struct brcm_pci_ring {
 	bool		inited;
 	bool		was_full;
 
-	struct brcm_pci_dma_buf	buf;
+	struct bwfm_pci_dma_buf	buf;
 
 	/* TCM addresses of ring's r/w indices (fw-side). */
 	uint32_t	w_idx_addr;
@@ -490,7 +490,7 @@ struct brcm_pci_ring {
 	struct mtx	lock;
 
 	/* Back pointer for callback context. */
-	struct brcm_pci_msgbuf	*mb;
+	struct bwfm_pci_msgbuf	*mb;
 };
 
 /*
@@ -499,21 +499,21 @@ struct brcm_pci_ring {
  * Unlike Linux there is no per-ring packet queue; net80211 queues at
  * the ifnet.
  */
-enum brcm_pci_flowring_status {
-	BRCM_FLOW_CLOSED = 0,
-	BRCM_FLOW_PENDING = 1,	/* CREATE sent, awaiting CMPLT */
-	BRCM_FLOW_OPEN = 2,
-	BRCM_FLOW_FAILED = 3,	/* fw rejected create */
+enum bwfm_pci_flowring_status {
+	BWFM_FLOW_CLOSED = 0,
+	BWFM_FLOW_PENDING = 1,	/* CREATE sent, awaiting CMPLT */
+	BWFM_FLOW_OPEN = 2,
+	BWFM_FLOW_FAILED = 3,	/* fw rejected create */
 };
-struct brcm_pci_flowring {
-	struct brcm_pci_ring	ring;		/* commonring mechanics */
+struct bwfm_pci_flowring {
+	struct bwfm_pci_ring	ring;		/* commonring mechanics */
 	uint8_t			da[6];
 	uint8_t			sa[6];
 	uint8_t			prio;
 	uint8_t			tid;
 	uint8_t			ifidx;
 	uint8_t			pad;
-	int			status;		/* brcm_pci_flowring_status */
+	int			status;		/* bwfm_pci_flowring_status */
 	int16_t			last_create_status;
 };
 
@@ -522,7 +522,7 @@ struct brcm_pci_flowring {
  * fw acks via TX_STATUS.  request_id in TX_POST is (idx + 1) so 0 =
  * "unused" (Linux msgbuf convention).
  */
-struct brcm_pci_pktid {
+struct bwfm_pci_pktid {
 	struct mbuf	*m;
 	bus_dmamap_t	 map;
 	uint64_t	 pa;
@@ -539,22 +539,22 @@ struct brcm_pci_pktid {
  * pktid in the RX_CMPLT / WL_EVENT / IOCTL_CMPLT descriptor so we
  * can look up the mbuf.
  */
-enum brcm_pci_rxpost_type {
-	BRCM_RXPOST_UNUSED = 0,
-	BRCM_RXPOST_DATA,	/* fw incoming 802.3 / 802.11 frame */
-	BRCM_RXPOST_EVENT,	/* WL_EVENT payload */
-	BRCM_RXPOST_IOCTL,	/* IOCTL response (not yet used) */
+enum bwfm_pci_rxpost_type {
+	BWFM_RXPOST_UNUSED = 0,
+	BWFM_RXPOST_DATA,	/* fw incoming 802.3 / 802.11 frame */
+	BWFM_RXPOST_EVENT,	/* WL_EVENT payload */
+	BWFM_RXPOST_IOCTL,	/* IOCTL response (not yet used) */
 };
-struct brcm_pci_rxpost {
+struct bwfm_pci_rxpost {
 	struct mbuf	*m;
 	bus_dmamap_t	 map;
 	uint64_t	 pa;
 	uint16_t	 buflen;
-	uint8_t		 type;		/* enum brcm_pci_rxpost_type */
+	uint8_t		 type;		/* enum bwfm_pci_rxpost_type */
 };
 
-struct brcm_pci_msgbuf {
-	struct brcm_pci_softc	*sc;
+struct bwfm_pci_msgbuf {
+	struct bwfm_pci_softc	*sc;
 	bool			 attached;
 
 	/* Shared-memory state read from TCM after fw boot. */
@@ -584,14 +584,14 @@ struct brcm_pci_msgbuf {
 	uint32_t		 h2d_mailbox_0;
 
 	/* The 5 fixed common rings. */
-	struct brcm_pci_ring	 rings[BRCM_NROF_COMMON_MSGRINGS];
+	struct bwfm_pci_ring	 rings[BWFM_NROF_COMMON_MSGRINGS];
 
 	/* Coherent scratch + ringupd (Linux init_scratchbuffers). */
-	struct brcm_pci_dma_buf	 scratch;
-	struct brcm_pci_dma_buf	 ringupd;
+	struct bwfm_pci_dma_buf	 scratch;
+	struct bwfm_pci_dma_buf	 ringupd;
 
 	/* Coherent IOCTL request buffer (single-outstanding, msgbuf.c). */
-	struct brcm_pci_dma_buf	 ioctbuf;
+	struct bwfm_pci_dma_buf	 ioctbuf;
 
 	/* IOCTL round-trip completion (single outstanding). */
 	struct sx		 dcmd_sx;
@@ -611,12 +611,12 @@ struct brcm_pci_msgbuf {
 	uint32_t		 flow_ringmem_next;	/* per-ring 16B slot */
 
 	/* Flowring array, size = max_flowrings.  Alloc'd at attach. */
-	struct brcm_pci_flowring *flowrings;
+	struct bwfm_pci_flowring *flowrings;
 	struct mtx		 flow_mtx;	/* protects create/status */
 	struct cv		 flow_cv;
 
-	/* Pktid table for TX (dyn-alloc size BRCM_MSGBUF_MAX_PKTID). */
-	struct brcm_pci_pktid	*pktids;
+	/* Pktid table for TX (dyn-alloc size BWFM_MSGBUF_MAX_PKTID). */
+	struct bwfm_pci_pktid	*pktids;
 	struct mtx		 pktid_mtx;
 	uint32_t		 pktid_next_hint;
 	bus_dma_tag_t		 tx_mbuf_tag;
@@ -625,7 +625,7 @@ struct brcm_pci_msgbuf {
 	 * Outstanding EAPOL TX pktids: incremented when an ethertype
 	 * 0x888e frame gets a pktid, decremented on its TX_STATUS, and
 	 * the cv is broadcast whenever the count reaches zero.
-	 * brcm_fmop_set_key waits on it before installing the PTK.
+	 * bwfm_fmop_set_key waits on it before installing the PTK.
 	 * Otherwise the key DCMD can reach the firmware ahead of M4, M4
 	 * goes out encrypted, and the AP drops it and deauthenticates.
 	 */
@@ -637,7 +637,7 @@ struct brcm_pci_msgbuf {
 	 * from tx_pktids — separate table + separate hint.  Slot 0 is
 	 * reserved (fw treats request_id 0 as "no id").
 	 */
-	struct brcm_pci_rxpost	*rxposts;
+	struct bwfm_pci_rxpost	*rxposts;
 	struct mtx		 rxpost_mtx;
 	uint32_t		 rxpost_next_hint;
 	bus_dma_tag_t		 rx_mbuf_tag;
@@ -647,7 +647,7 @@ struct brcm_pci_msgbuf {
 	uint16_t		 cur_rxbufpost;
 
 	/*
-	 * Coherent event buffer pool, BRCM_MSGBUF_MAX_EVENTBUF_POST
+	 * Coherent event buffer pool, BWFM_MSGBUF_MAX_EVENTBUF_POST
 	 * entries allocated once with bus_dmamem_alloc so the physical
 	 * address is guaranteed to satisfy the 32-bit DMA tag.  9KB mbuf
 	 * clusters can land above 4GB without a bounce buffer, which
@@ -655,14 +655,14 @@ struct brcm_pci_msgbuf {
 	 * first DCMD.  Slots live as long as the driver; pktid is the
 	 * slot index plus one.
 	 */
-	struct brcm_pci_dma_buf	 eventbufs[8];
+	struct bwfm_pci_dma_buf	 eventbufs[8];
 
 	/*
-	 * Deferred WL_EVENT queue (see struct brcm_pci_event).  The
+	 * Deferred WL_EVENT queue (see struct bwfm_pci_event).  The
 	 * interrupt path queues here and event_task drains it.
 	 */
 	struct mtx		 event_q_mtx;
-	STAILQ_HEAD(, brcm_pci_event) event_q;
+	STAILQ_HEAD(, bwfm_pci_event) event_q;
 	struct task		 event_task;
 
 	/* Statistics. */
@@ -673,7 +673,7 @@ struct brcm_pci_msgbuf {
 	 * Consecutive DCMD timeouts, reset to 0 on any success.  When it
 	 * reaches the softc's sc_crash_recover_threshold (0, i.e. off, by
 	 * default) the firmware is treated as crashed and a task runs
-	 * brcm_pci_cold_reattach().  It lives here rather than in the
+	 * bwfm_pci_cold_reattach().  It lives here rather than in the
 	 * softc so the DCMD paths can update it directly.
 	 */
 	uint32_t		 stat_dcmd_timeout_consec;
@@ -693,7 +693,7 @@ struct brcm_pci_msgbuf {
 };
 
 /* -----------------------------------------------------------------
- * Public entry points (implemented in brcm_pci_msgbuf.c).
+ * Public entry points (implemented in bwfm_pci_msgbuf.c).
  * ----------------------------------------------------------------- */
 
 /*
@@ -702,14 +702,14 @@ struct brcm_pci_msgbuf {
  * the rings, installs the interrupt handler and publishes the rings to
  * the firmware.  Returns 0 if already attached.
  */
-int	brcm_pci_msgbuf_attach(struct brcm_pci_softc *);
-void	brcm_pci_maybe_queue_crash_recover(struct brcm_pci_softc *);
+int	bwfm_pci_msgbuf_attach(struct bwfm_pci_softc *);
+void	bwfm_pci_maybe_queue_crash_recover(struct bwfm_pci_softc *);
 
 /*
  * Detach: free all coherent buffers, remove ISR.  Must be called
  * before device_detach.  Safe to call unattached.
  */
-void	brcm_pci_msgbuf_detach(struct brcm_pci_softc *);
+void	bwfm_pci_msgbuf_detach(struct bwfm_pci_softc *);
 
 /*
  * DCMD round trip: send `cmd` with `params_len` bytes, wait up to 2 s
@@ -718,7 +718,7 @@ void	brcm_pci_msgbuf_detach(struct brcm_pci_softc *);
  * firmware status.  Returns 0 on success, ETIMEDOUT if there is no
  * reply, ENXIO if msgbuf is not attached.
  */
-int	brcm_pci_msgbuf_dcmd(struct brcm_pci_softc *, uint32_t cmd,
+int	bwfm_pci_msgbuf_dcmd(struct bwfm_pci_softc *, uint32_t cmd,
 	    bool is_set, const void *params, size_t params_len,
 	    void *resp, size_t *resp_lenp, int32_t *fwerr);
 
@@ -726,11 +726,11 @@ int	brcm_pci_msgbuf_dcmd(struct brcm_pci_softc *, uint32_t cmd,
  * Create a flowring for (sa,da,prio) on ifidx.  Synchronous: sends
  * FLOW_RING_CREATE, waits up to 2 s for FLOW_RING_CREATE_CMPLT.
  * On success sets *flowid_out to the local flowring id (0-based).
- * Fw's ring id = flowid_out + BRCM_H2D_MSGRING_FLOWRING_IDSTART.
+ * Fw's ring id = flowid_out + BWFM_H2D_MSGRING_FLOWRING_IDSTART.
  * The TID sent is prio itself (identity map).  Linux differs: it sends
  * the AC fifo from brcmf_flowring_prio2fifo[] via brcmf_flowring_tid().
  */
-int	brcm_pci_msgbuf_flowring_create(struct brcm_pci_softc *,
+int	bwfm_pci_msgbuf_flowring_create(struct bwfm_pci_softc *,
 	    const uint8_t sa[6], const uint8_t da[6], uint8_t prio,
 	    uint8_t ifidx, uint16_t *flowid_out);
 
@@ -740,64 +740,64 @@ int	brcm_pci_msgbuf_flowring_create(struct brcm_pci_softc *,
  * on error return.  ifidx is written into the TX_POST header.
  * Frame must be 802.3 with a 14-byte Ethernet header at m_data.
  */
-int	brcm_pci_msgbuf_txmbuf(struct brcm_pci_softc *, uint16_t flowid,
+int	bwfm_pci_msgbuf_txmbuf(struct bwfm_pci_softc *, uint16_t flowid,
 	    struct mbuf *m, uint8_t ifidx);
 
 /*
  * DCMD wrappers, equivalent to Linux fwil.c.  All are synchronous and
  * wait up to 2 s for the reply.
  */
-int	brcm_pci_msgbuf_dcmd_set_int(struct brcm_pci_softc *, uint32_t cmd,
+int	bwfm_pci_msgbuf_dcmd_set_int(struct bwfm_pci_softc *, uint32_t cmd,
 	    uint32_t val);
-int	brcm_pci_msgbuf_dcmd_get_int(struct brcm_pci_softc *, uint32_t cmd,
+int	bwfm_pci_msgbuf_dcmd_get_int(struct bwfm_pci_softc *, uint32_t cmd,
 	    uint32_t *val);
-int	brcm_pci_msgbuf_dcmd_set_var(struct brcm_pci_softc *, const char *name,
+int	bwfm_pci_msgbuf_dcmd_set_var(struct bwfm_pci_softc *, const char *name,
 	    const void *data, size_t datalen);
-int	brcm_pci_msgbuf_dcmd_get_var(struct brcm_pci_softc *, const char *name,
+int	bwfm_pci_msgbuf_dcmd_get_var(struct bwfm_pci_softc *, const char *name,
 	    void *data, size_t *datalenp);
 
 /* Well-known DCMD command numbers (Linux fwil.h). */
-#define	BRCM_C_GET_VERSION	1
-#define	BRCM_C_UP		2
-#define	BRCM_C_DOWN		3
-#define	BRCM_C_GET_INFRA	19
-#define	BRCM_C_SET_INFRA	20
-#define	BRCM_C_GET_SSID		25
-#define	BRCM_C_SET_SSID		26
-#define	BRCM_C_DISASSOC		52
-#define	BRCM_C_SET_COUNTRY	84
-#define	BRCM_C_SET_PM		86
-#define	BRCM_C_GET_WSEC		133
-#define	BRCM_C_SET_WSEC		134
-#define	BRCM_C_GET_BSS_INFO	136
-#define	BRCM_C_GET_VAR		262
-#define	BRCM_C_SET_VAR		263
+#define	BWFM_C_GET_VERSION	1
+#define	BWFM_C_UP		2
+#define	BWFM_C_DOWN		3
+#define	BWFM_C_GET_INFRA	19
+#define	BWFM_C_SET_INFRA	20
+#define	BWFM_C_GET_SSID		25
+#define	BWFM_C_SET_SSID		26
+#define	BWFM_C_DISASSOC		52
+#define	BWFM_C_SET_COUNTRY	84
+#define	BWFM_C_SET_PM		86
+#define	BWFM_C_GET_WSEC		133
+#define	BWFM_C_SET_WSEC		134
+#define	BWFM_C_GET_BSS_INFO	136
+#define	BWFM_C_GET_VAR		262
+#define	BWFM_C_SET_VAR		263
 
 /*
  * Interrupt filter, installed with bus_setup_intr as a filter and
  * ithread pair.  Reads MAILBOXINT, acks the D2H bits and schedules the
  * ithread.
  */
-int	brcm_pci_msgbuf_isr_filter(void *arg);
+int	bwfm_pci_msgbuf_isr_filter(void *arg);
 
 /* ithread handler: drains the D2H completion rings. */
-void	brcm_pci_msgbuf_isr_thread(void *arg);
+void	bwfm_pci_msgbuf_isr_thread(void *arg);
 
 /* -----------------------------------------------------------------
- * Accessors provided by if_brcm_pci.c for brcm_pci_msgbuf.c, so the
+ * Accessors provided by if_bwfm_pci.c for bwfm_pci_msgbuf.c, so the
  * msgbuf layer does not depend on the transport softc definition.
  * ----------------------------------------------------------------- */
-struct brcm_pci_softc;
-uint32_t	brcm_pci_msgbuf_pcie2_base(struct brcm_pci_softc *);
-void		brcm_pci_msgbuf_set_window(struct brcm_pci_softc *, uint32_t);
-struct resource *brcm_pci_msgbuf_bar0(struct brcm_pci_softc *);
-struct resource *brcm_pci_msgbuf_bar2(struct brcm_pci_softc *);
-bus_space_tag_t	brcm_pci_msgbuf_bar0_tag(struct brcm_pci_softc *);
-bus_space_handle_t brcm_pci_msgbuf_bar0_handle(struct brcm_pci_softc *);
-bus_space_tag_t	brcm_pci_msgbuf_bar2_tag(struct brcm_pci_softc *);
-bus_space_handle_t brcm_pci_msgbuf_bar2_handle(struct brcm_pci_softc *);
-device_t	brcm_pci_msgbuf_dev(struct brcm_pci_softc *);
-int		brcm_pci_msgbuf_debug(struct brcm_pci_softc *);
+struct bwfm_pci_softc;
+uint32_t	bwfm_pci_msgbuf_pcie2_base(struct bwfm_pci_softc *);
+void		bwfm_pci_msgbuf_set_window(struct bwfm_pci_softc *, uint32_t);
+struct resource *bwfm_pci_msgbuf_bar0(struct bwfm_pci_softc *);
+struct resource *bwfm_pci_msgbuf_bar2(struct bwfm_pci_softc *);
+bus_space_tag_t	bwfm_pci_msgbuf_bar0_tag(struct bwfm_pci_softc *);
+bus_space_handle_t bwfm_pci_msgbuf_bar0_handle(struct bwfm_pci_softc *);
+bus_space_tag_t	bwfm_pci_msgbuf_bar2_tag(struct bwfm_pci_softc *);
+bus_space_handle_t bwfm_pci_msgbuf_bar2_handle(struct bwfm_pci_softc *);
+device_t	bwfm_pci_msgbuf_dev(struct bwfm_pci_softc *);
+int		bwfm_pci_msgbuf_debug(struct bwfm_pci_softc *);
 
 /*
  * D3/D0 mailbox helpers.  send_mb_data writes htod_val into the TCM
@@ -806,17 +806,17 @@ int		brcm_pci_msgbuf_debug(struct brcm_pci_softc *);
  * polls the dtoh slot for `expect` for up to `timeout_ms` ms and
  * returns 0 on a match, ETIMEDOUT otherwise.
  */
-int	brcm_pci_msgbuf_send_mb_data(struct brcm_pci_softc *,
+int	bwfm_pci_msgbuf_send_mb_data(struct bwfm_pci_softc *,
 	    uint32_t htod_val);
-int	brcm_pci_msgbuf_wait_mb_ack(struct brcm_pci_softc *,
+int	bwfm_pci_msgbuf_wait_mb_ack(struct bwfm_pci_softc *,
 	    uint32_t expect, int timeout_ms);
 
 /*
  * Block up to timeout_ms until every outstanding EAPOL TX pktid has
  * had a TX_STATUS.  Returns 0 on drain, ETIMEDOUT if the deadline
- * passes first.  Used from brcm_fmop_set_key on PTK install.
+ * passes first.  Used from bwfm_fmop_set_key on PTK install.
  */
-int	brcm_pci_msgbuf_wait_eapol_drain(struct brcm_pci_softc *,
+int	bwfm_pci_msgbuf_wait_eapol_drain(struct bwfm_pci_softc *,
 	    int timeout_ms);
 
 /*
@@ -825,29 +825,29 @@ int	brcm_pci_msgbuf_wait_eapol_drain(struct brcm_pci_softc *,
  * CLOSED so it can be reallocated on a subsequent create.  Returns
  * ETIMEDOUT if fw doesn't ack, ENXIO if msgbuf is down.
  */
-int	brcm_pci_msgbuf_flowring_delete(struct brcm_pci_softc *,
+int	bwfm_pci_msgbuf_flowring_delete(struct bwfm_pci_softc *,
 	    uint16_t local_id);
 
 /*
- * Iterate every host-side flowring in status BRCM_FLOW_OPEN and
- * synchronously delete each one (see brcm_pci_msgbuf_flowring_delete).
+ * Iterate every host-side flowring in status BWFM_FLOW_OPEN and
+ * synchronously delete each one (see bwfm_pci_msgbuf_flowring_delete).
  * Slots are marked CLOSED on success; failures are logged and skipped
  * so partial success is possible.
  */
-void	brcm_pci_msgbuf_flowring_delete_all(struct brcm_pci_softc *);
-uint32_t	brcm_pci_msgbuf_rambase(struct brcm_pci_softc *);
-uint32_t	brcm_pci_msgbuf_ramsize(struct brcm_pci_softc *);
-struct brcm_pci_msgbuf	*brcm_pci_msgbuf_state(struct brcm_pci_softc *);
+void	bwfm_pci_msgbuf_flowring_delete_all(struct bwfm_pci_softc *);
+uint32_t	bwfm_pci_msgbuf_rambase(struct bwfm_pci_softc *);
+uint32_t	bwfm_pci_msgbuf_ramsize(struct bwfm_pci_softc *);
+struct bwfm_pci_msgbuf	*bwfm_pci_msgbuf_state(struct bwfm_pci_softc *);
 /* Attach the filter and ithread to sc_irq; arg is &sc->sc_msgbuf. */
-int	brcm_pci_msgbuf_bind_intr(struct brcm_pci_softc *,
+int	bwfm_pci_msgbuf_bind_intr(struct bwfm_pci_softc *,
 	    driver_filter_t *filter, driver_intr_t *thread, void *arg);
-void	brcm_pci_msgbuf_unbind_intr(struct brcm_pci_softc *);
+void	bwfm_pci_msgbuf_unbind_intr(struct bwfm_pci_softc *);
 /*
- * Deliver a decoded WL_EVENT payload to the brcm.c FullMAC core.
- * Implemented in if_brcm_pci.c so this header stays independent of
- * brcmvar.h.
+ * Deliver a decoded WL_EVENT payload to the bwfm.c FullMAC core.
+ * Implemented in if_bwfm_pci.c so this header stays independent of
+ * bwfmvar.h.
  */
-void	brcm_pci_msgbuf_event_up(struct brcm_pci_softc *,
+void	bwfm_pci_msgbuf_event_up(struct bwfm_pci_softc *,
 	    const uint8_t *payload, size_t len);
 
 /*
@@ -855,16 +855,16 @@ void	brcm_pci_msgbuf_event_up(struct brcm_pci_softc *,
  * (uint16_t)-1 if none.  Used by the txdata path to skip the
  * create-then-fail cycle when the flow already exists.
  */
-uint16_t	brcm_pci_msgbuf_flowring_lookup(struct brcm_pci_softc *,
+uint16_t	bwfm_pci_msgbuf_flowring_lookup(struct bwfm_pci_softc *,
 		    const uint8_t da[6], uint8_t prio);
 
 /*
- * Hand an RX data mbuf to net80211.  The if_brcm_pci.c side finds the
- * shared brcm_softc and delivers the 802.3 frame with
+ * Hand an RX data mbuf to net80211.  The if_bwfm_pci.c side finds the
+ * shared bwfm_softc and delivers the 802.3 frame with
  * ieee80211_vap_deliver_data, or ieee80211_fmac_eapol_rx for EAPOL.
  * Always consumes `m`.
  */
-void	brcm_pci_msgbuf_rx_up(struct brcm_pci_softc *, struct mbuf *m,
+void	bwfm_pci_msgbuf_rx_up(struct bwfm_pci_softc *, struct mbuf *m,
 	    int rssi_dbm);
 
-#endif /* _DEV_BRCM_BRCM_PCI_MSGBUF_H_ */
+#endif /* _DEV_BWFM_BWFM_PCI_MSGBUF_H_ */

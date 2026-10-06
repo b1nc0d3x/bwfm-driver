@@ -23,7 +23,7 @@
  * SDPCM (SDIO Packet Common Multiplexer) protocol layer
  * for Broadcom fullmac firmware over SDIO.
  *
- * Sits on top of the brcm_sdio backplane primitives, below
+ * Sits on top of the bwfm_sdio backplane primitives, below
  * the brcmfmac-style iovar / BCDC layer.
  *
  * Wire frame layout (each direction):
@@ -45,8 +45,8 @@
  * host drains it with CMD53 reads.
  */
 
-#ifndef _BRCM_SDPCM_H_
-#define _BRCM_SDPCM_H_
+#ifndef _BWFM_SDPCM_H_
+#define _BWFM_SDPCM_H_
 
 #include <sys/types.h>
 #include <sys/_lock.h>
@@ -56,25 +56,25 @@
 #include <sys/queue.h>
 
 /* Protocol versions written into TOSBMAILBOXDATA. */
-#define BRCM_SDPCM_PROT_VERSION			4
-#define BRCM_SDPCM_PROT_VERSION_SHIFT		16
-#define BRCM_SDPCM_PROT_VERSION_MASK		0x00ff0000
+#define BWFM_SDPCM_PROT_VERSION			4
+#define BWFM_SDPCM_PROT_VERSION_SHIFT		16
+#define BWFM_SDPCM_PROT_VERSION_MASK		0x00ff0000
 
 /* sdpcm_shared structure version (fw <-> host shared state). */
-#define BRCM_SDPCM_SHARED_VERSION		0x0003
-#define BRCM_SDPCM_SHARED_VERSION_MASK		0x00ff
-#define BRCM_SDPCM_SHARED_ASSERT_BUILT		0x0100
-#define BRCM_SDPCM_SHARED_ASSERT		0x0200
-#define BRCM_SDPCM_SHARED_TRAP			0x0400
+#define BWFM_SDPCM_SHARED_VERSION		0x0003
+#define BWFM_SDPCM_SHARED_VERSION_MASK		0x00ff
+#define BWFM_SDPCM_SHARED_ASSERT_BUILT		0x0100
+#define BWFM_SDPCM_SHARED_ASSERT		0x0200
+#define BWFM_SDPCM_SHARED_TRAP			0x0400
 
 /* Hardware header. Always present. Added by the SDIO core. */
-struct brcm_sdpcm_hwhdr {
+struct bwfm_sdpcm_hwhdr {
 	uint16_t	frmlen;	/* full frame length, all headers included */
 	uint16_t	cksum;	/* ~frmlen — sanity check on frame length */
 } __packed;
 
 /* Extra hardware header on newer chips (like BCM43455). */
-struct brcm_sdpcm_hwexthdr {
+struct bwfm_sdpcm_hwexthdr {
 	uint16_t	pktlen;	/* payload length */
 	uint8_t		res0;	/* reserved */
 	uint8_t		flags;	/* header flags */
@@ -83,15 +83,15 @@ struct brcm_sdpcm_hwexthdr {
 } __packed;
 
 /* Software header. Handles channel mux + flow control. */
-struct brcm_sdpcm_swhdr {
+struct bwfm_sdpcm_swhdr {
 	uint8_t		seqnr;	/* frame sequence number */
 	uint8_t		chanflag;	/* channel type in low bits */
-#define BRCM_SDPCM_SWHDR_CHANNEL_CONTROL	0x00
-#define BRCM_SDPCM_SWHDR_CHANNEL_EVENT		0x01
-#define BRCM_SDPCM_SWHDR_CHANNEL_DATA		0x02
-#define BRCM_SDPCM_SWHDR_CHANNEL_GLOM		0x03
-#define BRCM_SDPCM_SWHDR_CHANNEL_TEST		0x0f
-#define BRCM_SDPCM_SWHDR_CHANNEL_MASK		0x0f
+#define BWFM_SDPCM_SWHDR_CHANNEL_CONTROL	0x00
+#define BWFM_SDPCM_SWHDR_CHANNEL_EVENT		0x01
+#define BWFM_SDPCM_SWHDR_CHANNEL_DATA		0x02
+#define BWFM_SDPCM_SWHDR_CHANNEL_GLOM		0x03
+#define BWFM_SDPCM_SWHDR_CHANNEL_TEST		0x0f
+#define BWFM_SDPCM_SWHDR_CHANNEL_MASK		0x0f
 	uint8_t		nextlen;	/* hint: size of next frame */
 	uint8_t		dataoff;	/* offset to the channel payload */
 	uint8_t		flowctl;	/* flow-control flags */
@@ -100,7 +100,7 @@ struct brcm_sdpcm_swhdr {
 } __packed;
 
 /* sdpcm_shared. The last word of RAM holds a pointer to one of these. */
-struct brcm_sdpcm_shared {
+struct bwfm_sdpcm_shared {
 	uint32_t	flags;	/* status/trap flags */
 	uint32_t	trap_addr;	/* chip address of trap record */
 	uint32_t	assert_exp_addr;	/* chip address of assert expression */
@@ -114,32 +114,32 @@ struct brcm_sdpcm_shared {
 
 /*
  * EVENT channel callback types, declared here so the function
- * pointers can sit in struct brcm_sdpcm_state.  See
- * brcm_sdpcm_set_event_handler below for the contract.
+ * pointers can sit in struct bwfm_sdpcm_state.  See
+ * bwfm_sdpcm_set_event_handler below for the contract.
  *
- * event_cb gets the decoded brcm_event_msg and its data, with the
+ * event_cb gets the decoded bwfm_event_msg and its data, with the
  * BCDC and Ethernet headers stripped and fields in host byte order,
  * for in-driver event logic that doesn't need the raw bytes.
  *
  * event_rx_cb gets the raw BCDC-prefixed SDPCM payload exactly as
  * the chip sent it (BCDC header at offset 0, ether_header at
- * 4 + dataoff*4).  That is the shape brcm_rx_frame expects, so the
+ * 4 + dataoff*4).  That is the shape bwfm_rx_frame expects, so the
  * driver can wrap the bytes in an mbuf and hand them on.
  */
-struct brcm_event_msg;
-typedef void (*brcm_sdpcm_event_cb_t)(void *arg,
-	    const struct brcm_event_msg *msg, const void *data,
+struct bwfm_event_msg;
+typedef void (*bwfm_sdpcm_event_cb_t)(void *arg,
+	    const struct bwfm_event_msg *msg, const void *data,
 	    size_t datalen);
-typedef void (*brcm_sdpcm_event_rx_cb_t)(void *arg,
+typedef void (*bwfm_sdpcm_event_rx_cb_t)(void *arg,
 	    const void *body, size_t paylen);
 
 /*
- * SDPCM software state. Hangs off struct brcm_sdio_softc.
+ * SDPCM software state. Hangs off struct bwfm_sdio_softc.
  *
  * Tracks TX/RX sequence numbers, queues for ctrl messages
  * waiting on a fw response, and mailbox state.
  */
-struct brcm_sdpcm_state {
+struct bwfm_sdpcm_state {
 	struct mtx	sp_lock;	/* protects this state */
 
 	/* TX seq counter. Bumped per TX frame, mod 256. */
@@ -151,12 +151,12 @@ struct brcm_sdpcm_state {
 	 * number is before max_seq, which it publishes in the swhdr of every
 	 * frame it sends (maxseqnr).  credit_seen is false until the first
 	 * one arrives; fc_off is the firmware's flow-control "stop" from
-	 * the host mailbox.  See brcm_sdpcm_tx_credit().
+	 * the host mailbox.  See bwfm_sdpcm_tx_credit().
 	 */
 	uint8_t		max_seq;
 	bool		credit_seen;
 	bool		fc_off;
-	/* Statistics, exported as dev.brcm.N.sdio_stats. */
+	/* Statistics, exported as dev.bwfm.N.sdio_stats. */
 	uint32_t	max_seq_updates;	/* credit values taken from rx */
 	uint32_t	data_tx;		/* data frames sent */
 	uint32_t	window_violations;	/* data frames sent past max_seq */
@@ -167,7 +167,7 @@ struct brcm_sdpcm_state {
 	 */
 	uint16_t	bcdc_reqid;
 
-	/* BRCM_TOHOSTMBOX_FWREADY seen in TOHOSTMAILBOXDATA. */
+	/* BWFM_TOHOSTMBOX_FWREADY seen in TOHOSTMAILBOXDATA. */
 	int		fw_ready;
 
 	/*
@@ -175,7 +175,7 @@ struct brcm_sdpcm_state {
 	 * in the last word of RAM (ram_base + ramsize - 4).
 	 */
 	uint32_t	shared_addr;
-	struct brcm_sdpcm_shared shared;	/* local copy of the shared block */
+	struct bwfm_sdpcm_shared shared;	/* local copy of the shared block */
 
 	/* Set during free to wake waiters and refuse new requests. */
 	int		dying;
@@ -197,13 +197,13 @@ struct brcm_sdpcm_state {
 	uint16_t	f2_blksize;
 
 	/*
-	 * EVENT channel callbacks, set via brcm_sdpcm_set_event_handler
-	 * and brcm_sdpcm_set_event_rx and read in rx_frames.  Either or
+	 * EVENT channel callbacks, set via bwfm_sdpcm_set_event_handler
+	 * and bwfm_sdpcm_set_event_rx and read in rx_frames.  Either or
 	 * both may be installed; NULL means the frame is not dispatched.
 	 */
-	brcm_sdpcm_event_cb_t		event_cb;
+	bwfm_sdpcm_event_cb_t		event_cb;
 	void				*event_arg;
-	brcm_sdpcm_event_rx_cb_t	event_rx_cb;
+	bwfm_sdpcm_event_rx_cb_t	event_rx_cb;
 	void				*event_rx_arg;
 };
 
@@ -215,43 +215,43 @@ struct brcm_sdpcm_state {
  * flow-control state changed, and I_HMB_FC_STATE is that state (set:
  * stop sending data).
  */
-#define	BRCM_SD_REG_TOSBMAILBOX		0x040
-#define	BRCM_SD_REG_TOHOSTMAILBOX	0x044
-#define	BRCM_SD_REG_TOSBMAILBOXDATA	0x048
-#define	BRCM_SD_REG_TOHOSTMAILBOXDATA	0x04c
-#define	BRCM_I_HMB_FC_STATE		(1u << 4)
-#define	BRCM_I_HMB_FC_CHANGE		(1u << 5)
-#define	BRCM_I_HMB_FRAME_IND		(1u << 6)
-#define	BRCM_I_HMB_HOST_INT		(1u << 7)
-#define	BRCM_SMB_NAK			(1u << 0)
-#define	BRCM_SMB_INT_ACK		(1u << 1)
+#define	BWFM_SD_REG_TOSBMAILBOX		0x040
+#define	BWFM_SD_REG_TOHOSTMAILBOX	0x044
+#define	BWFM_SD_REG_TOSBMAILBOXDATA	0x048
+#define	BWFM_SD_REG_TOHOSTMAILBOXDATA	0x04c
+#define	BWFM_I_HMB_FC_STATE		(1u << 4)
+#define	BWFM_I_HMB_FC_CHANGE		(1u << 5)
+#define	BWFM_I_HMB_FRAME_IND		(1u << 6)
+#define	BWFM_I_HMB_HOST_INT		(1u << 7)
+#define	BWFM_SMB_NAK			(1u << 0)
+#define	BWFM_SMB_INT_ACK		(1u << 1)
 
 /* Mailbox bits (host side reads SDPCMD_TOHOSTMAILBOXDATA). */
-#define BRCM_TOHOSTMBOX_NAKHANDLED	(1u << 0)
-#define BRCM_TOHOSTMBOX_DEVREADY	(1u << 1)
-#define BRCM_TOHOSTMBOX_FC		(1u << 2)
-#define BRCM_TOHOSTMBOX_FWREADY		(1u << 3)
-#define BRCM_TOHOSTMBOX_FWHALT		(1u << 4)
+#define BWFM_TOHOSTMBOX_NAKHANDLED	(1u << 0)
+#define BWFM_TOHOSTMBOX_DEVREADY	(1u << 1)
+#define BWFM_TOHOSTMBOX_FC		(1u << 2)
+#define BWFM_TOHOSTMBOX_FWREADY		(1u << 3)
+#define BWFM_TOHOSTMBOX_FWHALT		(1u << 4)
 
 /*
  * SDPCM public API.
  *
  * Takes a state pointer plus an F2 device_t directly so
- * brcm_sdpcm.c does not need to see struct brcm_sdio_softc
+ * bwfm_sdpcm.c does not need to see struct bwfm_sdio_softc
  * internals.
  *
- * The caller stores the returned state and calls brcm_sdpcm_free
+ * The caller stores the returned state and calls bwfm_sdpcm_free
  * at detach, which wakes waiters and drains ctrl_resp before
  * destroying the lock.  It also programs the SDIO backplane window
  * to the chip core whose base address, masked and OR'd with
  * SBSDIO_SB_ACCESS_2_4B_FLAG, gives `f2_addr`, and passes that
  * address in as `f2_addr`.
  *
- * brcm_sdpcm_alloc never returns NULL (uses M_WAITOK).
+ * bwfm_sdpcm_alloc never returns NULL (uses M_WAITOK).
  */
-struct brcm_sdpcm_state *brcm_sdpcm_alloc(uint32_t f2_addr,
+struct bwfm_sdpcm_state *bwfm_sdpcm_alloc(uint32_t f2_addr,
 	    uint16_t f2_blksize);
-void	brcm_sdpcm_free(struct brcm_sdpcm_state *);
+void	bwfm_sdpcm_free(struct bwfm_sdpcm_state *);
 
 /*
  * Send one control frame (usually a BCDC iovar request).  The SDPCM
@@ -259,14 +259,14 @@ void	brcm_sdpcm_free(struct brcm_sdpcm_state *);
  * small frames) and writes it with CMD53 without address increment,
  * since the chip's F2 is a fixed-address FIFO.
  */
-int	brcm_sdpcm_tx_ctrlframe(struct brcm_sdpcm_state *,
+int	bwfm_sdpcm_tx_ctrlframe(struct bwfm_sdpcm_state *,
 	    device_t f2_dev, const void *payload, size_t len);
 
 /*
  * Send an 802.3 frame on the DATA channel.  Always consumes the mbuf
  * chain, on success and failure.
  */
-int	brcm_sdpcm_tx_dataframe(struct brcm_sdpcm_state *,
+int	bwfm_sdpcm_tx_dataframe(struct bwfm_sdpcm_state *,
 	    device_t f2_dev, struct mbuf *m);
 
 /*
@@ -276,7 +276,7 @@ int	brcm_sdpcm_tx_dataframe(struct brcm_sdpcm_state *,
  * go to the event callbacks.  Returns 0 if the burst was drained
  * cleanly, or an errno on a bad frame or transport failure.
  */
-int	brcm_sdpcm_rx_frames(struct brcm_sdpcm_state *,
+int	bwfm_sdpcm_rx_frames(struct bwfm_sdpcm_state *,
 	    device_t f2_dev);
 
 /*
@@ -284,20 +284,20 @@ int	brcm_sdpcm_rx_frames(struct brcm_sdpcm_state *,
  * window and not flow-controlled.  Linux brcmfmac's data_ok().  Before
  * the first credit arrives, assume yes.
  */
-bool	brcm_sdpcm_tx_credit(struct brcm_sdpcm_state *st);
+bool	bwfm_sdpcm_tx_credit(struct bwfm_sdpcm_state *st);
 
 /*
  * Wait for the next CONTROL channel reply.  Returns an mbuf the
- * caller frees, or NULL on timeout or if brcm_sdpcm_free was called
+ * caller frees, or NULL on timeout or if bwfm_sdpcm_free was called
  * while waiting.
  */
-struct mbuf *brcm_sdpcm_wait_ctrl_resp(struct brcm_sdpcm_state *,
+struct mbuf *bwfm_sdpcm_wait_ctrl_resp(struct bwfm_sdpcm_state *,
 	    int timeout_ms);
 
 /*
  * EVENT channel callback wiring.
  *
- * Called from brcm_sdpcm_rx_frames whenever a valid BRCM
+ * Called from bwfm_sdpcm_rx_frames whenever a valid BWFM
  * EVENT frame arrives (ether_type=0x886c, OUI matches,
  * usr_subtype=EVENT). Fields in `msg` are host byte order.
  * `msg` points into a temporary buffer owned by the SDPCM
@@ -305,56 +305,56 @@ struct mbuf *brcm_sdpcm_wait_ctrl_resp(struct brcm_sdpcm_state *,
  * `data`/`datalen` cover the event-specific payload after
  * the 48-byte msg.
  *
- * Called in whatever context drives brcm_sdpcm_rx_frames.
+ * Called in whatever context drives bwfm_sdpcm_rx_frames.
  * Callbacks must be quick: parse, copy what they need and
  * return, leaving heavy work to a taskqueue.
  */
-void	brcm_sdpcm_set_event_handler(struct brcm_sdpcm_state *,
-	    brcm_sdpcm_event_cb_t cb, void *arg);
-void	brcm_sdpcm_set_event_rx(struct brcm_sdpcm_state *,
-	    brcm_sdpcm_event_rx_cb_t cb, void *arg);
+void	bwfm_sdpcm_set_event_handler(struct bwfm_sdpcm_state *,
+	    bwfm_sdpcm_event_cb_t cb, void *arg);
+void	bwfm_sdpcm_set_event_rx(struct bwfm_sdpcm_state *,
+	    bwfm_sdpcm_event_rx_cb_t cb, void *arg);
 
 /*
  * BCDC layer helpers.
  *
- * The wire definitions (struct brcm_bcdc_dcmd, BRCM_C_*,
- * BRCM_BCDC_FLAG_*) live in brcmreg.h; this header only
+ * The wire definitions (struct bwfm_bcdc_dcmd, BWFM_C_*,
+ * BWFM_BCDC_FLAG_*) live in bwfmreg.h; this header only
  * declares the builders the SDPCM layer exposes.
  *
  * Build a BCDC GET_VAR request reading the named iovar.
- * buf must hold at least sizeof(brcm_bcdc_dcmd) +
+ * buf must hold at least sizeof(bwfm_bcdc_dcmd) +
  * max(strlen(name)+1, resp_len) bytes. Returns total bytes
  * written (header + payload), or 0 on argument error.
  *
  * Pass resp_len = expected response size. The response from
  * fw overwrites the variable-name area with the value.
  */
-size_t	brcm_bcdc_build_getvar(void *buf, size_t bufsz,
+size_t	bwfm_bcdc_build_getvar(void *buf, size_t bufsz,
 	    const char *name, size_t resp_len, uint16_t id_tag);
 
 /*
  * Build a BCDC SET_VAR request writing the named iovar.
  *
- * buf must hold at least sizeof(brcm_bcdc_dcmd) +
+ * buf must hold at least sizeof(bwfm_bcdc_dcmd) +
  * strlen(name)+1 + vallen bytes. Returns total bytes
  * written, or 0 on argument error.
  */
-size_t	brcm_bcdc_build_setvar(void *buf, size_t bufsz,
+size_t	bwfm_bcdc_build_setvar(void *buf, size_t bufsz,
 	    const char *name, const void *val, size_t vallen,
 	    uint16_t id_tag);
 
 /*
  * Build a raw BCDC dcmd request.
  *
- * For BRCM_C_* opcodes that aren't iovars (BRCM_C_UP,
- * BRCM_C_DOWN, BRCM_C_DISASSOC, etc.). buf must hold
- * sizeof(brcm_bcdc_dcmd) + vallen bytes. If is_set is
- * non-zero, the SET flag is added (most BRCM_C_* opcodes
+ * For BWFM_C_* opcodes that aren't iovars (BWFM_C_UP,
+ * BWFM_C_DOWN, BWFM_C_DISASSOC, etc.). buf must hold
+ * sizeof(bwfm_bcdc_dcmd) + vallen bytes. If is_set is
+ * non-zero, the SET flag is added (most BWFM_C_* opcodes
  * are SETs that take no value; pass val=NULL vallen=0).
  * Returns total bytes written, or 0 on argument error.
  */
-size_t	brcm_bcdc_build_dcmd(void *buf, size_t bufsz,
+size_t	bwfm_bcdc_build_dcmd(void *buf, size_t bufsz,
 	    uint32_t cmd_id, const void *val, size_t vallen,
 	    int is_set, uint16_t id_tag);
 
-#endif /* _BRCM_SDPCM_H_ */
+#endif /* _BWFM_SDPCM_H_ */

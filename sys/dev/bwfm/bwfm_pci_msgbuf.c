@@ -10,7 +10,7 @@
  * memory, and runs dcmds and iovars through IOCTLPTR requests on the
  * control-submit ring.  The interrupt path drains the control, TX and
  * RX completion rings, hands received frames and firmware events to
- * brcm.c, and wakes waiting dcmds.  Ring indices are kept in chip RAM.
+ * bwfm.c, and wakes waiting dcmds.  Ring indices are kept in chip RAM.
  *
  * The protocol follows Linux brcmfmac msgbuf.c and commonring.c
  * (Broadcom); the code was written for this driver.
@@ -40,19 +40,19 @@
 
 #include <net/ethernet.h>
 
-#include "brcm_pci_msgbuf.h"
+#include "bwfm_pci_msgbuf.h"
 
 /* Local shortcuts. */
-#define	DEV(mb)		brcm_pci_msgbuf_dev((mb)->sc)
-#define	DBG(mb)		brcm_pci_msgbuf_debug((mb)->sc)
-#define	BAR0T(mb)	brcm_pci_msgbuf_bar0_tag((mb)->sc)
-#define	BAR0H(mb)	brcm_pci_msgbuf_bar0_handle((mb)->sc)
-#define	BAR2T(mb)	brcm_pci_msgbuf_bar2_tag((mb)->sc)
-#define	BAR2H(mb)	brcm_pci_msgbuf_bar2_handle((mb)->sc)
+#define	DEV(mb)		bwfm_pci_msgbuf_dev((mb)->sc)
+#define	DBG(mb)		bwfm_pci_msgbuf_debug((mb)->sc)
+#define	BAR0T(mb)	bwfm_pci_msgbuf_bar0_tag((mb)->sc)
+#define	BAR0H(mb)	bwfm_pci_msgbuf_bar0_handle((mb)->sc)
+#define	BAR2T(mb)	bwfm_pci_msgbuf_bar2_tag((mb)->sc)
+#define	BAR2H(mb)	bwfm_pci_msgbuf_bar2_handle((mb)->sc)
 
 /*
  * Debug print, silent by default.  Gated on the shared sc_debug like
- * DPRINTF() in brcmvar.h; level 0 fires when sc_debug > 0.
+ * DPRINTF() in bwfmvar.h; level 0 fires when sc_debug > 0.
  */
 #define	MDPRINTF(mb, level, ...)	do {				\
 	if (DBG(mb) > (level))						\
@@ -65,45 +65,45 @@
  * TCM (BAR2) accessors.  BAR2 maps TCM directly, so no window is needed.
  */
 static inline uint16_t
-tcm_read16(struct brcm_pci_msgbuf *mb, uint32_t off)
+tcm_read16(struct bwfm_pci_msgbuf *mb, uint32_t off)
 {
 	return (bus_space_read_2(BAR2T(mb), BAR2H(mb), off));
 }
 
 static inline uint32_t
-tcm_read32(struct brcm_pci_msgbuf *mb, uint32_t off)
+tcm_read32(struct bwfm_pci_msgbuf *mb, uint32_t off)
 {
 	return (bus_space_read_4(BAR2T(mb), BAR2H(mb), off));
 }
 
 static inline void
-tcm_write16(struct brcm_pci_msgbuf *mb, uint32_t off, uint16_t val)
+tcm_write16(struct bwfm_pci_msgbuf *mb, uint32_t off, uint16_t val)
 {
 	bus_space_write_2(BAR2T(mb), BAR2H(mb), off, val);
 }
 
 static inline void
-tcm_write32(struct brcm_pci_msgbuf *mb, uint32_t off, uint32_t val)
+tcm_write32(struct bwfm_pci_msgbuf *mb, uint32_t off, uint32_t val)
 {
 	bus_space_write_4(BAR2T(mb), BAR2H(mb), off, val);
 }
 
 /*
  * PCIe2 core register accessors.  These point the BAR0 window at the
- * PCIe2 core first.  There is no explicit window lock: if_brcm_pci
+ * PCIe2 core first.  There is no explicit window lock: if_bwfm_pci
  * serializes its own window users, and msgbuf has a single caller.
  */
 static inline uint32_t
-pcie2_read32(struct brcm_pci_msgbuf *mb, uint32_t off)
+pcie2_read32(struct bwfm_pci_msgbuf *mb, uint32_t off)
 {
-	brcm_pci_msgbuf_set_window(mb->sc, mb->pcie2_base);
+	bwfm_pci_msgbuf_set_window(mb->sc, mb->pcie2_base);
 	return (bus_space_read_4(BAR0T(mb), BAR0H(mb), off));
 }
 
 static inline void
-pcie2_write32(struct brcm_pci_msgbuf *mb, uint32_t off, uint32_t val)
+pcie2_write32(struct bwfm_pci_msgbuf *mb, uint32_t off, uint32_t val)
 {
-	brcm_pci_msgbuf_set_window(mb->sc, mb->pcie2_base);
+	bwfm_pci_msgbuf_set_window(mb->sc, mb->pcie2_base);
 	bus_space_write_4(BAR0T(mb), BAR0H(mb), off, val);
 }
 
@@ -122,8 +122,8 @@ dma_buf_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 }
 
 static int
-brcm_pci_msgbuf_dma_alloc(struct brcm_pci_msgbuf *mb,
-    struct brcm_pci_dma_buf *buf, size_t size, const char *tag)
+bwfm_pci_msgbuf_dma_alloc(struct bwfm_pci_msgbuf *mb,
+    struct bwfm_pci_dma_buf *buf, size_t size, const char *tag)
 {
 	int error;
 
@@ -167,8 +167,8 @@ brcm_pci_msgbuf_dma_alloc(struct brcm_pci_msgbuf *mb,
 }
 
 static void
-brcm_pci_msgbuf_dma_free(struct brcm_pci_msgbuf *mb __unused,
-    struct brcm_pci_dma_buf *buf)
+bwfm_pci_msgbuf_dma_free(struct bwfm_pci_msgbuf *mb __unused,
+    struct bwfm_pci_dma_buf *buf)
 {
 	if (buf->tag == NULL)
 		return;
@@ -188,11 +188,11 @@ brcm_pci_msgbuf_dma_free(struct brcm_pci_msgbuf *mb __unused,
  * Common ring mechanics.  Each ring has its own MTX_DEF mutex.
  */
 static void
-ring_config(struct brcm_pci_ring *ring, uint16_t depth, uint16_t item_len,
-    struct brcm_pci_msgbuf *mb)
+ring_config(struct bwfm_pci_ring *ring, uint16_t depth, uint16_t item_len,
+    struct bwfm_pci_msgbuf *mb)
 {
 	if (!ring->inited) {
-		mtx_init(&ring->lock, "brcm_pci_ring", NULL, MTX_DEF);
+		mtx_init(&ring->lock, "bwfm_pci_ring", NULL, MTX_DEF);
 		ring->inited = true;
 	}
 	ring->depth = depth;
@@ -206,41 +206,41 @@ ring_config(struct brcm_pci_ring *ring, uint16_t depth, uint16_t item_len,
 
 /* Publish our w_ptr (producer) to fw via the 16-bit TCM index. */
 static void
-ring_publish_wptr(struct brcm_pci_ring *ring)
+ring_publish_wptr(struct bwfm_pci_ring *ring)
 {
 	tcm_write16(ring->mb, ring->w_idx_addr, ring->w_ptr);
 }
 
 /* Publish our r_ptr (consumer) to fw via TCM index. */
 static void
-ring_publish_rptr(struct brcm_pci_ring *ring)
+ring_publish_rptr(struct bwfm_pci_ring *ring)
 {
 	tcm_write16(ring->mb, ring->r_idx_addr, ring->r_ptr);
 }
 
 /* Pull fw's current w_ptr for a D2H ring (fw is producer). */
 static void
-ring_pull_wptr_from_fw(struct brcm_pci_ring *ring)
+ring_pull_wptr_from_fw(struct bwfm_pci_ring *ring)
 {
 	ring->w_ptr = tcm_read16(ring->mb, ring->w_idx_addr);
 }
 
 /* Pull fw's current r_ptr for an H2D ring (fw is consumer). */
 static void
-ring_pull_rptr_from_fw(struct brcm_pci_ring *ring)
+ring_pull_rptr_from_fw(struct bwfm_pci_ring *ring)
 {
 	ring->r_ptr = tcm_read16(ring->mb, ring->r_idx_addr);
 }
 
 /* Ring the doorbell: a write to H2D_MAILBOX_0 kicks fw. */
 static void
-ring_bell(struct brcm_pci_ring *ring)
+ring_bell(struct bwfm_pci_ring *ring)
 {
-	pcie2_write32(ring->mb, BRCM_PCIE2REG_H2D_MAILBOX_0, 1);
+	pcie2_write32(ring->mb, BWFM_PCIE2REG_H2D_MAILBOX_0, 1);
 }
 
 static void *
-ring_reserve_for_write(struct brcm_pci_ring *ring)
+ring_reserve_for_write(struct bwfm_pci_ring *ring)
 {
 	uint16_t avail;
 	void *ret;
@@ -270,7 +270,7 @@ again:
 }
 
 static int
-ring_write_complete(struct brcm_pci_ring *ring)
+ring_write_complete(struct bwfm_pci_ring *ring)
 {
 	if (ring->f_ptr > ring->w_ptr)
 		ring->f_ptr = 0;
@@ -281,7 +281,7 @@ ring_write_complete(struct brcm_pci_ring *ring)
 }
 
 static void *
-ring_get_read_ptr(struct brcm_pci_ring *ring, uint16_t *n_items)
+ring_get_read_ptr(struct bwfm_pci_ring *ring, uint16_t *n_items)
 {
 	ring_pull_wptr_from_fw(ring);
 	if (ring->w_ptr >= ring->r_ptr)
@@ -294,7 +294,7 @@ ring_get_read_ptr(struct brcm_pci_ring *ring, uint16_t *n_items)
 }
 
 static void
-ring_read_complete(struct brcm_pci_ring *ring, uint16_t n_items)
+ring_read_complete(struct bwfm_pci_ring *ring, uint16_t n_items)
 {
 	ring->r_ptr += n_items;
 	if (ring->r_ptr == ring->depth)
@@ -311,12 +311,12 @@ ring_read_complete(struct brcm_pci_ring *ring, uint16_t n_items)
  * than silently rejected, which helps diagnose half-booted fw.
  */
 static int
-msgbuf_read_shared_info(struct brcm_pci_msgbuf *mb)
+msgbuf_read_shared_info(struct bwfm_pci_msgbuf *mb)
 {
 	uint32_t rambase, ramsize, off, shared_addr, flags;
 
-	rambase = brcm_pci_msgbuf_rambase(mb->sc);
-	ramsize = brcm_pci_msgbuf_ramsize(mb->sc);
+	rambase = bwfm_pci_msgbuf_rambase(mb->sc);
+	ramsize = bwfm_pci_msgbuf_ramsize(mb->sc);
 	off = rambase + ramsize - 4;
 
 	shared_addr = tcm_read32(mb, off);
@@ -343,14 +343,14 @@ msgbuf_read_shared_info(struct brcm_pci_msgbuf *mb)
 		 */
 		if (candidate >= rambase && candidate < rambase + ramsize) {
 			uint32_t f = tcm_read32(mb,
-			    candidate + BRCM_SHARED_FLAGS_OFFSET);
-			uint8_t v = f & BRCM_PCIE_SHARED_VERSION_MASK;
+			    candidate + BWFM_SHARED_FLAGS_OFFSET);
+			uint8_t v = f & BWFM_PCIE_SHARED_VERSION_MASK;
 
 			MDPRINTF(mb, 0,
 			    "msgbuf: try masked 0x%x — flags=0x%08x v=%u\n",
 			    candidate, f, v);
-			if (v >= BRCM_PCIE_MIN_SHARED_VERSION &&
-			    v <= BRCM_PCIE_MAX_SHARED_VERSION) {
+			if (v >= BWFM_PCIE_MIN_SHARED_VERSION &&
+			    v <= BWFM_PCIE_MAX_SHARED_VERSION) {
 				MDPRINTF(mb, 0,
 				    "msgbuf: masked address validates — "
 				    "using 0x%x\n", candidate);
@@ -363,17 +363,17 @@ msgbuf_read_shared_info(struct brcm_pci_msgbuf *mb)
 validated:
 
 	mb->shared_addr = shared_addr;
-	flags = tcm_read32(mb, shared_addr + BRCM_SHARED_FLAGS_OFFSET);
+	flags = tcm_read32(mb, shared_addr + BWFM_SHARED_FLAGS_OFFSET);
 	mb->shared_flags = flags;
-	mb->shared_version = flags & BRCM_PCIE_SHARED_VERSION_MASK;
+	mb->shared_version = flags & BWFM_PCIE_SHARED_VERSION_MASK;
 	MDPRINTF(mb, 0,
 	    "msgbuf: shared v=%u flags=0x%08x dma_idx=%d hostrdy_db1=%d\n",
 	    mb->shared_version, flags,
-	    !!(flags & BRCM_PCIE_SHARED_DMA_INDEX),
-	    !!(flags & BRCM_PCIE_SHARED_HOSTRDY_DB1));
+	    !!(flags & BWFM_PCIE_SHARED_DMA_INDEX),
+	    !!(flags & BWFM_PCIE_SHARED_HOSTRDY_DB1));
 
-	if (mb->shared_version < BRCM_PCIE_MIN_SHARED_VERSION ||
-	    mb->shared_version > BRCM_PCIE_MAX_SHARED_VERSION) {
+	if (mb->shared_version < BWFM_PCIE_MIN_SHARED_VERSION ||
+	    mb->shared_version > BWFM_PCIE_MAX_SHARED_VERSION) {
 		device_printf(DEV(mb),
 		    "msgbuf: unsupported shared version %u\n",
 		    mb->shared_version);
@@ -381,17 +381,17 @@ validated:
 	}
 
 	mb->max_rxbufpost = tcm_read16(mb,
-	    shared_addr + BRCM_SHARED_MAX_RXBUFPOST_OFFSET);
+	    shared_addr + BWFM_SHARED_MAX_RXBUFPOST_OFFSET);
 	mb->rx_dataoffset = tcm_read32(mb,
-	    shared_addr + BRCM_SHARED_RX_DATAOFFSET_OFFSET);
+	    shared_addr + BWFM_SHARED_RX_DATAOFFSET_OFFSET);
 	mb->htod_mb_data_addr = tcm_read32(mb,
-	    shared_addr + BRCM_SHARED_HTOD_MB_DATA_ADDR_OFFSET);
+	    shared_addr + BWFM_SHARED_HTOD_MB_DATA_ADDR_OFFSET);
 	mb->dtoh_mb_data_addr = tcm_read32(mb,
-	    shared_addr + BRCM_SHARED_DTOH_MB_DATA_ADDR_OFFSET);
+	    shared_addr + BWFM_SHARED_DTOH_MB_DATA_ADDR_OFFSET);
 	mb->ring_info_addr = tcm_read32(mb,
-	    shared_addr + BRCM_SHARED_RING_INFO_ADDR_OFFSET);
+	    shared_addr + BWFM_SHARED_RING_INFO_ADDR_OFFSET);
 	mb->console_addr = tcm_read32(mb,
-	    shared_addr + BRCM_SHARED_CONSOLE_ADDR_OFFSET);
+	    shared_addr + BWFM_SHARED_CONSOLE_ADDR_OFFSET);
 
 	MDPRINTF(mb, 0,
 	    "msgbuf: max_rxbufpost=%u rx_dataoff=0x%x ringinfo=0x%x console=0x%x\n",
@@ -409,30 +409,30 @@ validated:
  * Allocates the five common rings as coherent buffers and publishes
  * their DMA addresses into fw's ringmem slots.
  */
-static const uint32_t brcm_ring_max_item[BRCM_NROF_COMMON_MSGRINGS] = {
-	BRCM_H2D_CONTROL_SUBMIT_MAX_ITEM,
-	BRCM_H2D_RXPOST_SUBMIT_MAX_ITEM,
-	BRCM_D2H_CONTROL_COMPLETE_MAX_ITEM,
-	BRCM_D2H_TX_COMPLETE_MAX_ITEM,
-	BRCM_D2H_RX_COMPLETE_MAX_ITEM,
+static const uint32_t bwfm_ring_max_item[BWFM_NROF_COMMON_MSGRINGS] = {
+	BWFM_H2D_CONTROL_SUBMIT_MAX_ITEM,
+	BWFM_H2D_RXPOST_SUBMIT_MAX_ITEM,
+	BWFM_D2H_CONTROL_COMPLETE_MAX_ITEM,
+	BWFM_D2H_TX_COMPLETE_MAX_ITEM,
+	BWFM_D2H_RX_COMPLETE_MAX_ITEM,
 };
-static const uint32_t brcm_ring_itemsize_pre_v7[BRCM_NROF_COMMON_MSGRINGS] = {
-	BRCM_H2D_CONTROL_SUBMIT_ITEMSIZE,
-	BRCM_H2D_RXPOST_SUBMIT_ITEMSIZE,
-	BRCM_D2H_CONTROL_COMPLETE_ITEMSIZE,
-	BRCM_D2H_TX_COMPLETE_ITEMSIZE_PRE_V7,
-	BRCM_D2H_RX_COMPLETE_ITEMSIZE_PRE_V7,
+static const uint32_t bwfm_ring_itemsize_pre_v7[BWFM_NROF_COMMON_MSGRINGS] = {
+	BWFM_H2D_CONTROL_SUBMIT_ITEMSIZE,
+	BWFM_H2D_RXPOST_SUBMIT_ITEMSIZE,
+	BWFM_D2H_CONTROL_COMPLETE_ITEMSIZE,
+	BWFM_D2H_TX_COMPLETE_ITEMSIZE_PRE_V7,
+	BWFM_D2H_RX_COMPLETE_ITEMSIZE_PRE_V7,
 };
-static const uint32_t brcm_ring_itemsize_v7[BRCM_NROF_COMMON_MSGRINGS] = {
-	BRCM_H2D_CONTROL_SUBMIT_ITEMSIZE,
-	BRCM_H2D_RXPOST_SUBMIT_ITEMSIZE,
-	BRCM_D2H_CONTROL_COMPLETE_ITEMSIZE,
-	BRCM_D2H_TX_COMPLETE_ITEMSIZE,
-	BRCM_D2H_RX_COMPLETE_ITEMSIZE,
+static const uint32_t bwfm_ring_itemsize_v7[BWFM_NROF_COMMON_MSGRINGS] = {
+	BWFM_H2D_CONTROL_SUBMIT_ITEMSIZE,
+	BWFM_H2D_RXPOST_SUBMIT_ITEMSIZE,
+	BWFM_D2H_CONTROL_COMPLETE_ITEMSIZE,
+	BWFM_D2H_TX_COMPLETE_ITEMSIZE,
+	BWFM_D2H_RX_COMPLETE_ITEMSIZE,
 };
 
 static int
-msgbuf_init_rings(struct brcm_pci_msgbuf *mb)
+msgbuf_init_rings(struct bwfm_pci_msgbuf *mb)
 {
 	const uint32_t *itemsize;
 	uint32_t ring_mem_ptr;
@@ -445,14 +445,14 @@ msgbuf_init_rings(struct brcm_pci_msgbuf *mb)
 
 	if (mb->shared_version >= 6) {
 		max_sub = tcm_read16(mb, rinfo +
-		    BRCM_RINGINFO_MAX_SUBMISSIONRINGS_OFFSET);
+		    BWFM_RINGINFO_MAX_SUBMISSIONRINGS_OFFSET);
 		max_flow = tcm_read16(mb, rinfo +
-		    BRCM_RINGINFO_MAX_FLOWRINGS_OFFSET);
+		    BWFM_RINGINFO_MAX_FLOWRINGS_OFFSET);
 		max_cmp = tcm_read16(mb, rinfo +
-		    BRCM_RINGINFO_MAX_COMPLETIONRINGS_OFFSET);
+		    BWFM_RINGINFO_MAX_COMPLETIONRINGS_OFFSET);
 	} else {
 		max_sub = tcm_read16(mb, rinfo +
-		    BRCM_RINGINFO_MAX_FLOWRINGS_OFFSET);
+		    BWFM_RINGINFO_MAX_FLOWRINGS_OFFSET);
 		max_flow = max_sub - 2;	/* 2 H2D common rings */
 		max_cmp = 3;		/* 3 D2H common rings */
 	}
@@ -467,11 +467,11 @@ msgbuf_init_rings(struct brcm_pci_msgbuf *mb)
 	mb->max_completionrings = max_cmp;
 
 	/* TCM-index mode: read ptrs, use 4-byte stride. */
-	d2h_w = tcm_read32(mb, rinfo + BRCM_RINGINFO_D2H_W_IDX_PTR_OFFSET);
-	d2h_r = tcm_read32(mb, rinfo + BRCM_RINGINFO_D2H_R_IDX_PTR_OFFSET);
-	h2d_w = tcm_read32(mb, rinfo + BRCM_RINGINFO_H2D_W_IDX_PTR_OFFSET);
-	h2d_r = tcm_read32(mb, rinfo + BRCM_RINGINFO_H2D_R_IDX_PTR_OFFSET);
-	ring_mem_ptr = tcm_read32(mb, rinfo + BRCM_RINGINFO_RINGMEM_OFFSET);
+	d2h_w = tcm_read32(mb, rinfo + BWFM_RINGINFO_D2H_W_IDX_PTR_OFFSET);
+	d2h_r = tcm_read32(mb, rinfo + BWFM_RINGINFO_D2H_R_IDX_PTR_OFFSET);
+	h2d_w = tcm_read32(mb, rinfo + BWFM_RINGINFO_H2D_W_IDX_PTR_OFFSET);
+	h2d_r = tcm_read32(mb, rinfo + BWFM_RINGINFO_H2D_R_IDX_PTR_OFFSET);
+	ring_mem_ptr = tcm_read32(mb, rinfo + BWFM_RINGINFO_RINGMEM_OFFSET);
 
 	MDPRINTF(mb, 0,
 	    "msgbuf: max_sub=%u max_flow=%u max_cmp=%u ringmem=0x%x\n",
@@ -480,18 +480,18 @@ msgbuf_init_rings(struct brcm_pci_msgbuf *mb)
 	    "msgbuf: h2d_w=0x%x h2d_r=0x%x d2h_w=0x%x d2h_r=0x%x\n",
 	    h2d_w, h2d_r, d2h_w, d2h_r);
 
-	itemsize = (mb->shared_version >= 7) ? brcm_ring_itemsize_v7 :
-	    brcm_ring_itemsize_pre_v7;
+	itemsize = (mb->shared_version >= 7) ? bwfm_ring_itemsize_v7 :
+	    bwfm_ring_itemsize_pre_v7;
 
 	mb->ringmem_base = ring_mem_ptr;
 
 	/* Two H2D rings first, then three D2H rings. */
-	for (i = 0; i < BRCM_NROF_COMMON_MSGRINGS; i++) {
-		struct brcm_pci_ring *ring = &mb->rings[i];
-		size_t sz = brcm_ring_max_item[i] * itemsize[i];
+	for (i = 0; i < BWFM_NROF_COMMON_MSGRINGS; i++) {
+		struct bwfm_pci_ring *ring = &mb->rings[i];
+		size_t sz = bwfm_ring_max_item[i] * itemsize[i];
 		bus_addr_t pa;
 
-		error = brcm_pci_msgbuf_dma_alloc(mb, &ring->buf, sz, "ring");
+		error = bwfm_pci_msgbuf_dma_alloc(mb, &ring->buf, sz, "ring");
 		if (error != 0)
 			return (error);
 		pa = ring->buf.paddr;
@@ -500,17 +500,17 @@ msgbuf_init_rings(struct brcm_pci_msgbuf *mb)
 		 * Write the ring's DMA address, item count and item size
 		 * into its ringmem slot.
 		 */
-		tcm_write32(mb, ring_mem_ptr + BRCM_RING_MEM_BASE_ADDR_OFFSET,
+		tcm_write32(mb, ring_mem_ptr + BWFM_RING_MEM_BASE_ADDR_OFFSET,
 		    (uint32_t)(pa & 0xffffffff));
 		tcm_write32(mb,
-		    ring_mem_ptr + BRCM_RING_MEM_BASE_ADDR_OFFSET + 4,
+		    ring_mem_ptr + BWFM_RING_MEM_BASE_ADDR_OFFSET + 4,
 		    (uint32_t)((uint64_t)pa >> 32));
-		tcm_write16(mb, ring_mem_ptr + BRCM_RING_MAX_ITEM_OFFSET,
-		    brcm_ring_max_item[i]);
-		tcm_write16(mb, ring_mem_ptr + BRCM_RING_LEN_ITEMS_OFFSET,
+		tcm_write16(mb, ring_mem_ptr + BWFM_RING_MAX_ITEM_OFFSET,
+		    bwfm_ring_max_item[i]);
+		tcm_write16(mb, ring_mem_ptr + BWFM_RING_LEN_ITEMS_OFFSET,
 		    itemsize[i]);
 
-		ring_config(ring, brcm_ring_max_item[i], itemsize[i], mb);
+		ring_config(ring, bwfm_ring_max_item[i], itemsize[i], mb);
 		ring->id = i;
 		if (i < 2) {
 			ring->w_idx_addr = h2d_w;
@@ -523,7 +523,7 @@ msgbuf_init_rings(struct brcm_pci_msgbuf *mb)
 			d2h_w += sizeof(uint32_t);
 			d2h_r += sizeof(uint32_t);
 		}
-		ring_mem_ptr += BRCM_RING_MEM_SZ;
+		ring_mem_ptr += BWFM_RING_MEM_SZ;
 
 		/* Zero the TCM indices; fw does this at boot, but be safe. */
 		tcm_write16(mb, ring->w_idx_addr, 0);
@@ -532,7 +532,7 @@ msgbuf_init_rings(struct brcm_pci_msgbuf *mb)
 		MDPRINTF(mb, 0,
 		    "msgbuf: ring[%d] items=%u itemsize=%u pa=0x%jx "
 		    "w_idx=0x%x r_idx=0x%x\n", i,
-		    brcm_ring_max_item[i], itemsize[i], (uintmax_t)pa,
+		    bwfm_ring_max_item[i], itemsize[i], (uintmax_t)pa,
 		    ring->w_idx_addr, ring->r_idx_addr);
 	}
 
@@ -554,40 +554,40 @@ msgbuf_init_rings(struct brcm_pci_msgbuf *mb)
  * need them, but some fw versions assert if scratch is missing, and
  * they are cheap.
  */
-#define	BRCM_D2H_SCRATCH_BUF_LEN	8
-#define	BRCM_D2H_RINGUPD_BUF_LEN	1024
+#define	BWFM_D2H_SCRATCH_BUF_LEN	8
+#define	BWFM_D2H_RINGUPD_BUF_LEN	1024
 
 static int
-msgbuf_init_scratch(struct brcm_pci_msgbuf *mb)
+msgbuf_init_scratch(struct bwfm_pci_msgbuf *mb)
 {
 	uint32_t base, addr;
 	int error;
 
 	base = mb->shared_addr;
 
-	error = brcm_pci_msgbuf_dma_alloc(mb, &mb->scratch,
-	    BRCM_D2H_SCRATCH_BUF_LEN, "scratch");
+	error = bwfm_pci_msgbuf_dma_alloc(mb, &mb->scratch,
+	    BWFM_D2H_SCRATCH_BUF_LEN, "scratch");
 	if (error != 0)
 		return (error);
-	addr = base + BRCM_SHARED_DMA_SCRATCH_ADDR_OFFSET;
+	addr = base + BWFM_SHARED_DMA_SCRATCH_ADDR_OFFSET;
 	tcm_write32(mb, addr,
 	    (uint32_t)(mb->scratch.paddr & 0xffffffff));
 	tcm_write32(mb, addr + 4,
 	    (uint32_t)((uint64_t)mb->scratch.paddr >> 32));
-	tcm_write32(mb, base + BRCM_SHARED_DMA_SCRATCH_LEN_OFFSET,
-	    BRCM_D2H_SCRATCH_BUF_LEN);
+	tcm_write32(mb, base + BWFM_SHARED_DMA_SCRATCH_LEN_OFFSET,
+	    BWFM_D2H_SCRATCH_BUF_LEN);
 
-	error = brcm_pci_msgbuf_dma_alloc(mb, &mb->ringupd,
-	    BRCM_D2H_RINGUPD_BUF_LEN, "ringupd");
+	error = bwfm_pci_msgbuf_dma_alloc(mb, &mb->ringupd,
+	    BWFM_D2H_RINGUPD_BUF_LEN, "ringupd");
 	if (error != 0)
 		return (error);
-	addr = base + BRCM_SHARED_DMA_RINGUPD_ADDR_OFFSET;
+	addr = base + BWFM_SHARED_DMA_RINGUPD_ADDR_OFFSET;
 	tcm_write32(mb, addr,
 	    (uint32_t)(mb->ringupd.paddr & 0xffffffff));
 	tcm_write32(mb, addr + 4,
 	    (uint32_t)((uint64_t)mb->ringupd.paddr >> 32));
-	tcm_write32(mb, base + BRCM_SHARED_DMA_RINGUPD_LEN_OFFSET,
-	    BRCM_D2H_RINGUPD_BUF_LEN);
+	tcm_write32(mb, base + BWFM_SHARED_DMA_RINGUPD_LEN_OFFSET,
+	    BWFM_D2H_RINGUPD_BUF_LEN);
 
 	MDPRINTF(mb, 0,
 	    "msgbuf: scratch pa=0x%jx ringupd pa=0x%jx (published)\n",
@@ -602,13 +602,13 @@ msgbuf_init_scratch(struct brcm_pci_msgbuf *mb)
  * reused.
  */
 static int
-msgbuf_post_ioctlresp(struct brcm_pci_msgbuf *mb)
+msgbuf_post_ioctlresp(struct bwfm_pci_msgbuf *mb)
 {
-	struct brcm_pci_ring *ring;
+	struct bwfm_pci_ring *ring;
 	struct msgbuf_rx_ioctl_resp_or_event *post;
 	uint64_t paddr;
 
-	ring = &mb->rings[BRCM_H2D_MSGRING_CONTROL_SUBMIT];
+	ring = &mb->rings[BWFM_H2D_MSGRING_CONTROL_SUBMIT];
 	mtx_lock(&ring->lock);
 	post = ring_reserve_for_write(ring);
 	if (post == NULL) {
@@ -622,11 +622,11 @@ msgbuf_post_ioctlresp(struct brcm_pci_msgbuf *mb)
 	}
 
 	memset(post, 0, sizeof(*post));
-	post->msg.msgtype = BRCM_MSGBUF_TYPE_IOCTLRESP_BUF_POST;
+	post->msg.msgtype = BWFM_MSGBUF_TYPE_IOCTLRESP_BUF_POST;
 	post->msg.ifidx = 0;
 	post->msg.flags = 0;
-	post->msg.request_id = htole32(BRCM_IOCTL_REQ_PKTID);
-	post->host_buf_len = htole16(BRCM_MSGBUF_MAX_CTL_PKT_SIZE);
+	post->msg.request_id = htole32(BWFM_IOCTL_REQ_PKTID);
+	post->host_buf_len = htole16(BWFM_MSGBUF_MAX_CTL_PKT_SIZE);
 	paddr = (uint64_t)mb->ioctbuf.paddr;
 	post->host_buf_addr.low_addr = htole32((uint32_t)(paddr & 0xffffffff));
 	post->host_buf_addr.high_addr = htole32((uint32_t)(paddr >> 32));
@@ -643,7 +643,7 @@ msgbuf_post_ioctlresp(struct brcm_pci_msgbuf *mb)
  * (request_id 0 means "no id").
  */
 static int
-pktid_alloc(struct brcm_pci_msgbuf *mb, struct mbuf *m, uint16_t flowid,
+pktid_alloc(struct bwfm_pci_msgbuf *mb, struct mbuf *m, uint16_t flowid,
     bool is_eapol, uint32_t *idx_out)
 {
 	uint32_t i, start;
@@ -652,10 +652,10 @@ pktid_alloc(struct brcm_pci_msgbuf *mb, struct mbuf *m, uint16_t flowid,
 	start = mb->pktid_next_hint;
 	if (start == 0)
 		start = 1;
-	for (i = 0; i < BRCM_MSGBUF_MAX_PKTID; i++) {
+	for (i = 0; i < BWFM_MSGBUF_MAX_PKTID; i++) {
 		uint32_t j = start + i;
-		if (j >= BRCM_MSGBUF_MAX_PKTID)
-			j -= (BRCM_MSGBUF_MAX_PKTID - 1);
+		if (j >= BWFM_MSGBUF_MAX_PKTID)
+			j -= (BWFM_MSGBUF_MAX_PKTID - 1);
 		if (j == 0)
 			j = 1;
 		if (!mb->pktids[j].inuse) {
@@ -666,7 +666,7 @@ pktid_alloc(struct brcm_pci_msgbuf *mb, struct mbuf *m, uint16_t flowid,
 			if (is_eapol)
 				mb->pending_eapol++;
 			mb->pktid_next_hint = j + 1;
-			if (mb->pktid_next_hint >= BRCM_MSGBUF_MAX_PKTID)
+			if (mb->pktid_next_hint >= BWFM_MSGBUF_MAX_PKTID)
 				mb->pktid_next_hint = 1;
 			mtx_unlock(&mb->pktid_mtx);
 			*idx_out = j;
@@ -678,13 +678,13 @@ pktid_alloc(struct brcm_pci_msgbuf *mb, struct mbuf *m, uint16_t flowid,
 }
 
 static struct mbuf *
-pktid_release(struct brcm_pci_msgbuf *mb, uint32_t idx,
+pktid_release(struct bwfm_pci_msgbuf *mb, uint32_t idx,
     bus_dmamap_t *map_out)
 {
 	struct mbuf *m;
 	bool was_eapol;
 
-	if (idx == 0 || idx >= BRCM_MSGBUF_MAX_PKTID)
+	if (idx == 0 || idx >= BWFM_MSGBUF_MAX_PKTID)
 		return (NULL);
 	mtx_lock(&mb->pktid_mtx);
 	if (!mb->pktids[idx].inuse) {
@@ -718,7 +718,7 @@ pktid_release(struct brcm_pci_msgbuf *mb, uint32_t idx,
  * RX_CMPLT or WL_EVENT descriptor so the buffer can be found.
  */
 static int
-rxpost_alloc(struct brcm_pci_msgbuf *mb, struct mbuf *m, uint8_t type,
+rxpost_alloc(struct bwfm_pci_msgbuf *mb, struct mbuf *m, uint8_t type,
     uint32_t *idx_out)
 {
 	uint32_t i, start;
@@ -727,17 +727,17 @@ rxpost_alloc(struct brcm_pci_msgbuf *mb, struct mbuf *m, uint8_t type,
 	start = mb->rxpost_next_hint;
 	if (start == 0)
 		start = 1;
-	for (i = 0; i < BRCM_MSGBUF_MAX_RXPOST; i++) {
+	for (i = 0; i < BWFM_MSGBUF_MAX_RXPOST; i++) {
 		uint32_t j = start + i;
-		if (j >= BRCM_MSGBUF_MAX_RXPOST)
-			j -= (BRCM_MSGBUF_MAX_RXPOST - 1);
+		if (j >= BWFM_MSGBUF_MAX_RXPOST)
+			j -= (BWFM_MSGBUF_MAX_RXPOST - 1);
 		if (j == 0)
 			j = 1;
-		if (mb->rxposts[j].type == BRCM_RXPOST_UNUSED) {
+		if (mb->rxposts[j].type == BWFM_RXPOST_UNUSED) {
 			mb->rxposts[j].type = type;
 			mb->rxposts[j].m = m;
 			mb->rxpost_next_hint = j + 1;
-			if (mb->rxpost_next_hint >= BRCM_MSGBUF_MAX_RXPOST)
+			if (mb->rxpost_next_hint >= BWFM_MSGBUF_MAX_RXPOST)
 				mb->rxpost_next_hint = 1;
 			mtx_unlock(&mb->rxpost_mtx);
 			*idx_out = j;
@@ -749,15 +749,15 @@ rxpost_alloc(struct brcm_pci_msgbuf *mb, struct mbuf *m, uint8_t type,
 }
 
 static struct mbuf *
-rxpost_release(struct brcm_pci_msgbuf *mb, uint32_t idx,
+rxpost_release(struct bwfm_pci_msgbuf *mb, uint32_t idx,
     bus_dmamap_t *map_out, uint8_t *type_out)
 {
 	struct mbuf *m;
 
-	if (idx == 0 || idx >= BRCM_MSGBUF_MAX_RXPOST)
+	if (idx == 0 || idx >= BWFM_MSGBUF_MAX_RXPOST)
 		return (NULL);
 	mtx_lock(&mb->rxpost_mtx);
-	if (mb->rxposts[idx].type == BRCM_RXPOST_UNUSED) {
+	if (mb->rxposts[idx].type == BWFM_RXPOST_UNUSED) {
 		mtx_unlock(&mb->rxpost_mtx);
 		return (NULL);
 	}
@@ -770,7 +770,7 @@ rxpost_release(struct brcm_pci_msgbuf *mb, uint32_t idx,
 	mb->rxposts[idx].map = NULL;
 	mb->rxposts[idx].pa = 0;
 	mb->rxposts[idx].buflen = 0;
-	mb->rxposts[idx].type = BRCM_RXPOST_UNUSED;
+	mb->rxposts[idx].type = BWFM_RXPOST_UNUSED;
 	mtx_unlock(&mb->rxpost_mtx);
 	return (m);
 }
@@ -793,11 +793,11 @@ rxbuf_load_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
  * range, tagged in the high bits with the slot index in the low byte,
  * so it never overlaps the small data rxpost pktids and lookup is O(1).
  */
-#define	BRCM_EVENTBUF_PKTID_BASE	0xE0000000u
-#define	BRCM_EVENTBUF_PKTID(slot)	(BRCM_EVENTBUF_PKTID_BASE | (slot))
-#define	BRCM_EVENTBUF_IS_EVENT(pktid)	\
-	(((pktid) & 0xFFFFFF00u) == BRCM_EVENTBUF_PKTID_BASE)
-#define	BRCM_EVENTBUF_PKTID_SLOT(pktid)	((pktid) & 0xFFu)
+#define	BWFM_EVENTBUF_PKTID_BASE	0xE0000000u
+#define	BWFM_EVENTBUF_PKTID(slot)	(BWFM_EVENTBUF_PKTID_BASE | (slot))
+#define	BWFM_EVENTBUF_IS_EVENT(pktid)	\
+	(((pktid) & 0xFFFFFF00u) == BWFM_EVENTBUF_PKTID_BASE)
+#define	BWFM_EVENTBUF_PKTID_SLOT(pktid)	((pktid) & 0xFFu)
 
 /*
  * Post one preallocated coherent event buffer, mb->eventbufs[slot], to
@@ -806,10 +806,10 @@ rxbuf_load_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
  * tag's lowaddr keeps the buffer below 4GB.
  */
 static int
-msgbuf_post_event_slot(struct brcm_pci_msgbuf *mb, uint32_t slot)
+msgbuf_post_event_slot(struct bwfm_pci_msgbuf *mb, uint32_t slot)
 {
-	struct brcm_pci_ring *ring;
-	struct brcm_pci_dma_buf *evb;
+	struct bwfm_pci_ring *ring;
+	struct bwfm_pci_dma_buf *evb;
 	struct msgbuf_rx_ioctl_resp_or_event *post;
 
 	if (slot >= mb->max_eventbuf)
@@ -818,7 +818,7 @@ msgbuf_post_event_slot(struct brcm_pci_msgbuf *mb, uint32_t slot)
 	if (evb->vaddr == NULL || evb->paddr == 0)
 		return (ENOMEM);
 
-	ring = &mb->rings[BRCM_H2D_MSGRING_CONTROL_SUBMIT];
+	ring = &mb->rings[BWFM_H2D_MSGRING_CONTROL_SUBMIT];
 
 	/* Zero the buffer so fw sees clean state, then sync. */
 	memset(evb->vaddr, 0, evb->size);
@@ -832,9 +832,9 @@ msgbuf_post_event_slot(struct brcm_pci_msgbuf *mb, uint32_t slot)
 		return (ENOSPC);
 	}
 	memset(post, 0, sizeof(*post));
-	post->msg.msgtype = BRCM_MSGBUF_TYPE_EVENT_BUF_POST;
+	post->msg.msgtype = BWFM_MSGBUF_TYPE_EVENT_BUF_POST;
 	post->msg.ifidx = 0;
-	post->msg.request_id = htole32(BRCM_EVENTBUF_PKTID(slot));
+	post->msg.request_id = htole32(BWFM_EVENTBUF_PKTID(slot));
 	post->host_buf_len = htole16((uint16_t)evb->size);
 	post->host_buf_addr.low_addr = htole32((uint32_t)(evb->paddr & 0xffffffff));
 	post->host_buf_addr.high_addr = htole32((uint32_t)((uint64_t)evb->paddr >> 32));
@@ -849,10 +849,10 @@ msgbuf_post_event_slot(struct brcm_pci_msgbuf *mb, uint32_t slot)
  * instead.  The doorbell is rung for every post.  Returns 0 on success.
  */
 static int
-msgbuf_post_one_rxbuf(struct brcm_pci_msgbuf *mb, uint8_t type)
+msgbuf_post_one_rxbuf(struct bwfm_pci_msgbuf *mb, uint8_t type)
 {
 	struct mbuf *m;
-	struct brcm_pci_ring *ring;
+	struct bwfm_pci_ring *ring;
 	bus_dmamap_t map = NULL;
 	uint64_t pa;
 	uint32_t pktid;
@@ -860,17 +860,17 @@ msgbuf_post_one_rxbuf(struct brcm_pci_msgbuf *mb, uint8_t type)
 	uint8_t msgtype;
 	int error;
 
-	if (type == BRCM_RXPOST_EVENT) {
+	if (type == BWFM_RXPOST_EVENT) {
 		/*
 		 * Events use the coherent pool via msgbuf_post_event_slot.
 		 * Refuse the mbuf path so an mbuf above 4GB can never be
 		 * handed to fw as a bad pointer.
 		 */
 		return (EINVAL);
-	} else if (type == BRCM_RXPOST_DATA) {
-		bufsize = BRCM_MSGBUF_MAX_PKT_SIZE;
-		msgtype = BRCM_MSGBUF_TYPE_RXBUF_POST;
-		ring = &mb->rings[BRCM_H2D_MSGRING_RXPOST_SUBMIT];
+	} else if (type == BWFM_RXPOST_DATA) {
+		bufsize = BWFM_MSGBUF_MAX_PKT_SIZE;
+		msgtype = BWFM_MSGBUF_TYPE_RXBUF_POST;
+		ring = &mb->rings[BWFM_H2D_MSGRING_RXPOST_SUBMIT];
 	} else {
 		return (EINVAL);
 	}
@@ -941,7 +941,7 @@ msgbuf_post_one_rxbuf(struct brcm_pci_msgbuf *mb, uint8_t type)
 	    BUS_DMASYNC_PREREAD | BUS_DMASYNC_PREWRITE);
 
 	mtx_lock(&ring->lock);
-	if (type == BRCM_RXPOST_DATA) {
+	if (type == BWFM_RXPOST_DATA) {
 		struct msgbuf_rx_bufpost *post;
 
 		post = ring_reserve_for_write(ring);
@@ -976,7 +976,7 @@ msgbuf_post_one_rxbuf(struct brcm_pci_msgbuf *mb, uint8_t type)
 	ring_write_complete(ring);
 	mtx_unlock(&ring->lock);
 
-	if (type == BRCM_RXPOST_EVENT)
+	if (type == BWFM_RXPOST_EVENT)
 		mb->cur_eventbuf++;
 	else
 		mb->cur_rxbufpost++;
@@ -1006,7 +1006,7 @@ ring_full:
  * Returns the number posted.
  */
 static uint32_t
-msgbuf_post_event_bufs(struct brcm_pci_msgbuf *mb, uint32_t count)
+msgbuf_post_event_bufs(struct bwfm_pci_msgbuf *mb, uint32_t count)
 {
 	uint32_t posted = 0;
 	uint32_t i;
@@ -1032,8 +1032,8 @@ msgbuf_post_event_bufs(struct brcm_pci_msgbuf *mb, uint32_t count)
 static void
 msgbuf_event_task(void *arg, int pending __unused)
 {
-	struct brcm_pci_msgbuf *mb = arg;
-	struct brcm_pci_event *ep;
+	struct bwfm_pci_msgbuf *mb = arg;
+	struct bwfm_pci_event *ep;
 
 	for (;;) {
 		mtx_lock(&mb->event_q_mtx);
@@ -1043,19 +1043,19 @@ msgbuf_event_task(void *arg, int pending __unused)
 		mtx_unlock(&mb->event_q_mtx);
 		if (ep == NULL)
 			return;
-		brcm_pci_msgbuf_event_up(mb->sc, ep->data, ep->datalen);
+		bwfm_pci_msgbuf_event_up(mb->sc, ep->data, ep->datalen);
 		free(ep, M_DEVBUF);
 	}
 }
 
 /* Post up to `count` RX data buffers. */
 static uint32_t
-msgbuf_post_rx_bufs(struct brcm_pci_msgbuf *mb, uint32_t count)
+msgbuf_post_rx_bufs(struct bwfm_pci_msgbuf *mb, uint32_t count)
 {
 	uint32_t i;
 
 	for (i = 0; i < count; i++)
-		if (msgbuf_post_one_rxbuf(mb, BRCM_RXPOST_DATA) != 0)
+		if (msgbuf_post_one_rxbuf(mb, BWFM_RXPOST_DATA) != 0)
 			break;
 	return (i);
 }
@@ -1065,7 +1065,7 @@ msgbuf_post_rx_bufs(struct brcm_pci_msgbuf *mb, uint32_t count)
  * the ISR after a slot is consumed.
  */
 static void
-msgbuf_rxpost_refill(struct brcm_pci_msgbuf *mb)
+msgbuf_rxpost_refill(struct bwfm_pci_msgbuf *mb)
 {
 	uint32_t need, got;
 
@@ -1104,12 +1104,12 @@ prio_to_tid(uint8_t prio)
 }
 
 static int
-find_free_local_flowid(struct brcm_pci_msgbuf *mb, uint16_t *out)
+find_free_local_flowid(struct bwfm_pci_msgbuf *mb, uint16_t *out)
 {
 	uint16_t i;
 
 	for (i = 0; i < mb->max_flowrings; i++) {
-		if (mb->flowrings[i].status == BRCM_FLOW_CLOSED) {
+		if (mb->flowrings[i].status == BWFM_FLOW_CLOSED) {
 			*out = i;
 			return (0);
 		}
@@ -1118,13 +1118,13 @@ find_free_local_flowid(struct brcm_pci_msgbuf *mb, uint16_t *out)
 }
 
 /*
- * D3/D0 mailbox helpers; see brcm_pci_msgbuf.h.
+ * D3/D0 mailbox helpers; see bwfm_pci_msgbuf.h.
  */
 int
-brcm_pci_msgbuf_send_mb_data(struct brcm_pci_softc *sc, uint32_t htod_val)
+bwfm_pci_msgbuf_send_mb_data(struct bwfm_pci_softc *sc, uint32_t htod_val)
 {
-	struct brcm_pci_msgbuf *mb = brcm_pci_msgbuf_state(sc);
-	device_t dev = brcm_pci_msgbuf_dev(sc);
+	struct bwfm_pci_msgbuf *mb = bwfm_pci_msgbuf_state(sc);
+	device_t dev = bwfm_pci_msgbuf_dev(sc);
 	uint32_t cur;
 	int i;
 
@@ -1141,20 +1141,20 @@ brcm_pci_msgbuf_send_mb_data(struct brcm_pci_softc *sc, uint32_t htod_val)
 		return (EBUSY);
 	}
 	tcm_write32(mb, mb->htod_mb_data_addr, htod_val);
-	pci_write_config(dev, BRCM_PCI_REG_SBMBX, 1, 4);
+	pci_write_config(dev, BWFM_PCI_REG_SBMBX, 1, 4);
 	/*
 	 * PCIe2 core rev <= 13 needs the doorbell written twice.  Doing
 	 * it on every core is harmless.
 	 */
-	pci_write_config(dev, BRCM_PCI_REG_SBMBX, 1, 4);
+	pci_write_config(dev, BWFM_PCI_REG_SBMBX, 1, 4);
 	return (0);
 }
 
 int
-brcm_pci_msgbuf_wait_mb_ack(struct brcm_pci_softc *sc, uint32_t expect,
+bwfm_pci_msgbuf_wait_mb_ack(struct bwfm_pci_softc *sc, uint32_t expect,
     int timeout_ms)
 {
-	struct brcm_pci_msgbuf *mb = brcm_pci_msgbuf_state(sc);
+	struct bwfm_pci_msgbuf *mb = bwfm_pci_msgbuf_state(sc);
 	uint32_t val;
 	int elapsed;
 
@@ -1174,7 +1174,7 @@ brcm_pci_msgbuf_wait_mb_ack(struct brcm_pci_softc *sc, uint32_t expect,
 
 /*
  * Wait up to timeout_ms for every outstanding EAPOL TX pktid to get its
- * TX_STATUS.  brcm_fmop_set_key calls this when installing the PTK.
+ * TX_STATUS.  bwfm_fmop_set_key calls this when installing the PTK.
  * wpa_supplicant writes M4 and then issues SIOCS80211(WPAKEY) back to
  * back; if the WPAKEY DCMD reaches fw before M4 has drained from the
  * TID-7 flowring, fw may encrypt M4 with the new PTK.  The AP cannot
@@ -1183,9 +1183,9 @@ brcm_pci_msgbuf_wait_mb_ack(struct brcm_pci_softc *sc, uint32_t expect,
  * millisecond; the timeout only guards against misbehaving fw.
  */
 int
-brcm_pci_msgbuf_wait_eapol_drain(struct brcm_pci_softc *sc, int timeout_ms)
+bwfm_pci_msgbuf_wait_eapol_drain(struct bwfm_pci_softc *sc, int timeout_ms)
 {
-	struct brcm_pci_msgbuf *mb = brcm_pci_msgbuf_state(sc);
+	struct bwfm_pci_msgbuf *mb = bwfm_pci_msgbuf_state(sc);
 	sbintime_t deadline;
 	int error = 0;
 
@@ -1210,18 +1210,18 @@ brcm_pci_msgbuf_wait_eapol_drain(struct brcm_pci_softc *sc, int timeout_ms)
 }
 
 uint16_t
-brcm_pci_msgbuf_flowring_lookup(struct brcm_pci_softc *sc,
+bwfm_pci_msgbuf_flowring_lookup(struct bwfm_pci_softc *sc,
     const uint8_t da[6], uint8_t prio)
 {
-	struct brcm_pci_msgbuf *mb = brcm_pci_msgbuf_state(sc);
+	struct bwfm_pci_msgbuf *mb = bwfm_pci_msgbuf_state(sc);
 	uint16_t i;
 
 	if (mb == NULL || mb->flowrings == NULL)
 		return ((uint16_t)-1);
 	mtx_lock(&mb->flow_mtx);
 	for (i = 0; i < mb->max_flowrings; i++) {
-		struct brcm_pci_flowring *fr = &mb->flowrings[i];
-		if (fr->status != BRCM_FLOW_OPEN)
+		struct bwfm_pci_flowring *fr = &mb->flowrings[i];
+		if (fr->status != BWFM_FLOW_OPEN)
 			continue;
 		if (fr->prio != prio)
 			continue;
@@ -1235,13 +1235,13 @@ brcm_pci_msgbuf_flowring_lookup(struct brcm_pci_softc *sc,
 }
 
 int
-brcm_pci_msgbuf_flowring_create(struct brcm_pci_softc *sc,
+bwfm_pci_msgbuf_flowring_create(struct bwfm_pci_softc *sc,
     const uint8_t sa[6], const uint8_t da[6], uint8_t prio, uint8_t ifidx,
     uint16_t *flowid_out)
 {
-	struct brcm_pci_msgbuf *mb = brcm_pci_msgbuf_state(sc);
-	struct brcm_pci_flowring *fr;
-	struct brcm_pci_ring *ctl_ring;
+	struct bwfm_pci_msgbuf *mb = bwfm_pci_msgbuf_state(sc);
+	struct bwfm_pci_flowring *fr;
+	struct bwfm_pci_ring *ctl_ring;
 	struct msgbuf_tx_flowring_create_req *req;
 	uint32_t ringmem_addr;
 	uint16_t local_id, fw_id;
@@ -1260,7 +1260,7 @@ brcm_pci_msgbuf_flowring_create(struct brcm_pci_softc *sc,
 		return (error);
 	}
 	fr = &mb->flowrings[local_id];
-	fr->status = BRCM_FLOW_PENDING;
+	fr->status = BWFM_FLOW_PENDING;
 	memcpy(fr->da, da, 6);
 	memcpy(fr->sa, sa, 6);
 	fr->prio = prio;
@@ -1273,35 +1273,35 @@ brcm_pci_msgbuf_flowring_create(struct brcm_pci_softc *sc,
 	 * slots follow the cursors set up in msgbuf_init_rings.
 	 */
 	if (fr->ring.buf.tag == NULL) {
-		error = brcm_pci_msgbuf_dma_alloc(mb, &fr->ring.buf,
-		    BRCM_H2D_TXFLOWRING_MAX_ITEM * BRCM_H2D_TXFLOWRING_ITEMSIZE,
+		error = bwfm_pci_msgbuf_dma_alloc(mb, &fr->ring.buf,
+		    BWFM_H2D_TXFLOWRING_MAX_ITEM * BWFM_H2D_TXFLOWRING_ITEMSIZE,
 		    "flowring");
 		if (error != 0)
 			goto fail;
 	}
-	ring_config(&fr->ring, BRCM_H2D_TXFLOWRING_MAX_ITEM,
-	    BRCM_H2D_TXFLOWRING_ITEMSIZE, mb);
-	fr->ring.id = local_id + BRCM_H2D_MSGRING_FLOWRING_IDSTART;
+	ring_config(&fr->ring, BWFM_H2D_TXFLOWRING_MAX_ITEM,
+	    BWFM_H2D_TXFLOWRING_ITEMSIZE, mb);
+	fr->ring.id = local_id + BWFM_H2D_MSGRING_FLOWRING_IDSTART;
 	fr->ring.w_idx_addr = mb->flow_h2d_w_next + local_id * sizeof(uint32_t);
 	fr->ring.r_idx_addr = mb->flow_h2d_r_next + local_id * sizeof(uint32_t);
 
 	/* Publish per-ring metadata into fw's ringmem slot for this flow. */
-	ringmem_addr = mb->flow_ringmem_next + local_id * BRCM_RING_MEM_SZ;
+	ringmem_addr = mb->flow_ringmem_next + local_id * BWFM_RING_MEM_SZ;
 	paddr = (uint64_t)fr->ring.buf.paddr;
-	tcm_write32(mb, ringmem_addr + BRCM_RING_MEM_BASE_ADDR_OFFSET,
+	tcm_write32(mb, ringmem_addr + BWFM_RING_MEM_BASE_ADDR_OFFSET,
 	    (uint32_t)(paddr & 0xffffffff));
-	tcm_write32(mb, ringmem_addr + BRCM_RING_MEM_BASE_ADDR_OFFSET + 4,
+	tcm_write32(mb, ringmem_addr + BWFM_RING_MEM_BASE_ADDR_OFFSET + 4,
 	    (uint32_t)(paddr >> 32));
-	tcm_write16(mb, ringmem_addr + BRCM_RING_MAX_ITEM_OFFSET,
-	    BRCM_H2D_TXFLOWRING_MAX_ITEM);
-	tcm_write16(mb, ringmem_addr + BRCM_RING_LEN_ITEMS_OFFSET,
-	    BRCM_H2D_TXFLOWRING_ITEMSIZE);
+	tcm_write16(mb, ringmem_addr + BWFM_RING_MAX_ITEM_OFFSET,
+	    BWFM_H2D_TXFLOWRING_MAX_ITEM);
+	tcm_write16(mb, ringmem_addr + BWFM_RING_LEN_ITEMS_OFFSET,
+	    BWFM_H2D_TXFLOWRING_ITEMSIZE);
 	tcm_write16(mb, fr->ring.w_idx_addr, 0);
 	tcm_write16(mb, fr->ring.r_idx_addr, 0);
 
 	/* Send FLOW_RING_CREATE onto H2D_CTRL_SUBMIT. */
-	fw_id = local_id + BRCM_H2D_MSGRING_FLOWRING_IDSTART;
-	ctl_ring = &mb->rings[BRCM_H2D_MSGRING_CONTROL_SUBMIT];
+	fw_id = local_id + BWFM_H2D_MSGRING_FLOWRING_IDSTART;
+	ctl_ring = &mb->rings[BWFM_H2D_MSGRING_CONTROL_SUBMIT];
 	mtx_lock(&ctl_ring->lock);
 	req = ring_reserve_for_write(ctl_ring);
 	if (req == NULL) {
@@ -1310,7 +1310,7 @@ brcm_pci_msgbuf_flowring_create(struct brcm_pci_softc *sc,
 		goto fail;
 	}
 	memset(req, 0, sizeof(*req));
-	req->msg.msgtype = BRCM_MSGBUF_TYPE_FLOW_RING_CREATE;
+	req->msg.msgtype = BWFM_MSGBUF_TYPE_FLOW_RING_CREATE;
 	req->msg.ifidx = ifidx;
 	req->msg.request_id = 0;
 	memcpy(req->da, da, 6);
@@ -1321,8 +1321,8 @@ brcm_pci_msgbuf_flowring_create(struct brcm_pci_softc *sc,
 	req->tc = 0;
 	req->priority = prio;
 	req->int_vector = 0;
-	req->max_items = htole16(BRCM_H2D_TXFLOWRING_MAX_ITEM);
-	req->len_item = htole16(BRCM_H2D_TXFLOWRING_ITEMSIZE);
+	req->max_items = htole16(BWFM_H2D_TXFLOWRING_MAX_ITEM);
+	req->len_item = htole16(BWFM_H2D_TXFLOWRING_ITEMSIZE);
 	req->flow_ring_addr.low_addr = htole32((uint32_t)(paddr & 0xffffffff));
 	req->flow_ring_addr.high_addr = htole32((uint32_t)(paddr >> 32));
 
@@ -1338,11 +1338,11 @@ brcm_pci_msgbuf_flowring_create(struct brcm_pci_softc *sc,
 
 	/* Wait for CREATE_CMPLT on the D2H control ring. */
 	mtx_lock(&mb->flow_mtx);
-	while (fr->status == BRCM_FLOW_PENDING) {
+	while (fr->status == BWFM_FLOW_PENDING) {
 		error = cv_timedwait_sig(&mb->flow_cv, &mb->flow_mtx,
 		    hz * FLOW_CREATE_TIMEOUT_MS / 1000);
 		if (error == EWOULDBLOCK) {
-			fr->status = BRCM_FLOW_FAILED;
+			fr->status = BWFM_FLOW_FAILED;
 			mtx_unlock(&mb->flow_mtx);
 			device_printf(DEV(mb),
 			    "msgbuf: FLOW_CREATE flow=%u timeout\n", fw_id);
@@ -1353,7 +1353,7 @@ brcm_pci_msgbuf_flowring_create(struct brcm_pci_softc *sc,
 			return (error);
 		}
 	}
-	if (fr->status != BRCM_FLOW_OPEN) {
+	if (fr->status != BWFM_FLOW_OPEN) {
 		mtx_unlock(&mb->flow_mtx);
 		mb->stat_flow_create_fail++;
 		device_printf(DEV(mb),
@@ -1369,9 +1369,9 @@ brcm_pci_msgbuf_flowring_create(struct brcm_pci_softc *sc,
 
 fail:
 	mtx_lock(&mb->flow_mtx);
-	fr->status = BRCM_FLOW_CLOSED;
+	fr->status = BWFM_FLOW_CLOSED;
 	mtx_unlock(&mb->flow_mtx);
-	brcm_pci_msgbuf_dma_free(mb, &fr->ring.buf);
+	bwfm_pci_msgbuf_dma_free(mb, &fr->ring.buf);
 	return (error);
 }
 
@@ -1393,12 +1393,12 @@ tx_load_cb(void *arg, bus_dma_segment_t *segs, int nseg, int error)
 }
 
 int
-brcm_pci_msgbuf_txmbuf(struct brcm_pci_softc *sc, uint16_t flowid,
+bwfm_pci_msgbuf_txmbuf(struct bwfm_pci_softc *sc, uint16_t flowid,
     struct mbuf *m, uint8_t ifidx)
 {
-	struct brcm_pci_msgbuf *mb = brcm_pci_msgbuf_state(sc);
-	struct brcm_pci_flowring *fr;
-	struct brcm_pci_ring *ring;
+	struct bwfm_pci_msgbuf *mb = bwfm_pci_msgbuf_state(sc);
+	struct bwfm_pci_flowring *fr;
+	struct bwfm_pci_ring *ring;
 	struct msgbuf_tx_msghdr *tx;
 	bus_dmamap_t map = NULL;
 	uint64_t data_pa;
@@ -1409,7 +1409,7 @@ brcm_pci_msgbuf_txmbuf(struct brcm_pci_softc *sc, uint16_t flowid,
 	if (mb == NULL || !mb->attached || flowid >= mb->max_flowrings)
 		return (ENXIO);
 	fr = &mb->flowrings[flowid];
-	if (fr->status != BRCM_FLOW_OPEN)
+	if (fr->status != BWFM_FLOW_OPEN)
 		return (ENOTCONN);
 	if (m->m_pkthdr.len < ETHER_HDR_LEN)
 		return (EINVAL);
@@ -1467,13 +1467,13 @@ brcm_pci_msgbuf_txmbuf(struct brcm_pci_softc *sc, uint16_t flowid,
 
 	datalen = m->m_pkthdr.len;
 	memset(tx, 0, sizeof(*tx));
-	tx->msg.msgtype = BRCM_MSGBUF_TYPE_TX_POST;
+	tx->msg.msgtype = BWFM_MSGBUF_TYPE_TX_POST;
 	tx->msg.ifidx = ifidx;
 	tx->msg.flags = 0;
 	tx->msg.request_id = htole32(pktid + 1);
 	memcpy(tx->txhdr, mtod(m, uint8_t *), 14);
-	tx->flags = BRCM_MSGBUF_PKT_FLAGS_FRAME_802_3 |
-	    ((fr->prio & 0x07) << BRCM_MSGBUF_PKT_FLAGS_PRIO_SHIFT);
+	tx->flags = BWFM_MSGBUF_PKT_FLAGS_FRAME_802_3 |
+	    ((fr->prio & 0x07) << BWFM_MSGBUF_PKT_FLAGS_PRIO_SHIFT);
 	tx->seg_cnt = 1;
 	tx->data_len = htole16(datalen - 14);
 	/*
@@ -1503,7 +1503,7 @@ brcm_pci_msgbuf_txmbuf(struct brcm_pci_softc *sc, uint16_t flowid,
  * msgbuf_process_ctrl_msg.
  */
 static void
-msgbuf_process_flowring_create_cmplt(struct brcm_pci_msgbuf *mb, void *item)
+msgbuf_process_flowring_create_cmplt(struct bwfm_pci_msgbuf *mb, void *item)
 {
 	struct msgbuf_flowring_create_resp *resp = item;
 	uint16_t fw_id, local_id;
@@ -1512,13 +1512,13 @@ msgbuf_process_flowring_create_cmplt(struct brcm_pci_msgbuf *mb, void *item)
 	fw_id = le16toh(resp->compl_hdr.flow_ring_id);
 	status = (int16_t)le16toh(resp->compl_hdr.status);
 
-	if (fw_id < BRCM_H2D_MSGRING_FLOWRING_IDSTART) {
+	if (fw_id < BWFM_H2D_MSGRING_FLOWRING_IDSTART) {
 		device_printf(DEV(mb),
 		    "msgbuf: FLOW_CREATE_CMPLT weird fw_id=%u status=%d\n",
 		    fw_id, status);
 		return;
 	}
-	local_id = fw_id - BRCM_H2D_MSGRING_FLOWRING_IDSTART;
+	local_id = fw_id - BWFM_H2D_MSGRING_FLOWRING_IDSTART;
 	if (local_id >= mb->max_flowrings) {
 		device_printf(DEV(mb),
 		    "msgbuf: FLOW_CREATE_CMPLT local_id=%u out of range\n",
@@ -1529,7 +1529,7 @@ msgbuf_process_flowring_create_cmplt(struct brcm_pci_msgbuf *mb, void *item)
 	mtx_lock(&mb->flow_mtx);
 	mb->flowrings[local_id].last_create_status = status;
 	mb->flowrings[local_id].status = (status == 0) ?
-	    BRCM_FLOW_OPEN : BRCM_FLOW_FAILED;
+	    BWFM_FLOW_OPEN : BWFM_FLOW_FAILED;
 	cv_broadcast(&mb->flow_cv);
 	mtx_unlock(&mb->flow_mtx);
 
@@ -1543,7 +1543,7 @@ msgbuf_process_flowring_create_cmplt(struct brcm_pci_msgbuf *mb, void *item)
  * local slot CLOSED so a later create can reuse it.
  */
 static void
-msgbuf_process_flowring_delete_cmplt(struct brcm_pci_msgbuf *mb, void *item)
+msgbuf_process_flowring_delete_cmplt(struct bwfm_pci_msgbuf *mb, void *item)
 {
 	struct msgbuf_flowring_delete_resp *resp = item;
 	uint16_t fw_id, local_id;
@@ -1551,13 +1551,13 @@ msgbuf_process_flowring_delete_cmplt(struct brcm_pci_msgbuf *mb, void *item)
 
 	fw_id = le16toh(resp->compl_hdr.flow_ring_id);
 	status = (int16_t)le16toh(resp->compl_hdr.status);
-	if (fw_id < BRCM_H2D_MSGRING_FLOWRING_IDSTART) {
+	if (fw_id < BWFM_H2D_MSGRING_FLOWRING_IDSTART) {
 		device_printf(DEV(mb),
 		    "msgbuf: FLOW_DELETE_CMPLT weird fw_id=%u status=%d\n",
 		    fw_id, status);
 		return;
 	}
-	local_id = fw_id - BRCM_H2D_MSGRING_FLOWRING_IDSTART;
+	local_id = fw_id - BWFM_H2D_MSGRING_FLOWRING_IDSTART;
 	if (local_id >= mb->max_flowrings) {
 		device_printf(DEV(mb),
 		    "msgbuf: FLOW_DELETE_CMPLT local_id=%u out of range\n",
@@ -1565,7 +1565,7 @@ msgbuf_process_flowring_delete_cmplt(struct brcm_pci_msgbuf *mb, void *item)
 		return;
 	}
 	mtx_lock(&mb->flow_mtx);
-	mb->flowrings[local_id].status = BRCM_FLOW_CLOSED;
+	mb->flowrings[local_id].status = BWFM_FLOW_CLOSED;
 	memset(mb->flowrings[local_id].da, 0, 6);
 	memset(mb->flowrings[local_id].sa, 0, 6);
 	cv_broadcast(&mb->flow_cv);
@@ -1582,12 +1582,12 @@ msgbuf_process_flowring_delete_cmplt(struct brcm_pci_msgbuf *mb, void *item)
  * path needs.
  */
 int
-brcm_pci_msgbuf_flowring_delete(struct brcm_pci_softc *sc, uint16_t local_id)
+bwfm_pci_msgbuf_flowring_delete(struct bwfm_pci_softc *sc, uint16_t local_id)
 {
-	struct brcm_pci_msgbuf *mb = brcm_pci_msgbuf_state(sc);
-	struct brcm_pci_ring *ctl_ring;
+	struct bwfm_pci_msgbuf *mb = bwfm_pci_msgbuf_state(sc);
+	struct bwfm_pci_ring *ctl_ring;
 	struct msgbuf_tx_flowring_delete_req *req;
-	struct brcm_pci_flowring *fr;
+	struct bwfm_pci_flowring *fr;
 	uint16_t fw_id;
 	int error;
 
@@ -1598,14 +1598,14 @@ brcm_pci_msgbuf_flowring_delete(struct brcm_pci_softc *sc, uint16_t local_id)
 	fr = &mb->flowrings[local_id];
 
 	mtx_lock(&mb->flow_mtx);
-	if (fr->status != BRCM_FLOW_OPEN) {
+	if (fr->status != BWFM_FLOW_OPEN) {
 		mtx_unlock(&mb->flow_mtx);
 		return (0);	/* nothing to delete */
 	}
 	mtx_unlock(&mb->flow_mtx);
 
-	fw_id = local_id + BRCM_H2D_MSGRING_FLOWRING_IDSTART;
-	ctl_ring = &mb->rings[BRCM_H2D_MSGRING_CONTROL_SUBMIT];
+	fw_id = local_id + BWFM_H2D_MSGRING_FLOWRING_IDSTART;
+	ctl_ring = &mb->rings[BWFM_H2D_MSGRING_CONTROL_SUBMIT];
 	mtx_lock(&ctl_ring->lock);
 	req = ring_reserve_for_write(ctl_ring);
 	if (req == NULL) {
@@ -1613,7 +1613,7 @@ brcm_pci_msgbuf_flowring_delete(struct brcm_pci_softc *sc, uint16_t local_id)
 		return (ENOSPC);
 	}
 	memset(req, 0, sizeof(*req));
-	req->msg.msgtype = BRCM_MSGBUF_TYPE_FLOW_RING_DELETE;
+	req->msg.msgtype = BWFM_MSGBUF_TYPE_FLOW_RING_DELETE;
 	req->msg.ifidx = fr->ifidx;
 	req->msg.request_id = 0;
 	req->flow_ring_id = htole16(fw_id);
@@ -1624,7 +1624,7 @@ brcm_pci_msgbuf_flowring_delete(struct brcm_pci_softc *sc, uint16_t local_id)
 	MDPRINTF(mb, 0, "msgbuf: FLOW_DELETE flow=%u sent\n", fw_id);
 
 	mtx_lock(&mb->flow_mtx);
-	while (fr->status == BRCM_FLOW_OPEN) {
+	while (fr->status == BWFM_FLOW_OPEN) {
 		error = cv_timedwait_sig(&mb->flow_cv, &mb->flow_mtx,
 		    hz * 2);
 		if (error == EWOULDBLOCK) {
@@ -1643,18 +1643,18 @@ brcm_pci_msgbuf_flowring_delete(struct brcm_pci_softc *sc, uint16_t local_id)
 }
 
 void
-brcm_pci_msgbuf_flowring_delete_all(struct brcm_pci_softc *sc)
+bwfm_pci_msgbuf_flowring_delete_all(struct bwfm_pci_softc *sc)
 {
-	struct brcm_pci_msgbuf *mb = brcm_pci_msgbuf_state(sc);
+	struct bwfm_pci_msgbuf *mb = bwfm_pci_msgbuf_state(sc);
 	uint16_t i;
 	int rc, ok = 0, fail = 0;
 
 	if (mb == NULL || !mb->attached || mb->flowrings == NULL)
 		return;
 	for (i = 0; i < mb->max_flowrings; i++) {
-		if (mb->flowrings[i].status != BRCM_FLOW_OPEN)
+		if (mb->flowrings[i].status != BWFM_FLOW_OPEN)
 			continue;
-		rc = brcm_pci_msgbuf_flowring_delete(sc, i);
+		rc = bwfm_pci_msgbuf_flowring_delete(sc, i);
 		if (rc == 0)
 			ok++;
 		else
@@ -1667,7 +1667,7 @@ brcm_pci_msgbuf_flowring_delete_all(struct brcm_pci_softc *sc)
 }
 
 static void
-msgbuf_process_txstatus(struct brcm_pci_msgbuf *mb, void *item)
+msgbuf_process_txstatus(struct bwfm_pci_msgbuf *mb, void *item)
 {
 	struct msgbuf_tx_status *ts = item;
 	uint32_t pktid;
@@ -1714,13 +1714,13 @@ msgbuf_process_txstatus(struct brcm_pci_msgbuf *mb, void *item)
 }
 
 /*
- * DCMD wrappers.  All are synchronous through brcm_pci_msgbuf_dcmd,
+ * DCMD wrappers.  All are synchronous through bwfm_pci_msgbuf_dcmd,
  * which serializes on dcmd_sx.
  */
-#define	BRCM_IOVAR_BUF_MAX	1024
+#define	BWFM_IOVAR_BUF_MAX	1024
 
 int
-brcm_pci_msgbuf_dcmd_set_int(struct brcm_pci_softc *sc, uint32_t cmd,
+bwfm_pci_msgbuf_dcmd_set_int(struct bwfm_pci_softc *sc, uint32_t cmd,
     uint32_t val)
 {
 	uint32_t le = htole32(val);
@@ -1728,7 +1728,7 @@ brcm_pci_msgbuf_dcmd_set_int(struct brcm_pci_softc *sc, uint32_t cmd,
 	int32_t fwerr = 0;
 	int error;
 
-	error = brcm_pci_msgbuf_dcmd(sc, cmd, true, &le, sizeof(le),
+	error = bwfm_pci_msgbuf_dcmd(sc, cmd, true, &le, sizeof(le),
 	    NULL, &rlen, &fwerr);
 	if (error == 0 && fwerr != 0)
 		error = EIO;
@@ -1736,7 +1736,7 @@ brcm_pci_msgbuf_dcmd_set_int(struct brcm_pci_softc *sc, uint32_t cmd,
 }
 
 int
-brcm_pci_msgbuf_dcmd_get_int(struct brcm_pci_softc *sc, uint32_t cmd,
+bwfm_pci_msgbuf_dcmd_get_int(struct bwfm_pci_softc *sc, uint32_t cmd,
     uint32_t *val)
 {
 	uint32_t buf = 0;
@@ -1744,7 +1744,7 @@ brcm_pci_msgbuf_dcmd_get_int(struct brcm_pci_softc *sc, uint32_t cmd,
 	int32_t fwerr = 0;
 	int error;
 
-	error = brcm_pci_msgbuf_dcmd(sc, cmd, false, &buf, sizeof(buf),
+	error = bwfm_pci_msgbuf_dcmd(sc, cmd, false, &buf, sizeof(buf),
 	    &buf, &rlen, &fwerr);
 	if (error != 0)
 		return (error);
@@ -1757,10 +1757,10 @@ brcm_pci_msgbuf_dcmd_get_int(struct brcm_pci_softc *sc, uint32_t cmd,
 }
 
 int
-brcm_pci_msgbuf_dcmd_set_var(struct brcm_pci_softc *sc, const char *name,
+bwfm_pci_msgbuf_dcmd_set_var(struct bwfm_pci_softc *sc, const char *name,
     const void *data, size_t datalen)
 {
-	uint8_t buf[BRCM_IOVAR_BUF_MAX];
+	uint8_t buf[BWFM_IOVAR_BUF_MAX];
 	size_t namelen, buflen, rlen = 0;
 	int32_t fwerr = 0;
 	int error;
@@ -1773,7 +1773,7 @@ brcm_pci_msgbuf_dcmd_set_var(struct brcm_pci_softc *sc, const char *name,
 		memcpy(buf + namelen, data, datalen);
 	buflen = namelen + datalen;
 
-	error = brcm_pci_msgbuf_dcmd(sc, BRCM_C_SET_VAR, true, buf, buflen,
+	error = bwfm_pci_msgbuf_dcmd(sc, BWFM_C_SET_VAR, true, buf, buflen,
 	    NULL, &rlen, &fwerr);
 	if (error == 0 && fwerr != 0)
 		error = EIO;
@@ -1781,10 +1781,10 @@ brcm_pci_msgbuf_dcmd_set_var(struct brcm_pci_softc *sc, const char *name,
 }
 
 int
-brcm_pci_msgbuf_dcmd_get_var(struct brcm_pci_softc *sc, const char *name,
+bwfm_pci_msgbuf_dcmd_get_var(struct bwfm_pci_softc *sc, const char *name,
     void *data, size_t *datalenp)
 {
-	uint8_t buf[BRCM_IOVAR_BUF_MAX];
+	uint8_t buf[BWFM_IOVAR_BUF_MAX];
 	size_t namelen, buflen, rlen;
 	int32_t fwerr = 0;
 	int error;
@@ -1799,7 +1799,7 @@ brcm_pci_msgbuf_dcmd_get_var(struct brcm_pci_softc *sc, const char *name,
 	buflen = namelen + *datalenp;
 	rlen = *datalenp;
 
-	error = brcm_pci_msgbuf_dcmd(sc, BRCM_C_GET_VAR, false, buf, buflen,
+	error = bwfm_pci_msgbuf_dcmd(sc, BWFM_C_GET_VAR, false, buf, buflen,
 	    buf, &rlen, &fwerr);
 	if (error != 0)
 		return (error);
@@ -1816,19 +1816,19 @@ brcm_pci_msgbuf_dcmd_get_var(struct brcm_pci_softc *sc, const char *name,
  *
  * 1. Post one IOCTLRESP buffer.
  * 2. Copy params into mb->ioctbuf and enqueue an IOCTLPTR_REQ on
- *    H2D_CONTROL_SUBMIT with request_id BRCM_IOCTL_REQ_PKTID, a new
+ *    H2D_CONTROL_SUBMIT with request_id BWFM_IOCTL_REQ_PKTID, a new
  *    trans_id, and req_buf_addr pointing at mb->ioctbuf.
  * 3. Ring the doorbell and wait on dcmd_cv for up to 2s.
  * 4. On completion, copy the response fw wrote into mb->ioctbuf out to
  *    the caller and return fw's status in *fwerr.
  */
 int
-brcm_pci_msgbuf_dcmd(struct brcm_pci_softc *sc, uint32_t cmd, bool is_set,
+bwfm_pci_msgbuf_dcmd(struct bwfm_pci_softc *sc, uint32_t cmd, bool is_set,
     const void *params, size_t params_len, void *resp, size_t *resp_lenp,
     int32_t *fwerr)
 {
-	struct brcm_pci_msgbuf *mb = brcm_pci_msgbuf_state(sc);
-	struct brcm_pci_ring *ring;
+	struct bwfm_pci_msgbuf *mb = bwfm_pci_msgbuf_state(sc);
+	struct bwfm_pci_ring *ring;
 	struct msgbuf_ioctl_req_hdr *req;
 	uint16_t buf_len, out_len;
 	uint64_t paddr;
@@ -1836,8 +1836,8 @@ brcm_pci_msgbuf_dcmd(struct brcm_pci_softc *sc, uint32_t cmd, bool is_set,
 
 	if (mb == NULL || !mb->attached)
 		return (ENXIO);
-	if (params_len > BRCM_MSGBUF_MAX_CTL_PKT_SIZE ||
-	    (resp_lenp != NULL && *resp_lenp > BRCM_MSGBUF_MAX_CTL_PKT_SIZE))
+	if (params_len > BWFM_MSGBUF_MAX_CTL_PKT_SIZE ||
+	    (resp_lenp != NULL && *resp_lenp > BWFM_MSGBUF_MAX_CTL_PKT_SIZE))
 		return (E2BIG);
 
 	sx_xlock(&mb->dcmd_sx);
@@ -1850,7 +1850,7 @@ brcm_pci_msgbuf_dcmd(struct brcm_pci_softc *sc, uint32_t cmd, bool is_set,
 	}
 
 	/* Stage request payload. */
-	buf_len = (uint16_t)MIN(params_len, BRCM_MSGBUF_MAX_CTL_PKT_SIZE);
+	buf_len = (uint16_t)MIN(params_len, BWFM_MSGBUF_MAX_CTL_PKT_SIZE);
 	if (params != NULL && buf_len > 0)
 		memcpy(mb->ioctbuf.vaddr, params, buf_len);
 	else
@@ -1866,7 +1866,7 @@ brcm_pci_msgbuf_dcmd(struct brcm_pci_softc *sc, uint32_t cmd, bool is_set,
 	out_len = (uint16_t)MAX(buf_len,
 	    resp_lenp != NULL ? *resp_lenp : 0);
 
-	ring = &mb->rings[BRCM_H2D_MSGRING_CONTROL_SUBMIT];
+	ring = &mb->rings[BWFM_H2D_MSGRING_CONTROL_SUBMIT];
 	mtx_lock(&ring->lock);
 	req = ring_reserve_for_write(ring);
 	if (req == NULL) {
@@ -1882,10 +1882,10 @@ brcm_pci_msgbuf_dcmd(struct brcm_pci_softc *sc, uint32_t cmd, bool is_set,
 	mb->dcmd_reqid++;
 
 	memset(req, 0, sizeof(*req));
-	req->msg.msgtype = BRCM_MSGBUF_TYPE_IOCTLPTR_REQ;
+	req->msg.msgtype = BWFM_MSGBUF_TYPE_IOCTLPTR_REQ;
 	req->msg.ifidx = 0;
 	req->msg.flags = 0;
-	req->msg.request_id = htole32(BRCM_IOCTL_REQ_PKTID);
+	req->msg.request_id = htole32(BWFM_IOCTL_REQ_PKTID);
 	req->cmd = htole32(cmd);
 	req->trans_id = htole16(mb->dcmd_reqid);
 	req->input_buf_len = htole16(buf_len);
@@ -1921,11 +1921,11 @@ brcm_pci_msgbuf_dcmd(struct brcm_pci_softc *sc, uint32_t cmd, bool is_set,
 				    mb->stat_dcmd_timeout_consec);
 			/*
 			 * Fw crash recovery.  The threshold check lives in
-			 * if_brcm_pci.c, where struct brcm_pci_softc is
+			 * if_bwfm_pci.c, where struct bwfm_pci_softc is
 			 * fully defined; this file only sees a forward
 			 * declaration.
 			 */
-			brcm_pci_maybe_queue_crash_recover(sc);
+			bwfm_pci_maybe_queue_crash_recover(sc);
 			sx_xunlock(&mb->dcmd_sx);
 			return (ETIMEDOUT);
 		}
@@ -1960,17 +1960,17 @@ brcm_pci_msgbuf_dcmd(struct brcm_pci_softc *sc, uint32_t cmd, bool is_set,
  * re-entering while the thread is working.
  */
 int
-brcm_pci_msgbuf_isr_filter(void *arg)
+bwfm_pci_msgbuf_isr_filter(void *arg)
 {
-	struct brcm_pci_msgbuf *mb = arg;
+	struct bwfm_pci_msgbuf *mb = arg;
 	uint32_t status;
 
-	status = pcie2_read32(mb, BRCM_PCIE2REG_MAILBOXINT);
+	status = pcie2_read32(mb, BWFM_PCIE2REG_MAILBOXINT);
 	if (status == 0 || status == 0xffffffff)
 		return (FILTER_STRAY);
 
 	/* Mask; the thread re-enables after draining. */
-	pcie2_write32(mb, BRCM_PCIE2REG_MAILBOXMASK, 0);
+	pcie2_write32(mb, BWFM_PCIE2REG_MAILBOXMASK, 0);
 	mb->stat_isr_hits++;
 	return (FILTER_SCHEDULE_THREAD);
 }
@@ -1987,41 +1987,41 @@ static const char *
 bcmevent_name(uint32_t code)
 {
 	switch (code) {
-	case BRCM_PCI_E_SET_SSID:		return "SET_SSID";
-	case BRCM_PCI_E_JOIN:		return "JOIN";
-	case BRCM_PCI_E_START:		return "START";
-	case BRCM_PCI_E_AUTH:		return "AUTH";
-	case BRCM_PCI_E_AUTH_IND:		return "AUTH_IND";
-	case BRCM_PCI_E_DEAUTH:		return "DEAUTH";
-	case BRCM_PCI_E_DEAUTH_IND:		return "DEAUTH_IND";
-	case BRCM_PCI_E_ASSOC:		return "ASSOC";
-	case BRCM_PCI_E_ASSOC_IND:		return "ASSOC_IND";
-	case BRCM_PCI_E_REASSOC:		return "REASSOC";
-	case BRCM_PCI_E_REASSOC_IND:	return "REASSOC_IND";
-	case BRCM_PCI_E_DISASSOC:		return "DISASSOC";
-	case BRCM_PCI_E_DISASSOC_IND:	return "DISASSOC_IND";
-	case BRCM_PCI_E_LINK:		return "LINK";
-	case BRCM_PCI_E_MIC_ERROR:		return "MIC_ERROR";
-	case BRCM_PCI_E_ROAM:		return "ROAM";
-	case BRCM_PCI_E_PMKID_CACHE:	return "PMKID_CACHE";
-	case BRCM_PCI_E_EAPOL_MSG:		return "EAPOL_MSG";
-	case BRCM_PCI_E_SCAN_COMPLETE:	return "SCAN_COMPLETE";
-	case BRCM_PCI_E_JOIN_START:		return "JOIN_START";
-	case BRCM_PCI_E_ROAM_START:		return "ROAM_START";
-	case BRCM_PCI_E_ASSOC_START:	return "ASSOC_START";
-	case BRCM_PCI_E_PSK_SUP:		return "PSK_SUP";
-	case BRCM_PCI_E_COUNTRY_CODE_CHANGED: return "COUNTRY_CODE_CHANGED";
-	case BRCM_PCI_E_ACTION_FRAME:	return "ACTION_FRAME";
-	case BRCM_PCI_E_ESCAN_RESULT:	return "ESCAN_RESULT";
-	case BRCM_PCI_E_PROBERESP_MSG:	return "PROBERESP_MSG";
-	case BRCM_PCI_E_FIFO_CREDIT_MAP:	return "FIFO_CREDIT_MAP";
-	case BRCM_PCI_E_IF:		return "IF";
-	case BRCM_PCI_E_RSSI:		return "RSSI";
-	case BRCM_PCI_E_TRACE:		return "TRACE";
-	case BRCM_PCI_E_BEACON_RX:	return "BEACON_RX";
-	case BRCM_PCI_E_TXFAIL:		return "TXFAIL";
-	case BRCM_PCI_E_RADIO:		return "RADIO";
-	case BRCM_PCI_E_PSM_WATCHDOG:	return "PSM_WATCHDOG";
+	case BWFM_PCI_E_SET_SSID:		return "SET_SSID";
+	case BWFM_PCI_E_JOIN:		return "JOIN";
+	case BWFM_PCI_E_START:		return "START";
+	case BWFM_PCI_E_AUTH:		return "AUTH";
+	case BWFM_PCI_E_AUTH_IND:		return "AUTH_IND";
+	case BWFM_PCI_E_DEAUTH:		return "DEAUTH";
+	case BWFM_PCI_E_DEAUTH_IND:		return "DEAUTH_IND";
+	case BWFM_PCI_E_ASSOC:		return "ASSOC";
+	case BWFM_PCI_E_ASSOC_IND:		return "ASSOC_IND";
+	case BWFM_PCI_E_REASSOC:		return "REASSOC";
+	case BWFM_PCI_E_REASSOC_IND:	return "REASSOC_IND";
+	case BWFM_PCI_E_DISASSOC:		return "DISASSOC";
+	case BWFM_PCI_E_DISASSOC_IND:	return "DISASSOC_IND";
+	case BWFM_PCI_E_LINK:		return "LINK";
+	case BWFM_PCI_E_MIC_ERROR:		return "MIC_ERROR";
+	case BWFM_PCI_E_ROAM:		return "ROAM";
+	case BWFM_PCI_E_PMKID_CACHE:	return "PMKID_CACHE";
+	case BWFM_PCI_E_EAPOL_MSG:		return "EAPOL_MSG";
+	case BWFM_PCI_E_SCAN_COMPLETE:	return "SCAN_COMPLETE";
+	case BWFM_PCI_E_JOIN_START:		return "JOIN_START";
+	case BWFM_PCI_E_ROAM_START:		return "ROAM_START";
+	case BWFM_PCI_E_ASSOC_START:	return "ASSOC_START";
+	case BWFM_PCI_E_PSK_SUP:		return "PSK_SUP";
+	case BWFM_PCI_E_COUNTRY_CODE_CHANGED: return "COUNTRY_CODE_CHANGED";
+	case BWFM_PCI_E_ACTION_FRAME:	return "ACTION_FRAME";
+	case BWFM_PCI_E_ESCAN_RESULT:	return "ESCAN_RESULT";
+	case BWFM_PCI_E_PROBERESP_MSG:	return "PROBERESP_MSG";
+	case BWFM_PCI_E_FIFO_CREDIT_MAP:	return "FIFO_CREDIT_MAP";
+	case BWFM_PCI_E_IF:		return "IF";
+	case BWFM_PCI_E_RSSI:		return "RSSI";
+	case BWFM_PCI_E_TRACE:		return "TRACE";
+	case BWFM_PCI_E_BEACON_RX:	return "BEACON_RX";
+	case BWFM_PCI_E_TXFAIL:		return "TXFAIL";
+	case BWFM_PCI_E_RADIO:		return "RADIO";
+	case BWFM_PCI_E_PSM_WATCHDOG:	return "PSM_WATCHDOG";
 	default:			return "?";
 	}
 }
@@ -2030,27 +2030,27 @@ static const char *
 bcmevent_status_name(uint32_t status)
 {
 	switch (status) {
-	case BRCM_PCI_E_STATUS_SUCCESS:	return "SUCCESS";
-	case BRCM_PCI_E_STATUS_FAIL:	return "FAIL";
-	case BRCM_PCI_E_STATUS_TIMEOUT:	return "TIMEOUT";
-	case BRCM_PCI_E_STATUS_NO_NETWORKS:	return "NO_NETWORKS";
-	case BRCM_PCI_E_STATUS_ABORT:	return "ABORT";
-	case BRCM_PCI_E_STATUS_NO_ACK:	return "NO_ACK";
-	case BRCM_PCI_E_STATUS_UNSOLICITED:	return "UNSOLICITED";
-	case BRCM_PCI_E_STATUS_ATTEMPT:	return "ATTEMPT";
-	case BRCM_PCI_E_STATUS_PARTIAL:	return "PARTIAL";
-	case BRCM_PCI_E_STATUS_NEWSCAN:	return "NEWSCAN";
-	case BRCM_PCI_E_STATUS_NEWASSOC:	return "NEWASSOC";
-	case BRCM_PCI_E_STATUS_ERROR:	return "ERROR";
+	case BWFM_PCI_E_STATUS_SUCCESS:	return "SUCCESS";
+	case BWFM_PCI_E_STATUS_FAIL:	return "FAIL";
+	case BWFM_PCI_E_STATUS_TIMEOUT:	return "TIMEOUT";
+	case BWFM_PCI_E_STATUS_NO_NETWORKS:	return "NO_NETWORKS";
+	case BWFM_PCI_E_STATUS_ABORT:	return "ABORT";
+	case BWFM_PCI_E_STATUS_NO_ACK:	return "NO_ACK";
+	case BWFM_PCI_E_STATUS_UNSOLICITED:	return "UNSOLICITED";
+	case BWFM_PCI_E_STATUS_ATTEMPT:	return "ATTEMPT";
+	case BWFM_PCI_E_STATUS_PARTIAL:	return "PARTIAL";
+	case BWFM_PCI_E_STATUS_NEWSCAN:	return "NEWSCAN";
+	case BWFM_PCI_E_STATUS_NEWASSOC:	return "NEWASSOC";
+	case BWFM_PCI_E_STATUS_ERROR:	return "ERROR";
 	default:			return "?";
 	}
 }
 
 static void
-msgbuf_process_wl_event(struct brcm_pci_msgbuf *mb, void *item)
+msgbuf_process_wl_event(struct bwfm_pci_msgbuf *mb, void *item)
 {
 	struct msgbuf_rx_event *ev = item;
-	struct brcm_pci_dma_buf *evb;
+	struct bwfm_pci_dma_buf *evb;
 	uint32_t pktid, slot;
 	uint16_t datalen;
 	uint8_t *payload;
@@ -2060,13 +2060,13 @@ msgbuf_process_wl_event(struct brcm_pci_msgbuf *mb, void *item)
 
 	mb->stat_event_rx++;
 
-	if (!BRCM_EVENTBUF_IS_EVENT(pktid)) {
+	if (!BWFM_EVENTBUF_IS_EVENT(pktid)) {
 		device_printf(DEV(mb),
 		    "msgbuf: WL_EVENT pktid=0x%x not in eventbuf range\n",
 		    pktid);
 		return;
 	}
-	slot = BRCM_EVENTBUF_PKTID_SLOT(pktid);
+	slot = BWFM_EVENTBUF_PKTID_SLOT(pktid);
 	if (slot >= mb->max_eventbuf) {
 		device_printf(DEV(mb),
 		    "msgbuf: WL_EVENT slot %u out of range (max %u)\n",
@@ -2086,30 +2086,30 @@ msgbuf_process_wl_event(struct brcm_pci_msgbuf *mb, void *item)
 	if (datalen > evb->size)
 		datalen = evb->size;
 
-	if (datalen < BRCM_EVT_OFFSET_DATA) {
+	if (datalen < BWFM_EVT_OFFSET_DATA) {
 		device_printf(DEV(mb),
 		    "msgbuf: WL_EVENT ifidx=%u short (datalen=%u < %u)\n",
-		    ev->msg.ifidx, datalen, BRCM_EVT_OFFSET_DATA);
+		    ev->msg.ifidx, datalen, BWFM_EVT_OFFSET_DATA);
 		goto refill;
 	}
 	payload = evb->vaddr;
 	{
 		uint16_t etype;
-		struct brcm_bcm_ethhdr *eh;
-		struct brcm_bcm_event_msg *em;
+		struct bwfm_bcm_ethhdr *eh;
+		struct bwfm_bcm_event_msg *em;
 		uint32_t event_code, status, reason, data_len_field;
 		uint16_t version, flags;
 		const uint8_t *addr;
 
 		etype = be16dec(payload + 12);
-		if (etype != BRCM_ETH_TYPE_EVENT) {
+		if (etype != BWFM_ETH_TYPE_EVENT) {
 			device_printf(DEV(mb),
 			    "msgbuf: WL_EVENT unexpected etype=0x%04x "
 			    "(want 0x886c)\n", etype);
 			goto refill;
 		}
-		eh = (struct brcm_bcm_ethhdr *)(payload + BRCM_EVT_OFFSET_BCM_ETHHDR);
-		em = (struct brcm_bcm_event_msg *)(payload + BRCM_EVT_OFFSET_MSG);
+		eh = (struct bwfm_bcm_ethhdr *)(payload + BWFM_EVT_OFFSET_BCM_ETHHDR);
+		em = (struct bwfm_bcm_event_msg *)(payload + BWFM_EVT_OFFSET_MSG);
 
 		version = be16dec(&em->version);
 		flags = be16dec(&em->flags);
@@ -2127,14 +2127,14 @@ msgbuf_process_wl_event(struct brcm_pci_msgbuf *mb, void *item)
 		    bcmevent_status_name(status), status,
 		    reason, flags, em->ifidx,
 		    addr[0], addr[1], addr[2], addr[3], addr[4], addr[5],
-		    data_len_field, datalen - BRCM_EVT_OFFSET_DATA,
+		    data_len_field, datalen - BWFM_EVT_OFFSET_DATA,
 		    version, be16dec(&eh->subtype),
 		    be16dec(&eh->usr_subtype));
 	}
 	/*
 	 * Queue the payload for dispatch on taskqueue_thread.  Direct
 	 * dispatch here would deadlock: the ISR holds ring->lock, and
-	 * brcm_pci_msgbuf_event_up -> brcm_handle_event ->
+	 * bwfm_pci_msgbuf_event_up -> bwfm_handle_event ->
 	 * ieee80211_add_scan_result takes IEEE80211_LOCK.  Meanwhile the
 	 * scan path (fmac_scan_start_shim -> DCMD) holds IEEE80211_LOCK
 	 * while it waits for the IOCTL_CMPLT that this same ISR has to
@@ -2142,7 +2142,7 @@ msgbuf_process_wl_event(struct brcm_pci_msgbuf *mb, void *item)
 	 * IEEE80211_LOCK, at the cost of one malloc and memcpy per event.
 	 */
 	{
-		struct brcm_pci_event *ep;
+		struct bwfm_pci_event *ep;
 
 		ep = malloc(sizeof(*ep), M_DEVBUF, M_NOWAIT);
 		if (ep == NULL) {
@@ -2172,7 +2172,7 @@ refill:
  * the mbuf, pass it up, and refill the RX pool.
  */
 static void
-msgbuf_process_rx_complete(struct brcm_pci_msgbuf *mb, void *item)
+msgbuf_process_rx_complete(struct bwfm_pci_msgbuf *mb, void *item)
 {
 	struct msgbuf_rx_complete *rc = item;
 	struct mbuf *m;
@@ -2186,7 +2186,7 @@ msgbuf_process_rx_complete(struct brcm_pci_msgbuf *mb, void *item)
 	mb->stat_rx_data++;
 
 	m = rxpost_release(mb, pktid, &map, &type);
-	if (m == NULL || type != BRCM_RXPOST_DATA) {
+	if (m == NULL || type != BWFM_RXPOST_DATA) {
 		device_printf(DEV(mb),
 		    "msgbuf: RX_CMPLT pktid=%u unknown (m=%p type=%u)\n",
 		    pktid, m, type);
@@ -2208,7 +2208,7 @@ msgbuf_process_rx_complete(struct brcm_pci_msgbuf *mb, void *item)
 
 		/*
 		 * Strip fw's RX data offset, if any, trim to datalen and
-		 * pass the mbuf to net80211 through the shared brcm.c
+		 * pass the mbuf to net80211 through the shared bwfm.c
 		 * core.  As a fullmac STA, fw delivers 802.3 frames;
 		 * monitor-mode 802.11 frames are dropped.
 		 */
@@ -2218,12 +2218,12 @@ msgbuf_process_rx_complete(struct brcm_pci_msgbuf *mb, void *item)
 			m->m_len = datalen;
 			m->m_pkthdr.len = datalen;
 		}
-		if ((flags & BRCM_MSGBUF_PKT_FLAGS_FRAME_MASK) ==
-		    BRCM_MSGBUF_PKT_FLAGS_FRAME_802_11) {
+		if ((flags & BWFM_MSGBUF_PKT_FLAGS_FRAME_MASK) ==
+		    BWFM_MSGBUF_PKT_FLAGS_FRAME_802_11) {
 			/* Monitor-mode 802.11 frames are not handled. */
 			m_freem(m);
 		} else {
-			brcm_pci_msgbuf_rx_up(mb->sc, m, -50);
+			bwfm_pci_msgbuf_rx_up(mb->sc, m, -50);
 		}
 	}
 	mb->cur_rxbufpost--;
@@ -2235,7 +2235,7 @@ msgbuf_process_rx_complete(struct brcm_pci_msgbuf *mb, void *item)
  * waiter; GEN_STATUS, RING_STATUS and IOCTLPTR_REQ_ACK are only logged.
  */
 static void
-msgbuf_process_ctrl_msg(struct brcm_pci_msgbuf *mb, void *item)
+msgbuf_process_ctrl_msg(struct bwfm_pci_msgbuf *mb, void *item)
 {
 	struct msgbuf_common_hdr *hdr = item;
 	struct msgbuf_ioctl_resp_hdr *ioctl;
@@ -2243,7 +2243,7 @@ msgbuf_process_ctrl_msg(struct brcm_pci_msgbuf *mb, void *item)
 	mb->stat_ctl_msgs++;
 
 	switch (hdr->msgtype) {
-	case BRCM_MSGBUF_TYPE_IOCTL_CMPLT:
+	case BWFM_MSGBUF_TYPE_IOCTL_CMPLT:
 		ioctl = item;
 		mtx_lock(&mb->dcmd_mtx);
 		mb->dcmd_resp_status = (int16_t)le16toh(ioctl->compl_hdr.status);
@@ -2257,26 +2257,26 @@ msgbuf_process_ctrl_msg(struct brcm_pci_msgbuf *mb, void *item)
 		    le16toh(ioctl->trans_id),
 		    (int)mb->dcmd_resp_status, mb->dcmd_resp_len);
 		break;
-	case BRCM_MSGBUF_TYPE_FLOW_RING_CREATE_CMPLT:
+	case BWFM_MSGBUF_TYPE_FLOW_RING_CREATE_CMPLT:
 		msgbuf_process_flowring_create_cmplt(mb, item);
 		break;
-	case BRCM_MSGBUF_TYPE_FLOW_RING_DELETE_CMPLT:
+	case BWFM_MSGBUF_TYPE_FLOW_RING_DELETE_CMPLT:
 		msgbuf_process_flowring_delete_cmplt(mb, item);
 		break;
-	case BRCM_MSGBUF_TYPE_TX_STATUS:
+	case BWFM_MSGBUF_TYPE_TX_STATUS:
 		msgbuf_process_txstatus(mb, item);
 		break;
-	case BRCM_MSGBUF_TYPE_GEN_STATUS:
-	case BRCM_MSGBUF_TYPE_RING_STATUS:
-	case BRCM_MSGBUF_TYPE_IOCTLPTR_REQ_ACK:
+	case BWFM_MSGBUF_TYPE_GEN_STATUS:
+	case BWFM_MSGBUF_TYPE_RING_STATUS:
+	case BWFM_MSGBUF_TYPE_IOCTLPTR_REQ_ACK:
 		MDPRINTF(mb, 0,
 		    "msgbuf: ctrl msg type 0x%02x (ignored, first-light)\n",
 		    hdr->msgtype);
 		break;
-	case BRCM_MSGBUF_TYPE_WL_EVENT:
+	case BWFM_MSGBUF_TYPE_WL_EVENT:
 		msgbuf_process_wl_event(mb, item);
 		break;
-	case BRCM_MSGBUF_TYPE_RX_CMPLT:
+	case BWFM_MSGBUF_TYPE_RX_CMPLT:
 		msgbuf_process_rx_complete(mb, item);
 		break;
 	default:
@@ -2287,9 +2287,9 @@ msgbuf_process_ctrl_msg(struct brcm_pci_msgbuf *mb, void *item)
 }
 
 static void
-drain_d2h_ring(struct brcm_pci_msgbuf *mb, uint32_t ring_idx)
+drain_d2h_ring(struct bwfm_pci_msgbuf *mb, uint32_t ring_idx)
 {
-	struct brcm_pci_ring *ring = &mb->rings[ring_idx];
+	struct bwfm_pci_ring *ring = &mb->rings[ring_idx];
 	void *base;
 	uint16_t n, i;
 
@@ -2307,15 +2307,15 @@ drain_d2h_ring(struct brcm_pci_msgbuf *mb, uint32_t ring_idx)
 }
 
 void
-brcm_pci_msgbuf_isr_thread(void *arg)
+bwfm_pci_msgbuf_isr_thread(void *arg)
 {
-	struct brcm_pci_msgbuf *mb = arg;
+	struct bwfm_pci_msgbuf *mb = arg;
 	uint32_t status;
 
 	/* Read and ack the chip's interrupt status. */
-	status = pcie2_read32(mb, BRCM_PCIE2REG_MAILBOXINT);
+	status = pcie2_read32(mb, BWFM_PCIE2REG_MAILBOXINT);
 	if (status != 0 && status != 0xffffffff)
-		pcie2_write32(mb, BRCM_PCIE2REG_MAILBOXINT, status);
+		pcie2_write32(mb, BWFM_PCIE2REG_MAILBOXINT, status);
 
 	/*
 	 * Drain all three D2H rings.  D2H_CTRL carries IOCTL completions,
@@ -2323,14 +2323,14 @@ brcm_pci_msgbuf_isr_thread(void *arg)
 	 * TX_STATUS, and D2H_RX carries RX_CMPLT.  Fw indicates which ring
 	 * with the D2H_DB bits, but every ring is polled regardless.
 	 */
-	drain_d2h_ring(mb, BRCM_D2H_MSGRING_CONTROL_COMPLETE);
-	drain_d2h_ring(mb, BRCM_D2H_MSGRING_TX_COMPLETE);
-	drain_d2h_ring(mb, BRCM_D2H_MSGRING_RX_COMPLETE);
+	drain_d2h_ring(mb, BWFM_D2H_MSGRING_CONTROL_COMPLETE);
+	drain_d2h_ring(mb, BWFM_D2H_MSGRING_TX_COMPLETE);
+	drain_d2h_ring(mb, BWFM_D2H_MSGRING_RX_COMPLETE);
 
 	/* Re-arm the chip interrupt unless we are tearing down. */
 	if (mb->attached)
-		pcie2_write32(mb, BRCM_PCIE2REG_MAILBOXMASK,
-		    BRCM_PCIE_MB_INT_D2H_DB | BRCM_PCIE_MB_INT_FN0);
+		pcie2_write32(mb, BWFM_PCIE2REG_MAILBOXMASK,
+		    BWFM_PCIE_MB_INT_D2H_DB | BWFM_PCIE_MB_INT_FN0);
 }
 
 /*
@@ -2338,9 +2338,9 @@ brcm_pci_msgbuf_isr_thread(void *arg)
  * (armcr4_release succeeded).  A second attach is a no-op.
  */
 int
-brcm_pci_msgbuf_attach(struct brcm_pci_softc *sc)
+bwfm_pci_msgbuf_attach(struct bwfm_pci_softc *sc)
 {
-	struct brcm_pci_msgbuf *mb = brcm_pci_msgbuf_state(sc);
+	struct bwfm_pci_msgbuf *mb = bwfm_pci_msgbuf_state(sc);
 	uint32_t pcie2;
 	int error;
 
@@ -2352,26 +2352,26 @@ brcm_pci_msgbuf_attach(struct brcm_pci_softc *sc)
 	memset(mb, 0, sizeof(*mb));
 	mb->sc = sc;
 
-	pcie2 = brcm_pci_msgbuf_pcie2_base(sc);
+	pcie2 = bwfm_pci_msgbuf_pcie2_base(sc);
 	if (pcie2 == 0) {
-		device_printf(brcm_pci_msgbuf_dev(sc),
+		device_printf(bwfm_pci_msgbuf_dev(sc),
 		    "msgbuf: PCIe2 core not found in EROM\n");
 		return (ENOENT);
 	}
 	mb->pcie2_base = pcie2;
-	mb->intmask = BRCM_PCIE2REG_INTMASK;
-	mb->mailboxint = BRCM_PCIE2REG_MAILBOXINT;
-	mb->mailboxmask = BRCM_PCIE2REG_MAILBOXMASK;
-	mb->h2d_mailbox_0 = BRCM_PCIE2REG_H2D_MAILBOX_0;
+	mb->intmask = BWFM_PCIE2REG_INTMASK;
+	mb->mailboxint = BWFM_PCIE2REG_MAILBOXINT;
+	mb->mailboxmask = BWFM_PCIE2REG_MAILBOXMASK;
+	mb->h2d_mailbox_0 = BWFM_PCIE2REG_H2D_MAILBOX_0;
 
-	sx_init(&mb->dcmd_sx, "brcm_pci_dcmd_sx");
-	mtx_init(&mb->dcmd_mtx, "brcm_pci_dcmd_mtx", NULL, MTX_DEF);
-	cv_init(&mb->dcmd_cv, "brcm_pci_dcmd_cv");
-	mtx_init(&mb->flow_mtx, "brcm_pci_flow_mtx", NULL, MTX_DEF);
-	cv_init(&mb->flow_cv, "brcm_pci_flow_cv");
-	mtx_init(&mb->pktid_mtx, "brcm_pci_pktid_mtx", NULL, MTX_DEF);
-	cv_init(&mb->pending_eapol_cv, "brcm_pci_eapol_cv");
-	mtx_init(&mb->rxpost_mtx, "brcm_pci_rxpost_mtx", NULL, MTX_DEF);
+	sx_init(&mb->dcmd_sx, "bwfm_pci_dcmd_sx");
+	mtx_init(&mb->dcmd_mtx, "bwfm_pci_dcmd_mtx", NULL, MTX_DEF);
+	cv_init(&mb->dcmd_cv, "bwfm_pci_dcmd_cv");
+	mtx_init(&mb->flow_mtx, "bwfm_pci_flow_mtx", NULL, MTX_DEF);
+	cv_init(&mb->flow_cv, "bwfm_pci_flow_cv");
+	mtx_init(&mb->pktid_mtx, "bwfm_pci_pktid_mtx", NULL, MTX_DEF);
+	cv_init(&mb->pending_eapol_cv, "bwfm_pci_eapol_cv");
+	mtx_init(&mb->rxpost_mtx, "bwfm_pci_rxpost_mtx", NULL, MTX_DEF);
 
 	error = msgbuf_read_shared_info(mb);
 	if (error != 0)
@@ -2386,8 +2386,8 @@ brcm_pci_msgbuf_attach(struct brcm_pci_softc *sc)
 		goto fail;
 
 	/* IOCTL request buffer: host memory fw reads the request from. */
-	error = brcm_pci_msgbuf_dma_alloc(mb, &mb->ioctbuf,
-	    BRCM_MSGBUF_MAX_CTL_PKT_SIZE, "ioctbuf");
+	error = bwfm_pci_msgbuf_dma_alloc(mb, &mb->ioctbuf,
+	    BWFM_MSGBUF_MAX_CTL_PKT_SIZE, "ioctbuf");
 	if (error != 0)
 		goto fail;
 
@@ -2396,14 +2396,14 @@ brcm_pci_msgbuf_attach(struct brcm_pci_softc *sc)
 	 * dma_alloc.  The buffers live as long as the driver: fw writes
 	 * one, we process it and re-post the same slot.
 	 *
-	 * Use BRCM_MSGBUF_MAX_EVENTBUF_POST rather than mb->max_eventbuf,
+	 * Use BWFM_MSGBUF_MAX_EVENTBUF_POST rather than mb->max_eventbuf,
 	 * which is not set until later in this function.
 	 */
 	{
 		uint32_t i;
-		for (i = 0; i < BRCM_MSGBUF_MAX_EVENTBUF_POST; i++) {
-			error = brcm_pci_msgbuf_dma_alloc(mb,
-			    &mb->eventbufs[i], BRCM_MSGBUF_MAX_CTL_PKT_SIZE,
+		for (i = 0; i < BWFM_MSGBUF_MAX_EVENTBUF_POST; i++) {
+			error = bwfm_pci_msgbuf_dma_alloc(mb,
+			    &mb->eventbufs[i], BWFM_MSGBUF_MAX_CTL_PKT_SIZE,
 			    "evtbuf");
 			if (error != 0) {
 				device_printf(DEV(mb),
@@ -2415,7 +2415,7 @@ brcm_pci_msgbuf_attach(struct brcm_pci_softc *sc)
 	}
 
 	/* Deferred WL_EVENT dispatch queue. */
-	mtx_init(&mb->event_q_mtx, "brcm_pci_evtq", NULL, MTX_DEF);
+	mtx_init(&mb->event_q_mtx, "bwfm_pci_evtq", NULL, MTX_DEF);
 	STAILQ_INIT(&mb->event_q);
 	TASK_INIT(&mb->event_task, 0, msgbuf_event_task, mb);
 
@@ -2426,7 +2426,7 @@ brcm_pci_msgbuf_attach(struct brcm_pci_softc *sc)
 		error = ENOMEM;
 		goto fail;
 	}
-	mb->pktids = malloc(BRCM_MSGBUF_MAX_PKTID * sizeof(*mb->pktids),
+	mb->pktids = malloc(BWFM_MSGBUF_MAX_PKTID * sizeof(*mb->pktids),
 	    M_DEVBUF, M_WAITOK | M_ZERO);
 	if (mb->pktids == NULL) {
 		error = ENOMEM;
@@ -2455,8 +2455,8 @@ brcm_pci_msgbuf_attach(struct brcm_pci_softc *sc)
 	    /* alignment */ 4, /* boundary */ 0,
 	    BUS_SPACE_MAXADDR_32BIT, BUS_SPACE_MAXADDR,
 	    NULL, NULL,
-	    /* maxsize */ BRCM_MSGBUF_MAX_CTL_PKT_SIZE, /* nsegments */ 1,
-	    /* maxsegsize */ BRCM_MSGBUF_MAX_CTL_PKT_SIZE,
+	    /* maxsize */ BWFM_MSGBUF_MAX_CTL_PKT_SIZE, /* nsegments */ 1,
+	    /* maxsegsize */ BWFM_MSGBUF_MAX_CTL_PKT_SIZE,
 	    0, NULL, NULL, &mb->rx_mbuf_tag);
 	if (error != 0) {
 		device_printf(DEV(mb),
@@ -2465,14 +2465,14 @@ brcm_pci_msgbuf_attach(struct brcm_pci_softc *sc)
 	}
 
 	/* RXPOST tracking table. */
-	mb->rxposts = malloc(BRCM_MSGBUF_MAX_RXPOST * sizeof(*mb->rxposts),
+	mb->rxposts = malloc(BWFM_MSGBUF_MAX_RXPOST * sizeof(*mb->rxposts),
 	    M_DEVBUF, M_WAITOK | M_ZERO);
 	if (mb->rxposts == NULL) {
 		error = ENOMEM;
 		goto fail;
 	}
 	mb->rxpost_next_hint = 1;
-	mb->max_eventbuf = BRCM_MSGBUF_MAX_EVENTBUF_POST;
+	mb->max_eventbuf = BWFM_MSGBUF_MAX_EVENTBUF_POST;
 	/* Clamp the max_rxbufpost fw advertised to a reasonable value. */
 	if (mb->max_rxbufpost > 128)
 		mb->max_rxbufpost = 128;
@@ -2490,23 +2490,23 @@ brcm_pci_msgbuf_attach(struct brcm_pci_softc *sc)
 	 * chips that are not strictly W1C, and is suspected of wedging
 	 * attach.
 	 */
-	pcie2_write32(mb, BRCM_PCIE2REG_MAILBOXMASK, 0);
+	pcie2_write32(mb, BWFM_PCIE2REG_MAILBOXMASK, 0);
 	{
-		uint32_t stale = pcie2_read32(mb, BRCM_PCIE2REG_MAILBOXINT);
+		uint32_t stale = pcie2_read32(mb, BWFM_PCIE2REG_MAILBOXINT);
 		if (stale != 0 && stale != 0xffffffff)
-			pcie2_write32(mb, BRCM_PCIE2REG_MAILBOXINT, stale);
+			pcie2_write32(mb, BWFM_PCIE2REG_MAILBOXINT, stale);
 	}
 
-	error = brcm_pci_msgbuf_bind_intr(sc, brcm_pci_msgbuf_isr_filter,
-	    brcm_pci_msgbuf_isr_thread, mb);
+	error = bwfm_pci_msgbuf_bind_intr(sc, bwfm_pci_msgbuf_isr_filter,
+	    bwfm_pci_msgbuf_isr_thread, mb);
 	if (error != 0) {
 		mb->attached = false;
 		goto fail;
 	}
 
 	/* Unmask the chip's interrupts. */
-	pcie2_write32(mb, BRCM_PCIE2REG_MAILBOXMASK,
-	    BRCM_PCIE_MB_INT_D2H_DB | BRCM_PCIE_MB_INT_FN0);
+	pcie2_write32(mb, BWFM_PCIE2REG_MAILBOXMASK,
+	    BWFM_PCIE_MB_INT_D2H_DB | BWFM_PCIE_MB_INT_FN0);
 
 	/*
 	 * With the interrupt armed, prime the RX pools.  Event buffers go
@@ -2543,19 +2543,19 @@ brcm_pci_msgbuf_attach(struct brcm_pci_softc *sc)
 		    posted, mb->max_rxbufpost);
 	}
 
-	device_printf(brcm_pci_msgbuf_dev(sc),
+	device_printf(bwfm_pci_msgbuf_dev(sc),
 	    "msgbuf: attach OK — rings + scratch + ioctbuf + ISR bound\n");
 	return (0);
 
 fail:
-	brcm_pci_msgbuf_detach(sc);
+	bwfm_pci_msgbuf_detach(sc);
 	return (error);
 }
 
 void
-brcm_pci_msgbuf_detach(struct brcm_pci_softc *sc)
+bwfm_pci_msgbuf_detach(struct bwfm_pci_softc *sc)
 {
-	struct brcm_pci_msgbuf *mb = brcm_pci_msgbuf_state(sc);
+	struct bwfm_pci_msgbuf *mb = bwfm_pci_msgbuf_state(sc);
 	bool was_attached;
 	int i;
 
@@ -2566,15 +2566,15 @@ brcm_pci_msgbuf_detach(struct brcm_pci_softc *sc)
 
 	/* Mask the chip interrupt and unbind before freeing DMA memory. */
 	if (was_attached) {
-		pcie2_write32(mb, BRCM_PCIE2REG_MAILBOXMASK, 0);
+		pcie2_write32(mb, BWFM_PCIE2REG_MAILBOXMASK, 0);
 		mb->attached = false;
 	}
-	brcm_pci_msgbuf_unbind_intr(sc);
+	bwfm_pci_msgbuf_unbind_intr(sc);
 
 	/* Reclaim posted RX/event mbufs before killing rx_mbuf_tag. */
 	if (mb->rxposts != NULL) {
 		uint32_t k;
-		for (k = 1; k < BRCM_MSGBUF_MAX_RXPOST; k++) {
+		for (k = 1; k < BWFM_MSGBUF_MAX_RXPOST; k++) {
 			bus_dmamap_t map = NULL;
 			uint8_t type = 0;
 			struct mbuf *m = rxpost_release(mb, k, &map, &type);
@@ -2597,7 +2597,7 @@ brcm_pci_msgbuf_detach(struct brcm_pci_softc *sc)
 	/* Reclaim in-flight TX mbufs before destroying tx_mbuf_tag. */
 	if (mb->pktids != NULL) {
 		uint32_t k;
-		for (k = 1; k < BRCM_MSGBUF_MAX_PKTID; k++) {
+		for (k = 1; k < BWFM_MSGBUF_MAX_PKTID; k++) {
 			bus_dmamap_t map = NULL;
 			struct mbuf *m = pktid_release(mb, k, &map);
 			if (m != NULL) {
@@ -2618,43 +2618,43 @@ brcm_pci_msgbuf_detach(struct brcm_pci_softc *sc)
 
 	/*
 	 * Free the flowring buffers.  Fw keeps ring state until it sees
-	 * FLOW_RING_DELETE (brcm_pci_msgbuf_flowring_delete_all); detach
+	 * FLOW_RING_DELETE (bwfm_pci_msgbuf_flowring_delete_all); detach
 	 * only frees the host side, and the chip faults if it DMAs to a
 	 * freed ring.
 	 */
 	if (mb->flowrings != NULL) {
 		uint32_t k;
 		for (k = 0; k < mb->max_flowrings; k++) {
-			struct brcm_pci_ring *fring = &mb->flowrings[k].ring;
+			struct bwfm_pci_ring *fring = &mb->flowrings[k].ring;
 			if (fring->inited) {
 				mtx_destroy(&fring->lock);
 				fring->inited = false;
 			}
-			brcm_pci_msgbuf_dma_free(mb, &fring->buf);
+			bwfm_pci_msgbuf_dma_free(mb, &fring->buf);
 		}
 		free(mb->flowrings, M_DEVBUF);
 		mb->flowrings = NULL;
 	}
 
-	for (i = 0; i < BRCM_NROF_COMMON_MSGRINGS; i++) {
-		struct brcm_pci_ring *ring = &mb->rings[i];
+	for (i = 0; i < BWFM_NROF_COMMON_MSGRINGS; i++) {
+		struct bwfm_pci_ring *ring = &mb->rings[i];
 		if (ring->inited) {
 			mtx_destroy(&ring->lock);
 			ring->inited = false;
 		}
-		brcm_pci_msgbuf_dma_free(mb, &ring->buf);
+		bwfm_pci_msgbuf_dma_free(mb, &ring->buf);
 	}
-	brcm_pci_msgbuf_dma_free(mb, &mb->scratch);
-	brcm_pci_msgbuf_dma_free(mb, &mb->ringupd);
-	brcm_pci_msgbuf_dma_free(mb, &mb->ioctbuf);
+	bwfm_pci_msgbuf_dma_free(mb, &mb->scratch);
+	bwfm_pci_msgbuf_dma_free(mb, &mb->ringupd);
+	bwfm_pci_msgbuf_dma_free(mb, &mb->ioctbuf);
 	{
 		uint32_t i;
 		for (i = 0; i < 8; i++)
-			brcm_pci_msgbuf_dma_free(mb, &mb->eventbufs[i]);
+			bwfm_pci_msgbuf_dma_free(mb, &mb->eventbufs[i]);
 	}
 
 	if (was_attached) {
-		struct brcm_pci_event *ep;
+		struct bwfm_pci_event *ep;
 
 		/* Drain the event task first — it may hold event_q_mtx. */
 		taskqueue_drain(taskqueue_thread, &mb->event_task);

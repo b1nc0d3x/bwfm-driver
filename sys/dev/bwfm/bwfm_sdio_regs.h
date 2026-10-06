@@ -5,7 +5,7 @@
  * Copyright (c) 2010-2016 Broadcom Corporation
  * Copyright (c) 2018 Patrick Wildt <patrick@blueri.se>
  *
- * Broadcom-only SDIO host-side registers for brcm_sdio.
+ * Broadcom-only SDIO host-side registers for bwfm_sdio.
  *
  * These are NOT in any SD/SDIO spec. They come from Linux
  * brcmfmac (drivers/net/wireless/broadcom/brcm80211/
@@ -31,7 +31,7 @@
  *     CMD52 / CMD53 to func 1.
  *
  *   * SDIO function 2 is the WLAN frame FIFO, used once the
- *     firmware is running (see brcm_sdpcm.c).
+ *     firmware is running (see bwfm_sdpcm.c).
  *
  * How the backplane window works:
  *
@@ -58,8 +58,8 @@
  *   not spend 3 CMD52s per chunk.
  */
 
-#ifndef _BRCM_SDIO_REGS_H_
-#define _BRCM_SDIO_REGS_H_
+#ifndef _BWFM_SDIO_REGS_H_
+#define _BWFM_SDIO_REGS_H_
 
 /*
  * SDIO func 1 register addresses for the host-side SDIO
@@ -152,23 +152,23 @@
  * Vendor CCCR registers Broadcom adds above the standard
  * CCCR layout (0x00..0x17).
  *
- * BRCM_CARDCAP says which CMD14 (sleep-control) variant the
- * chip supports. BRCM_SEPINT routes the host-wake interrupt
+ * BWFM_CARDCAP says which CMD14 (sleep-control) variant the
+ * chip supports. BWFM_SEPINT routes the host-wake interrupt
  * out of band on platforms wired that way; this driver does
  * not use it.
  */
-#define	SDIO_CCCR_BRCM_CARDCAP			0xF0
-#define	 SDIO_CCCR_BRCM_CARDCAP_CMD14_SUPPORT	(1u << 1)
-#define	 SDIO_CCCR_BRCM_CARDCAP_CMD14_EXT	(1u << 2)
-#define	 SDIO_CCCR_BRCM_CARDCAP_CMD_NODEC	(1u << 3)
+#define	SDIO_CCCR_BWFM_CARDCAP			0xF0
+#define	 SDIO_CCCR_BWFM_CARDCAP_CMD14_SUPPORT	(1u << 1)
+#define	 SDIO_CCCR_BWFM_CARDCAP_CMD14_EXT	(1u << 2)
+#define	 SDIO_CCCR_BWFM_CARDCAP_CMD_NODEC	(1u << 3)
 
-#define	SDIO_CCCR_BRCM_CARDCTRL			0xF1
-#define	 SDIO_CCCR_BRCM_CARDCTRL_WLANRESET	(1u << 1)
+#define	SDIO_CCCR_BWFM_CARDCTRL			0xF1
+#define	 SDIO_CCCR_BWFM_CARDCTRL_WLANRESET	(1u << 1)
 
-#define	SDIO_CCCR_BRCM_SEPINT			0xF2
-#define	 SDIO_CCCR_BRCM_SEPINT_MASK		(1u << 0)
-#define	 SDIO_CCCR_BRCM_SEPINT_OE		(1u << 1)
-#define	 SDIO_CCCR_BRCM_SEPINT_ACT_HI		(1u << 2)
+#define	SDIO_CCCR_BWFM_SEPINT			0xF2
+#define	 SDIO_CCCR_BWFM_SEPINT_MASK		(1u << 0)
+#define	 SDIO_CCCR_BWFM_SEPINT_OE		(1u << 1)
+#define	 SDIO_CCCR_BWFM_SEPINT_ACT_HI		(1u << 2)
 
 /*
  * Function 1 / Function 2 enable + ready bit masks.
@@ -200,13 +200,13 @@
  * Linux reads this register right after enabling function 1
  * to prove the backplane window plumbing works.
  */
-#define	BRCM_CC_CORE_BASE	0x18000000U
-#define	BRCM_CC_CHIPID		0x00
+#define	BWFM_CC_CORE_BASE	0x18000000U
+#define	BWFM_CC_CHIPID		0x00
 
-#define	BRCM_CHIPID_ID(reg)	((reg) & 0x0000FFFF)
-#define	BRCM_CHIPID_REV(reg)	(((reg) >> 16) & 0xF)
-#define	BRCM_CHIPID_PKG(reg)	(((reg) >> 20) & 0xF)
-#define	BRCM_CHIPID_NUMCORES(reg) (((reg) >> 24) & 0xF)
+#define	BWFM_CHIPID_ID(reg)	((reg) & 0x0000FFFF)
+#define	BWFM_CHIPID_REV(reg)	(((reg) >> 16) & 0xF)
+#define	BWFM_CHIPID_PKG(reg)	(((reg) >> 20) & 0xF)
+#define	BWFM_CHIPID_NUMCORES(reg) (((reg) >> 24) & 0xF)
 
 /*
  * BCM chip family IDs as they show up in CC.CHIPID bits 0..15.
@@ -216,42 +216,42 @@
  * register value here so grepping against the wire is easy.
  * That hex value is what the host reads from the chip.
  */
-#define	BRCM_CHIP_BCM43430	0xa9a6	/* Linux: BRCM_CC_43430_CHIP_ID */
-#define	BRCM_CHIP_BCM4339	0x4339
-#define	BRCM_CHIP_BCM4345	0x4345	/* BCM43455/43456 silicon family */
-#define	BRCM_CHIP_BCM4354	0x4354
-#define	BRCM_CHIP_BCM4356	0x4356
-#define	BRCM_CHIP_BCM4359	0x4359
-#define	BRCM_CHIP_BCM4373	0x4373	/* CYW4373 */
+#define	BWFM_CHIP_BCM43430	0xa9a6	/* Linux: BRCM_CC_43430_CHIP_ID */
+#define	BWFM_CHIP_BCM4339	0x4339
+#define	BWFM_CHIP_BCM4345	0x4345	/* BCM43455/43456 silicon family */
+#define	BWFM_CHIP_BCM4354	0x4354
+#define	BWFM_CHIP_BCM4356	0x4356
+#define	BWFM_CHIP_BCM4359	0x4359
+#define	BWFM_CHIP_BCM4373	0x4373	/* CYW4373 */
 
 /*
  * ARM core type at the chip's compute centre.
  *
  * Picks the passive/active reset sequence we use:
  *
- *   BRCM_ARM_CM3 Cortex-M3, simple MCU. BCM4329, BCM43430,
+ *   BWFM_ARM_CM3 Cortex-M3, simple MCU. BCM4329, BCM43430,
  *                BCM43439. ARM reset uses SOCRAM's standard
  *                reset bit.
- *   BRCM_ARM_CR4 Cortex-R4, real-time. BCM4345/43455,
+ *   BWFM_ARM_CR4 Cortex-R4, real-time. BCM4345/43455,
  *                BCM4339, BCM4354, BCM4356, BCM4359, BCM4373.
  *                Has its own "rstvec" register. Firmware
  *                load address is not always the ARM reset
  *                vector (we program the vector via CR4 TCM).
- *   BRCM_ARM_CA7 Cortex-A7, application class. Newer chips
+ *   BWFM_ARM_CA7 Cortex-A7, application class. Newer chips
  *                (BCM43596, etc.). Listed to cover the three
  *                ARM core ids Linux handles
  *                (BCMA_CORE_ARM_CM3/CR4/CA7).
  */
-enum brcm_arm_core {
-	BRCM_ARM_CM3 = 1,
-	BRCM_ARM_CR4 = 2,
-	BRCM_ARM_CA7 = 3,
+enum bwfm_arm_core {
+	BWFM_ARM_CM3 = 1,
+	BWFM_ARM_CR4 = 2,
+	BWFM_ARM_CA7 = 3,
 };
 
 /*
  * ChipCommon (CC) core register offsets.
  *
- * CC always sits at BRCM_CC_CORE_BASE. Beyond CHIPID at
+ * CC always sits at BWFM_CC_CORE_BASE. Beyond CHIPID at
  * offset 0, we care about EROMPTR at offset 0xFC. That is
  * the pointer to the Enumeration ROM, which lists every
  * core on the backplane. Walking EROM finds the ARM CR4
@@ -262,7 +262,7 @@ enum brcm_arm_core {
  * The chip's AHB-style mirror at 0x40C does not exist on
  * the SoC variant we reach over SDIO.
  */
-#define	BRCM_CC_EROMPTR		0xFC
+#define	BWFM_CC_EROMPTR		0xFC
 
 /*
  * EROM descriptor decode.
@@ -336,7 +336,7 @@ enum brcm_arm_core {
  * Only the fields the chip activate sequence touches are
  * here.
  */
-#define	BRCM_SD_REG_INTSTATUS		0x020
+#define	BWFM_SD_REG_INTSTATUS		0x020
 
 /*
  * Wrapper register offsets, shared across cores.
@@ -365,23 +365,23 @@ enum brcm_arm_core {
  *
  * Lives at chipcommon base + 0x600. Linux uses chipcommon
  * unless the chip has a separate PMU core (ccrev >= 35 with
- * the AOB capability); see brcm_chip_get_pmu().
+ * the AOB capability); see bwfm_chip_get_pmu().
  *
  * RES_RELOAD tells the PMU to reload its resource table. On
  * chips whose boot ROM left the resource state partial, the
  * PMU otherwise acks FORCE_HT in CHIPCLKCSR but never asserts
  * HT_AVAIL; after the reload it grants HT.
  */
-#define	BRCM_CC_PMUCONTROL			0x00000600
-#define	 BRCM_CC_PMUCONTROL_RES_MASK		0x00006000
-#define	 BRCM_CC_PMUCONTROL_RES_SHIFT		13
-#define	 BRCM_CC_PMUCONTROL_RES_RELOAD		0x2
-#define	BRCM_CC_PMUCAPABILITIES			0x00000604
-#define	BRCM_CC_PMUSTATUS			0x00000608
-#define	BRCM_CC_PMU_RES_STATE			0x0000060c
-#define	BRCM_CC_PMU_RES_PENDING			0x00000610
-#define	BRCM_CC_PMU_MIN_RES_MASK		0x00000618
-#define	BRCM_CC_PMU_MAX_RES_MASK		0x0000061c
+#define	BWFM_CC_PMUCONTROL			0x00000600
+#define	 BWFM_CC_PMUCONTROL_RES_MASK		0x00006000
+#define	 BWFM_CC_PMUCONTROL_RES_SHIFT		13
+#define	 BWFM_CC_PMUCONTROL_RES_RELOAD		0x2
+#define	BWFM_CC_PMUCAPABILITIES			0x00000604
+#define	BWFM_CC_PMUSTATUS			0x00000608
+#define	BWFM_CC_PMU_RES_STATE			0x0000060c
+#define	BWFM_CC_PMU_RES_PENDING			0x00000610
+#define	BWFM_CC_PMU_MIN_RES_MASK		0x00000618
+#define	BWFM_CC_PMU_MAX_RES_MASK		0x0000061c
 #define	D11_BCMA_IOCTL_PHYCLOCKEN	0x0004
 #define	D11_BCMA_IOCTL_PHYRESET		0x0008
 
@@ -400,7 +400,7 @@ enum brcm_arm_core {
  *   ram_base    Chip-internal address where the firmware
  *               blob starts loading. On CR4 chips, also
  *               where we point the ARM rstvec after upload.
- *   fw_name     Short suffix. brcm_sdio prepends "brcmfmac"
+ *   fw_name     Short suffix. bwfm_sdio prepends "brcmfmac"
  *               and appends "-sdio.bin" or "-sdio.txt" to
  *               form the firmware(9) request name, following
  *               Linux's brcmfmac*-sdio.{bin,txt} naming.
@@ -409,14 +409,14 @@ enum brcm_arm_core {
  *               from generic ones. NULL means use the default
  *               "brcmfmac<fw_name>-sdio.txt".
  */
-struct brcm_sdio_chip_recipe {
+struct bwfm_sdio_chip_recipe {
 	uint16_t		chip_id;	/* chip family id */
 	uint32_t		chiprev_mask;	/* which chip revisions match */
 	uint32_t		ram_base;
-	enum brcm_arm_core	arm_core;	/* which ARM core type */
+	enum bwfm_arm_core	arm_core;	/* which ARM core type */
 	const char		*fw_name;
 	const char		*nvram_board;
 	const char		*desc;	/* human-readable name */
 };
 
-#endif /* _BRCM_SDIO_REGS_H_ */
+#endif /* _BWFM_SDIO_REGS_H_ */

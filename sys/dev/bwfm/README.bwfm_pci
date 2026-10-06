@@ -1,10 +1,10 @@
-brcm_pci -- FreeBSD driver for Broadcom FullMAC PCIe wireless chips
+bwfm_pci -- FreeBSD driver for Broadcom FullMAC PCIe wireless chips
 ===================================================================
 
 Hardware
 --------
 
-brcm_pci probes these Broadcom PCI device IDs (vendor 14e4):
+bwfm_pci probes these Broadcom PCI device IDs (vendor 14e4):
 
     43ba  BCM43602   full bring-up; the supported chip
     43a0  BCM4360    probe only
@@ -15,20 +15,20 @@ brcm_pci probes these Broadcom PCI device IDs (vendor 14e4):
 Only the BCM43602 is brought up.  It has been tested on the Apple
 MacBook Pro 11,4 (subsystem 106b:0152), revision A1.  The BCM4360 has
 no ARM-CR4 FullMAC firmware available, so bring-up is refused on it;
-see sys/modules/brcm_pci_fw_4360/Makefile.
+see sys/modules/bwfm_pci_fw_4360/Makefile.
 
 The BCM43602 firmware, brcmfmac43602-pcie.bin, is shipped as the
-brcm_pci_fw_43602 module and registered under the firmware(9) name
+bwfm_pci_fw_43602 module and registered under the firmware(9) name
 brcmfmac43602_pcie.
 
 Loading
 -------
 
-    kldload brcm_pci_fw_43602 brcm_pci
+    kldload bwfm_pci_fw_43602 bwfm_pci
 
 At boot, load it from rc.conf rather than loader.conf:
 
-    kld_list="brcm_pci_fw_43602 brcm_pci"
+    kld_list="bwfm_pci_fw_43602 bwfm_pci"
 
 kld_list loads the modules once the system is up.  Preloaded from
 loader.conf, the driver attaches during boot-time autoconfiguration,
@@ -49,9 +49,9 @@ to net80211.  This takes about nine seconds; kldload returns at once.  The
 device then appears in net.wlan.devices, and only wlan0 is left to
 create:
 
-    ifconfig wlan0 create wlandev brcm_pci0
+    ifconfig wlan0 create wlandev bwfm_pci0
 
-wlans_brcm_pci0 in rc.conf is too early, since netif runs before the
+wlans_bwfm_pci0 in rc.conf is too early, since netif runs before the
 bring-up has finished.
 
 Taking the last vap down leaves the network and turns the radio off
@@ -61,27 +61,27 @@ firmware stays loaded in between.
 Loader tunables
 ---------------
 
-    hw.brcm_pci.autostart=0
+    hw.bwfm_pci.autostart=0
         Leave the chip alone after attach and run the bring-up by hand:
 
-            sysctl dev.brcm_pci.0.bringup=1     # skip if fw_running is 1
-            sysctl dev.brcm_pci.0.msgbuf_attach=1
-            sysctl dev.brcm_pci.0.wlc_up=1
-            sysctl dev.brcm_pci.0.net80211_attach=1
+            sysctl dev.bwfm_pci.0.bringup=1     # skip if fw_running is 1
+            sysctl dev.bwfm_pci.0.msgbuf_attach=1
+            sysctl dev.bwfm_pci.0.wlc_up=1
+            sysctl dev.bwfm_pci.0.net80211_attach=1
 
-    hw.brcm_pci.attach_appu_warm=0
+    hw.bwfm_pci.attach_appu_warm=0
         Skip the warm-up sequence at attach (default 1).
 
-    hw.brcm_pci.pm_supported=1
+    hw.bwfm_pci.pm_supported=1
         Allow suspend/resume attempts (default 0, suspend is refused).
         Warm resume is best effort; a cold resume still needs
         kldunload and kldload.
 
-dev.brcm_pci_nvram_seed_enable (default 0) adds a random-seed prelude to
+dev.bwfm_pci_nvram_seed_enable (default 0) adds a random-seed prelude to
 the NVRAM image.  It is off because it stopped the BCM43602 firmware
 from coming up.
 
-Sysctls (dev.brcm_pci.0)
+Sysctls (dev.bwfm_pci.0)
 ------------------------
 
     debug                  log verbosity (0 = quiet)
@@ -125,7 +125,7 @@ FT.
 Known limits
 ------------
 
-- Do not kldunload brcm_pci after a vap has been created; reboot.
+- Do not kldunload bwfm_pci after a vap has been created; reboot.
   Detach is refused while net80211 is attached (destroy wlan0 and
   write 1 to net80211_detach first).
 - After the wireless power rail has been fully power-cycled, the

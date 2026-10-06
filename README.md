@@ -1,13 +1,13 @@
-# brcm — FreeBSD driver for Broadcom FullMAC wifi
+# bwfm — FreeBSD driver for Broadcom FullMAC wifi
 
 A native FreeBSD driver for Broadcom FullMAC wifi chips, the ones that run
 their own firmware and leave the host to configure joins and install keys.
 It comes as three loadable modules, one per bus, sharing one source tree in
-`sys/dev/brcm/`:
+`sys/dev/bwfm/`:
 
-- `brcm_pci` for PCIe cards
-- `brcm_sdio` for SDIO chips on ARM boards such as the Raspberry Pi
-- `brcm_usb` for USB dongles
+- `bwfm_pci` for PCIe cards
+- `bwfm_sdio` for SDIO chips on ARM boards such as the Raspberry Pi
+- `bwfm_usb` for USB dongles
 
 Station mode with WPA2-PSK works on all three. net80211 and wpa_supplicant
 drive the join and the 4-way handshake, and the driver installs the keys
@@ -28,9 +28,9 @@ repository does not ship.
 
 ## Requirements
 
-- FreeBSD 15.0 or later with kernel sources in `/usr/src`.  `brcm_usb` and
-  `brcm_pci` build against the stock sources (tested on 15.0 and 15.1).
-  `brcm_sdio` also needs the kernel's SDIO function layer
+- FreeBSD 15.0 or later with kernel sources in `/usr/src`.  `bwfm_usb` and
+  `bwfm_pci` build against the stock sources (tested on 15.0 and 15.1).
+  `bwfm_sdio` also needs the kernel's SDIO function layer
   (`sys/dev/mmc/sdio_func.[ch]` and the matching `mmc.c` changes), which
   stock FreeBSD does not have yet; it is on the `rkdev` branch of
   [FBSD_DEV](https://github.com/b1nc0d3x/FBSD_DEV).
@@ -47,9 +47,9 @@ Each module builds on its own. `SRCTOP` points at the top of this
 repository:
 
 ```
-cd sys/modules/brcm_sdio && make SRCTOP=$(pwd)/../../.. SYSDIR=/usr/src/sys
-cd sys/modules/brcm_usb  && make SRCTOP=$(pwd)/../../.. SYSDIR=/usr/src/sys
-cd sys/modules/brcm_pci  && make SRCTOP=$(pwd)/../../.. SYSDIR=/usr/src/sys
+cd sys/modules/bwfm_sdio && make SRCTOP=$(pwd)/../../.. SYSDIR=/usr/src/sys
+cd sys/modules/bwfm_usb  && make SRCTOP=$(pwd)/../../.. SYSDIR=/usr/src/sys
+cd sys/modules/bwfm_pci  && make SRCTOP=$(pwd)/../../.. SYSDIR=/usr/src/sys
 ```
 
 Build the matching firmware module the same way, for example
@@ -60,7 +60,7 @@ Build the matching firmware module the same way, for example
 Copy the modules and refresh the hints:
 
 ```
-install -m 555 sys/modules/brcm_sdio/brcm_sdio.ko \
+install -m 555 sys/modules/bwfm_sdio/bwfm_sdio.ko \
     sys/modules/brcmfmac43455_fw/brcmfmac43455_fw.ko /boot/modules/
 kldxref /boot/modules
 ```
@@ -70,62 +70,63 @@ ready (its firmware can come up after the network has started, and USB
 dongles can arrive at any time):
 
 ```
-install -m 644 etc/devd/brcm.conf /usr/local/etc/devd/
+install -m 644 etc/devd/bwfm.conf /usr/local/etc/devd/
 service devd restart
 ```
 
 Load the modules from `/etc/rc.conf`, cipher and firmware modules first:
 
 ```
-kld_list="wlan_ccmp wlan_tkip brcmfmac43455_fw brcm_sdio"
+kld_list="wlan_ccmp wlan_tkip brcmfmac43455_fw bwfm_sdio"
 ```
 
-For USB use `brcmfmac43236b_fw brcm_usb`, and for PCIe
-`brcm_pci_fw_43602 brcm_pci`. Then name the interface and let rc run
-wpa_supplicant and DHCP as usual (the PCIe device is `brcm_pci0`, so its
-line is `wlans_brcm_pci0`):
+For USB use `brcmfmac43236b_fw bwfm_usb`, and for PCIe
+`bwfm_pci_fw_43602 bwfm_pci`. Then name the interface and let rc run
+wpa_supplicant and DHCP as usual (the PCIe device is `bwfm_pci0`, so its
+line is `wlans_bwfm_pci0`):
 
 ```
-wlans_brcm0="wlan0"
+wlans_bwfm0="wlan0"
 ifconfig_wlan0="WPA DHCP"
 ```
 
 Each module brings its chip up from attach (firmware download, then
-net80211), so there are no bring-up scripts.  `hw.brcm_sdio.autostart=0`
-or `hw.brcm_pci.autostart=0` at the loader prompt turns that off.
+net80211), so there are no bring-up scripts.  `hw.bwfm_sdio.autostart=0`
+or `hw.bwfm_pci.autostart=0` at the loader prompt turns that off.
 
-`brcm_sdio` and `brcm_pci` cannot be unloaded while net80211 is
-attached, so replacing them takes a reboot.  `brcm_usb` unloads once its
+`bwfm_sdio` and `bwfm_pci` cannot be unloaded while net80211 is
+attached, so replacing them takes a reboot.  `bwfm_usb` unloads once its
 wlan interface is destroyed.
 
 ## Known issues
 
-- With both an SDIO and a USB chip in one machine, list `brcm_sdio` before
-  `brcm_usb` in `kld_list`.  If the USB device attaches first and the SDIO
-  chip becomes `brcm1`, the SDIO chip associates but receives no data.
+- With both an SDIO and a USB chip in one machine, list `bwfm_sdio` before
+  `bwfm_usb` in `kld_list`.  If the USB device attaches first and the SDIO
+  chip becomes `bwfm1`, the SDIO chip associates but receives no data.
 
 ## Layout
 
 ```
-sys/dev/brcm/
-    brcm.c                  net80211 glue, joins, key install (shared)
+sys/dev/bwfm/
+    bwfm.c                  net80211 glue, joins, key install (shared)
     ieee80211_fullmac.c/.h  FullMAC layer over net80211 (shared)
-    brcmreg.h, brcmvar.h    firmware interface definitions, softc
-    brcm_chip.c/.h          chip backplane walk and core reset
-    if_brcm_pci.c           PCIe attach, firmware download, rings
-    brcm_pci_msgbuf.c/.h    msgbuf protocol (PCIe)
-    if_brcm_sdio.c          SDIO attach and firmware bring-up
-    brcm_sdpcm.c/.h         SDPCM framing (SDIO)
-    brcm_sdio_regs.h        SDIO core registers
-    if_brcm_usb.c           USB attach and firmware download
+    bwfmreg.h, bwfmvar.h    firmware interface definitions, softc
+    bwfm_chip.c/.h          chip backplane walk and core reset
+    if_bwfm_pci.c           PCIe attach, firmware download, rings
+    bwfm_pci_msgbuf.c/.h    msgbuf protocol (PCIe)
+    if_bwfm_sdio.c          SDIO attach and firmware bring-up
+    bwfm_sdpcm.c/.h         SDPCM framing (SDIO)
+    bwfm_sdio_regs.h        SDIO core registers
+    if_bwfm_usb.c           USB attach and firmware download
 sys/modules/                one directory per module and firmware image
-etc/devd/brcm.conf          creates wlan interfaces when a device is ready
+etc/devd/bwfm.conf          creates wlan interfaces when a device is ready
 ```
 
 ## Credits
 
 The driver was written for FreeBSD, but its firmware interface follows
-Linux brcmfmac (Broadcom) and OpenBSD bwfm (Patrick Wildt). Files that
+Linux brcmfmac (Broadcom) and OpenBSD bwfm (Patrick Wildt). It takes its
+name from the OpenBSD and NetBSD driver for the same chips. Files that
 carry their definitions say so and keep their ISC notices.
 
 ## License

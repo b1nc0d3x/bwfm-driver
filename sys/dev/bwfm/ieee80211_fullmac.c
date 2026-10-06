@@ -73,7 +73,7 @@ static LIST_HEAD(fmac_list_head, fmac_state) fmac_list =
 
 /*
  * fmac_list_mtx is initialized via MTX_SYSINIT so that two transports
- * attaching in parallel (brcm_pci and brcm_sdio loaded concurrently,
+ * attaching in parallel (bwfm_pci and bwfm_sdio loaded concurrently,
  * say) can't race a lazy mtx_init and initialize the mutex twice.
  */
 MTX_SYSINIT(fmac_list_mtx, &fmac_list_mtx, "80211_fmac_list", MTX_DEF);
@@ -474,7 +474,7 @@ ieee80211_fmac_input_beacon(struct ieee80211com *ic, struct mbuf *m,
 
 	/*
 	 * Pick the first STA vap.  fmac is single-vap by contract
-	 * (brcm_vap_create rejects a second vap).
+	 * (bwfm_vap_create rejects a second vap).
 	 */
 	vap = TAILQ_FIRST(&ic->ic_vaps);
 	if (vap == NULL || vap->iv_bss == NULL) {
@@ -537,7 +537,7 @@ ieee80211_fmac_input_beacon(struct ieee80211com *ic, struct mbuf *m,
 		st = ieee80211_parse_beacon(ni, m, rxchan, &sp);
 		/*
 		 * Bypass swscan_add_scan and call scan_add (= sta_add)
-		 * directly; see brcm_add_scan_result for the same
+		 * directly; see bwfm_add_scan_result for the same
 		 * ISCAN_DISCARD rationale.  parse_beacon has fully
 		 * populated sp (tstamp, rates, ssid, ies, ...) so
 		 * sta_add has no NULL fields to deref.
@@ -651,7 +651,7 @@ ieee80211_fmac_eapol_rx(struct ieee80211com *ic,
 
 /*
  * Scan-result up-call.  The API takes a structured description, but
- * brcm still uses its own synthesised-beacon path because the scan
+ * bwfm still uses its own synthesised-beacon path because the scan
  * path is more invasive to change than the state-machine paths.
  * This is a stub until a second driver needs it.
  */

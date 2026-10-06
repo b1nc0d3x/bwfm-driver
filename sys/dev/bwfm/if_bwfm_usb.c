@@ -3,23 +3,23 @@
  *
  * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
  *
- * Broadcom FullMAC USB transport glue for brcm.
+ * Broadcom FullMAC USB transport glue for bwfm.
  *
  * Lifecycle (BCM43236 example):
  *   1. uhub matches us via STRUCT_USB_HOST_ID; probe accepts iface 0.
  *   2. attach() discovers bulk-IN / bulk-OUT endpoints, sets up the
  *      usb_xfer slots, then issues DL_GETVER to read the boot ROM.
- *   3. If the chip reports BRCM_POSTBOOT_ID, firmware already runs and
- *      we jump straight to brcm_attach() to wire net80211.
- *   4. Otherwise we look up the chip in brcm_chip_table, fetch the
+ *   3. If the chip reports BWFM_POSTBOOT_ID, firmware already runs and
+ *      we jump straight to bwfm_attach() to wire net80211.
+ *   4. Otherwise we look up the chip in bwfm_chip_table, fetch the
  *      firmware(9) blob, push it through DL_START / chunked bulk-OUT /
- *      DL_GO, then poll DL_GETVER until BRCM_POSTBOOT_ID appears.
- *      Finally we call brcm_attach().
+ *      DL_GO, then poll DL_GETVER until BWFM_POSTBOOT_ID appears.
+ *      Finally we call bwfm_attach().
  *
  * Bus ops:
  *   bs_txctl   USB vendor-class control OUT (bmReq 0x21, bReq 0)
  *   bs_rxctl   Drained by the dedicated EP0-pump kthread; the core
- *              owns the wakeup/match logic via brcm_rxctl().
+ *              owns the wakeup/match logic via bwfm_rxctl().
  *   bs_txdata  Bulk-OUT pipe (post-boot data path).
  *   bs_stop    Wakes the kthread, then unsets transfers.
  *
@@ -57,58 +57,58 @@
 #include <dev/usb/usbdi.h>
 #include <dev/usb/usbdi_util.h>
 
-#include "brcmvar.h"
-#include "brcmreg.h"
+#include "bwfmvar.h"
+#include "bwfmreg.h"
 
-#define	BRCM_USB_DESC	"Broadcom FullMAC USB"
+#define	BWFM_USB_DESC	"Broadcom FullMAC USB"
 
 /*
  * USB transfer slots.
  *
- * BRCM_BULK_DL_OUT is used during the firmware download phase only;
- * once the chip is running it's effectively idle.  BRCM_BULK_TX_OUT
- * carries post-boot data frames.  BRCM_BULK_RX_IN feeds events +
- * data frames into brcm_rx_frame().  BRCM_INT_IN is informational
+ * BWFM_BULK_DL_OUT is used during the firmware download phase only;
+ * once the chip is running it's effectively idle.  BWFM_BULK_TX_OUT
+ * carries post-boot data frames.  BWFM_BULK_RX_IN feeds events +
+ * data frames into bwfm_rx_frame().  BWFM_INT_IN is informational
  * dongle status (8 bytes); we count + ignore.
  */
 enum {
-	BRCM_BULK_DL_OUT,
-	BRCM_BULK_TX_OUT,
-	BRCM_BULK_RX_IN,
-	BRCM_INT_IN,
-	BRCM_N_XFER,
+	BWFM_BULK_DL_OUT,
+	BWFM_BULK_TX_OUT,
+	BWFM_BULK_RX_IN,
+	BWFM_INT_IN,
+	BWFM_N_XFER,
 };
 
-#define	BRCM_TX_BUFSZ		2048
-#define	BRCM_CTL_REPLY_MAX	4096
+#define	BWFM_TX_BUFSZ		2048
+#define	BWFM_CTL_REPLY_MAX	4096
 
 /*
  * Per-mbuf TX queue node.  Caller-provided mbufs are wrapped into one
  * of these so the bulk-OUT callback can dequeue + ship + free in its
  * own context without referencing the original net80211 caller.
  */
-struct brcm_tx_pending {
-	STAILQ_ENTRY(brcm_tx_pending)	link;	/* queue linkage */
+struct bwfm_tx_pending {
+	STAILQ_ENTRY(bwfm_tx_pending)	link;	/* queue linkage */
 	struct mbuf			*m;	/* the frame to send */
 };
-STAILQ_HEAD(brcm_tx_queue, brcm_tx_pending);
+STAILQ_HEAD(bwfm_tx_queue, bwfm_tx_pending);
 
 /*
- * Per-USB-attach state.  Embeds a brcm_softc as its first member so
+ * Per-USB-attach state.  Embeds a bwfm_softc as its first member so
  * the core can recover us via container_of-style casts (the core
- * itself only sees a struct brcm_softc *).
+ * itself only sees a struct bwfm_softc *).
  */
-struct brcm_usb_softc {
-	struct brcm_softc	 bus_sc;	/* shared core state (first member) */
+struct bwfm_usb_softc {
+	struct bwfm_softc	 bus_sc;	/* shared core state (first member) */
 	struct usb_device	*sc_udev;	/* USB device handle */
-	struct usb_xfer		*sc_xfer[BRCM_N_XFER];	/* USB transfer slots */
+	struct usb_xfer		*sc_xfer[BWFM_N_XFER];	/* USB transfer slots */
 	struct proc		*sc_ctlrx_proc;	/* control-read thread */
 	u_int			 sc_ctl_want;	/* sent, reply not yet read */
 	uint8_t			 sc_iface_index;	/* USB interface number */
 	uint8_t			 sc_rx_ep;	/* bulk-in endpoint */
 	uint8_t			 sc_tx_ep;	/* bulk-out endpoint */
 
-	struct brcm_tx_queue	 sc_tx_q;	/* frames waiting to send */
+	struct bwfm_tx_queue	 sc_tx_q;	/* frames waiting to send */
 	bool			 sc_tx_running;	/* true while the tx pipe is busy */
 
 	/* Firmware download cursor (DL phase only). */
@@ -119,84 +119,84 @@ struct brcm_usb_softc {
 	int			 sc_dl_done;
 };
 
-#define	SC_TO_USB(sc)	__containerof((sc), struct brcm_usb_softc, bus_sc)
+#define	SC_TO_USB(sc)	__containerof((sc), struct bwfm_usb_softc, bus_sc)
 
-static const STRUCT_USB_HOST_ID brcm_usb_devs[] = {
-	{ USB_VPI(BRCM_USB_VENDOR_BROADCOM,
-	    BRCM_USB_PRODUCT_BCM43143, 0) },
-	{ USB_VPI(BRCM_USB_VENDOR_BROADCOM,
-	    BRCM_USB_PRODUCT_BCM43236, 0) },
-	{ USB_VPI(BRCM_USB_VENDOR_BROADCOM,
-	    BRCM_USB_PRODUCT_BCM43242, 0) },
-	{ USB_VPI(BRCM_USB_VENDOR_BROADCOM,
-	    BRCM_USB_PRODUCT_BCM43569, 0) },
-	{ USB_VPI(BRCM_USB_VENDOR_BROADCOM,
-	    BRCM_USB_PRODUCT_BCMFW,    0) },
+static const STRUCT_USB_HOST_ID bwfm_usb_devs[] = {
+	{ USB_VPI(BWFM_USB_VENDOR_BROADCOM,
+	    BWFM_USB_PRODUCT_BCM43143, 0) },
+	{ USB_VPI(BWFM_USB_VENDOR_BROADCOM,
+	    BWFM_USB_PRODUCT_BCM43236, 0) },
+	{ USB_VPI(BWFM_USB_VENDOR_BROADCOM,
+	    BWFM_USB_PRODUCT_BCM43242, 0) },
+	{ USB_VPI(BWFM_USB_VENDOR_BROADCOM,
+	    BWFM_USB_PRODUCT_BCM43569, 0) },
+	{ USB_VPI(BWFM_USB_VENDOR_BROADCOM,
+	    BWFM_USB_PRODUCT_BCMFW,    0) },
 };
 
-static usb_callback_t	brcm_usb_dl_cb;
-static usb_callback_t	brcm_usb_bulk_rx_cb;
-static usb_callback_t	brcm_usb_bulk_tx_cb;
-static usb_callback_t	brcm_usb_int_in_cb;
+static usb_callback_t	bwfm_usb_dl_cb;
+static usb_callback_t	bwfm_usb_bulk_rx_cb;
+static usb_callback_t	bwfm_usb_bulk_tx_cb;
+static usb_callback_t	bwfm_usb_int_in_cb;
 
-static void	brcm_usb_ctlrx_thread(void *);
+static void	bwfm_usb_ctlrx_thread(void *);
 
-static int	brcm_usb_dl_cmd(struct brcm_usb_softc *, uint8_t,
+static int	bwfm_usb_dl_cmd(struct bwfm_usb_softc *, uint8_t,
 		    void *, int);
-static int	brcm_usb_load_firmware(struct brcm_usb_softc *,
+static int	bwfm_usb_load_firmware(struct bwfm_usb_softc *,
 		    const uint8_t *, size_t);
-static int	brcm_usb_read_bootrom(struct brcm_usb_softc *);
-static int	brcm_usb_enumerate_endpoints(struct brcm_usb_softc *,
+static int	bwfm_usb_read_bootrom(struct bwfm_usb_softc *);
+static int	bwfm_usb_enumerate_endpoints(struct bwfm_usb_softc *,
 		    struct usb_attach_arg *);
 
 /* Bus ops, forward-declared so the const table can refer to them. */
-static int	brcm_usb_bs_txctl(struct brcm_softc *, const void *, size_t);
-static int	brcm_usb_bs_rxctl(struct brcm_softc *, void *, size_t *, int);
-static int	brcm_usb_bs_txdata(struct brcm_softc *, struct mbuf *);
-static void	brcm_usb_bs_stop(struct brcm_softc *);
+static int	bwfm_usb_bs_txctl(struct bwfm_softc *, const void *, size_t);
+static int	bwfm_usb_bs_rxctl(struct bwfm_softc *, void *, size_t *, int);
+static int	bwfm_usb_bs_txdata(struct bwfm_softc *, struct mbuf *);
+static void	bwfm_usb_bs_stop(struct bwfm_softc *);
 
-static const struct brcm_bus_ops brcm_usb_bus_ops = {
-	.bs_txctl = brcm_usb_bs_txctl,
-	.bs_rxctl = brcm_usb_bs_rxctl,
-	.bs_txdata = brcm_usb_bs_txdata,
-	.bs_stop = brcm_usb_bs_stop,
+static const struct bwfm_bus_ops bwfm_usb_bus_ops = {
+	.bs_txctl = bwfm_usb_bs_txctl,
+	.bs_rxctl = bwfm_usb_bs_rxctl,
+	.bs_txdata = bwfm_usb_bs_txdata,
+	.bs_stop = bwfm_usb_bs_stop,
 };
 
-static const struct usb_config brcm_usb_config[BRCM_N_XFER] = {
-	[BRCM_BULK_DL_OUT] = {
+static const struct usb_config bwfm_usb_config[BWFM_N_XFER] = {
+	[BWFM_BULK_DL_OUT] = {
 		.type = UE_BULK,
 		.endpoint = UE_ADDR_ANY,
 		.direction = UE_DIR_OUT,
-		.bufsize = BRCM_TRX_RDL_CHUNK,
+		.bufsize = BWFM_TRX_RDL_CHUNK,
 		.flags = { .pipe_bof = 1, .force_short_xfer = 1, },
-		.callback = brcm_usb_dl_cb,
+		.callback = bwfm_usb_dl_cb,
 		.timeout = 5000,
 	},
-	[BRCM_BULK_TX_OUT] = {
+	[BWFM_BULK_TX_OUT] = {
 		.type = UE_BULK,
 		.endpoint = UE_ADDR_ANY,
 		.direction = UE_DIR_OUT,
-		.bufsize = BRCM_TX_BUFSZ,
+		.bufsize = BWFM_TX_BUFSZ,
 		.flags = { .pipe_bof = 1, .force_short_xfer = 1, },
-		.callback = brcm_usb_bulk_tx_cb,
+		.callback = bwfm_usb_bulk_tx_cb,
 		.timeout = 5000,
 	},
-	[BRCM_BULK_RX_IN] = {
+	[BWFM_BULK_RX_IN] = {
 		.type = UE_BULK,
 		.endpoint = UE_ADDR_ANY,
 		.direction = UE_DIR_IN,
 		.bufsize = 2048,
 		.flags = { .pipe_bof = 1, .short_xfer_ok = 1, },
-		.callback = brcm_usb_bulk_rx_cb,
+		.callback = bwfm_usb_bulk_rx_cb,
 		.timeout = 0,
 	},
-	[BRCM_INT_IN] = {
+	[BWFM_INT_IN] = {
 		.type = UE_INTERRUPT,
 		.endpoint = UE_ADDR_ANY,
 		.direction = UE_DIR_IN,
 		.bufsize = 64,
 		.flags = { .pipe_bof = 1, .short_xfer_ok = 1, },
-		.callback = brcm_usb_int_in_cb,
+		.callback = bwfm_usb_int_in_cb,
 		.timeout = 0,
 	},
 };
@@ -209,7 +209,7 @@ static const struct usb_config brcm_usb_config[BRCM_N_XFER] = {
  * first matching pair as the canonical bulk pipes.
  */
 static int
-brcm_usb_enumerate_endpoints(struct brcm_usb_softc *sc,
+bwfm_usb_enumerate_endpoints(struct bwfm_usb_softc *sc,
     struct usb_attach_arg *uaa)
 {
 	struct usb_endpoint_descriptor *ed;
@@ -252,7 +252,7 @@ brcm_usb_enumerate_endpoints(struct brcm_usb_softc *sc,
  * bRequest = cmd, payload of `len` bytes.  Synchronous.
  */
 static int
-brcm_usb_dl_cmd(struct brcm_usb_softc *sc, uint8_t cmd, void *buf, int len)
+bwfm_usb_dl_cmd(struct bwfm_usb_softc *sc, uint8_t cmd, void *buf, int len)
 {
 	struct usb_device_request req;
 	usb_error_t err;
@@ -281,9 +281,9 @@ brcm_usb_dl_cmd(struct brcm_usb_softc *sc, uint8_t cmd, void *buf, int len)
  * last chunk has been sent we set sc_dl_done and wake the loader.
  */
 static void
-brcm_usb_dl_cb(struct usb_xfer *xfer, usb_error_t error)
+bwfm_usb_dl_cb(struct usb_xfer *xfer, usb_error_t error)
 {
-	struct brcm_usb_softc *sc = usbd_xfer_softc(xfer);
+	struct bwfm_usb_softc *sc = usbd_xfer_softc(xfer);
 	struct usb_page_cache *pc;
 	size_t chunk;
 
@@ -298,8 +298,8 @@ brcm_usb_dl_cb(struct usb_xfer *xfer, usb_error_t error)
 		/* FALLTHROUGH */
 	case USB_ST_SETUP:
 		chunk = sc->sc_dl_len - sc->sc_dl_sent;
-		if (chunk > BRCM_TRX_RDL_CHUNK)
-			chunk = BRCM_TRX_RDL_CHUNK;
+		if (chunk > BWFM_TRX_RDL_CHUNK)
+			chunk = BWFM_TRX_RDL_CHUNK;
 		if (chunk == 0)
 			break;
 		pc = usbd_xfer_get_frame(xfer, 0);
@@ -324,27 +324,27 @@ brcm_usb_dl_cb(struct usb_xfer *xfer, usb_error_t error)
  *   4. DL_GO transfers control to the loaded image
  */
 static int
-brcm_usb_load_firmware(struct brcm_usb_softc *sc, const uint8_t *ucode,
+bwfm_usb_load_firmware(struct bwfm_usb_softc *sc, const uint8_t *ucode,
     size_t size)
 {
-	const struct brcm_trx_header *trx;
-	struct brcm_rdl_state state;
+	const struct bwfm_trx_header *trx;
+	struct bwfm_rdl_state state;
 	int error;
 
 	if (size < sizeof(*trx))
 		return (EINVAL);
-	trx = (const struct brcm_trx_header *)ucode;
-	if (le32toh(trx->magic) != BRCM_TRX_MAGIC ||
-	    (le32toh(trx->flag_version) & BRCM_TRX_UNCOMP_IMAGE) == 0) {
+	trx = (const struct bwfm_trx_header *)ucode;
+	if (le32toh(trx->magic) != BWFM_TRX_MAGIC ||
+	    (le32toh(trx->flag_version) & BWFM_TRX_UNCOMP_IMAGE) == 0) {
 		device_printf(sc->bus_sc.sc_dev, "invalid TRX header\n");
 		return (EINVAL);
 	}
 
 	memset(&state, 0, sizeof(state));
-	error = brcm_usb_dl_cmd(sc, BRCM_DL_START, &state, sizeof(state));
+	error = bwfm_usb_dl_cmd(sc, BWFM_DL_START, &state, sizeof(state));
 	if (error != 0)
 		return (error);
-	if (le32toh(state.state) != BRCM_DL_WAITING) {
+	if (le32toh(state.state) != BWFM_DL_WAITING) {
 		device_printf(sc->bus_sc.sc_dev,
 		    "DL_START refused (state=%u)\n", le32toh(state.state));
 		return (EIO);
@@ -357,55 +357,55 @@ brcm_usb_load_firmware(struct brcm_usb_softc *sc, const uint8_t *ucode,
 	sc->sc_dl_done = 0;
 
 	mtx_lock(&sc->bus_sc.sc_mtx);
-	usbd_transfer_start(sc->sc_xfer[BRCM_BULK_DL_OUT]);
+	usbd_transfer_start(sc->sc_xfer[BWFM_BULK_DL_OUT]);
 	while (sc->sc_dl_done == 0 && sc->sc_dl_err == 0 &&
 	    !sc->bus_sc.sc_dying) {
 		(void)mtx_sleep(&sc->sc_dl_done, &sc->bus_sc.sc_mtx, 0,
-		    "brcmdl", hz * 5);
+		    "bwfmdl", hz * 5);
 	}
-	usbd_transfer_stop(sc->sc_xfer[BRCM_BULK_DL_OUT]);
+	usbd_transfer_stop(sc->sc_xfer[BWFM_BULK_DL_OUT]);
 	mtx_unlock(&sc->bus_sc.sc_mtx);
 
 	if (sc->sc_dl_err != 0)
 		return (sc->sc_dl_err);
 
 	memset(&state, 0, sizeof(state));
-	error = brcm_usb_dl_cmd(sc, BRCM_DL_GETSTATE, &state, sizeof(state));
+	error = bwfm_usb_dl_cmd(sc, BWFM_DL_GETSTATE, &state, sizeof(state));
 	if (error != 0)
 		return (error);
-	if (le32toh(state.state) != BRCM_DL_RUNNABLE) {
+	if (le32toh(state.state) != BWFM_DL_RUNNABLE) {
 		device_printf(sc->bus_sc.sc_dev,
 		    "chip not runnable after upload (state=%u)\n",
 		    le32toh(state.state));
 		return (EIO);
 	}
-	return (brcm_usb_dl_cmd(sc, BRCM_DL_GO, &state, sizeof(state)));
+	return (bwfm_usb_dl_cmd(sc, BWFM_DL_GO, &state, sizeof(state)));
 }
 
 /* read the boot ROM version from the chip */
 static int
-brcm_usb_read_bootrom(struct brcm_usb_softc *sc)
+bwfm_usb_read_bootrom(struct bwfm_usb_softc *sc)
 {
 	memset(&sc->bus_sc.sc_brom, 0, sizeof(sc->bus_sc.sc_brom));
-	return (brcm_usb_dl_cmd(sc, BRCM_DL_GETVER, &sc->bus_sc.sc_brom,
+	return (bwfm_usb_dl_cmd(sc, BWFM_DL_GETVER, &sc->bus_sc.sc_brom,
 	    sizeof(sc->bus_sc.sc_brom)));
 }
 
 /*
  * Bulk-IN callback.  Pulls full frames out of the pipe and hands them
- * to the brcm core via brcm_rx_frame().  Resubmits unconditionally so
+ * to the bwfm core via bwfm_rx_frame().  Resubmits unconditionally so
  * the pipe keeps draining.
  *
- * The USB framework invokes us with sc_mtx held; brcm_rx_frame may
+ * The USB framework invokes us with sc_mtx held; bwfm_rx_frame may
  * call ieee80211_input_all which takes net80211 locks and can
  * re-enter the driver.  Drop sc_mtx for the duration of the input
  * call (run(4) pattern) and re-acquire before falling through to
  * usbd_transfer_submit.
  */
 static void
-brcm_usb_bulk_rx_cb(struct usb_xfer *xfer, usb_error_t error)
+bwfm_usb_bulk_rx_cb(struct usb_xfer *xfer, usb_error_t error)
 {
-	struct brcm_usb_softc *sc = usbd_xfer_softc(xfer);
+	struct bwfm_usb_softc *sc = usbd_xfer_softc(xfer);
 	struct usb_page_cache *pc;
 	struct mbuf *m;
 	int actlen;
@@ -423,7 +423,7 @@ brcm_usb_bulk_rx_cb(struct usb_xfer *xfer, usb_error_t error)
 		usbd_copy_out(pc, 0, mtod(m, void *), actlen);
 		m->m_len = m->m_pkthdr.len = actlen;
 		mtx_unlock(&sc->bus_sc.sc_mtx);
-		brcm_rx_frame(&sc->bus_sc, m);
+		bwfm_rx_frame(&sc->bus_sc, m);
 		mtx_lock(&sc->bus_sc.sc_mtx);
 		/* FALLTHROUGH */
 	case USB_ST_SETUP:
@@ -448,12 +448,12 @@ resubmit:
  * framework holds when the callback fires.
  */
 static void
-brcm_usb_bulk_tx_cb(struct usb_xfer *xfer, usb_error_t error)
+bwfm_usb_bulk_tx_cb(struct usb_xfer *xfer, usb_error_t error)
 {
-	struct brcm_usb_softc *sc = usbd_xfer_softc(xfer);
+	struct bwfm_usb_softc *sc = usbd_xfer_softc(xfer);
 	struct usb_page_cache *pc;
-	struct brcm_tx_pending *p;
-	struct brcm_bcdc_hdr hdr;
+	struct bwfm_tx_pending *p;
+	struct bwfm_bcdc_hdr hdr;
 	struct mbuf *m;
 	int actlen, payload_len;
 
@@ -471,16 +471,16 @@ tr_setup_tx:
 		}
 		STAILQ_REMOVE_HEAD(&sc->sc_tx_q, link);
 		m = p->m;
-		free(p, M_BRCM);
+		free(p, M_BWFM);
 
 		payload_len = m->m_pkthdr.len;
-		if (payload_len + (int)sizeof(hdr) > BRCM_TX_BUFSZ) {
+		if (payload_len + (int)sizeof(hdr) > BWFM_TX_BUFSZ) {
 			m_freem(m);
 			goto tr_setup_tx;
 		}
 
 		memset(&hdr, 0, sizeof(hdr));
-		hdr.flags = BRCM_BCDC_FLAG_VER(BRCM_BCDC_FLAG_PROTO_VER);
+		hdr.flags = BWFM_BCDC_FLAG_VER(BWFM_BCDC_FLAG_PROTO_VER);
 		pc = usbd_xfer_get_frame(xfer, 0);
 		usbd_copy_in(pc, 0, &hdr, sizeof(hdr));
 		usbd_m_copy_in(pc, sizeof(hdr), m, 0, payload_len);
@@ -506,9 +506,9 @@ tr_setup_tx:
 
 /* count status pulses on the interrupt endpoint */
 static void
-brcm_usb_int_in_cb(struct usb_xfer *xfer, usb_error_t error)
+bwfm_usb_int_in_cb(struct usb_xfer *xfer, usb_error_t error)
 {
-	struct brcm_usb_softc *sc = usbd_xfer_softc(xfer);
+	struct bwfm_usb_softc *sc = usbd_xfer_softc(xfer);
 
 	switch (USB_GET_STATE(xfer)) {
 	case USB_ST_TRANSFERRED:
@@ -528,15 +528,15 @@ brcm_usb_int_in_cb(struct usb_xfer *xfer, usb_error_t error)
 /*
  * EP0 control-IN pump.  Loops on UT_READ_CLASS_INTERFACE bRequest 1
  * pulls (the way the chip emits BCDC replies on USB) and shuttles
- * each response into brcm_rxctl() for reqid demultiplex.  Exits on
+ * each response into bwfm_rxctl() for reqid demultiplex.  Exits on
  * sc_dying; clears sc_ctlrx_proc and wakes anyone waiting for the
  * thread to exit (the detach / fail teardown path).
  */
 static void
-brcm_usb_ctlrx_thread(void *arg)
+bwfm_usb_ctlrx_thread(void *arg)
 {
-	struct brcm_usb_softc *sc = arg;
-	uint8_t buf[BRCM_CTL_REPLY_MAX];
+	struct bwfm_usb_softc *sc = arg;
+	uint8_t buf[BWFM_CTL_REPLY_MAX];
 	struct usb_device_request req;
 	uint16_t actlen;
 	usb_error_t err;
@@ -554,7 +554,7 @@ brcm_usb_ctlrx_thread(void *arg)
 		mtx_lock(&sc->bus_sc.sc_ctl_mtx);
 		while (sc->sc_ctl_want == 0 && !sc->bus_sc.sc_dying)
 			mtx_sleep(&sc->sc_ctl_want, &sc->bus_sc.sc_ctl_mtx,
-			    0, "brcmcti", hz / 2);
+			    0, "bwfmcti", hz / 2);
 		if (TAILQ_EMPTY(&sc->bus_sc.sc_ctl_pending))
 			sc->sc_ctl_want = 0;	/* waiter gave up */
 		mtx_unlock(&sc->bus_sc.sc_ctl_mtx);
@@ -576,11 +576,11 @@ brcm_usb_ctlrx_thread(void *arg)
 		if (err == USB_ERR_TIMEOUT)
 			continue;
 		if (err != USB_ERR_NORMAL_COMPLETION) {
-			pause("brcmctl", hz / 10);
+			pause("bwfmctl", hz / 10);
 			continue;
 		}
-		if (actlen >= sizeof(struct brcm_bcdc_dcmd)) {
-			brcm_rxctl(&sc->bus_sc, buf, actlen);
+		if (actlen >= sizeof(struct bwfm_bcdc_dcmd)) {
+			bwfm_rxctl(&sc->bus_sc, buf, actlen);
 			mtx_lock(&sc->bus_sc.sc_ctl_mtx);
 			if (sc->sc_ctl_want > 0)
 				sc->sc_ctl_want--;
@@ -595,12 +595,12 @@ brcm_usb_ctlrx_thread(void *arg)
 	kproc_exit(0);
 }
 
-/* ----------------- brcm_bus_ops implementations ---------------- */
+/* ----------------- bwfm_bus_ops implementations ---------------- */
 
 static int
-brcm_usb_bs_txctl(struct brcm_softc *bsc, const void *buf, size_t len)
+bwfm_usb_bs_txctl(struct bwfm_softc *bsc, const void *buf, size_t len)
 {
-	struct brcm_usb_softc *sc = SC_TO_USB(bsc);
+	struct bwfm_usb_softc *sc = SC_TO_USB(bsc);
 	struct usb_device_request req;
 	usb_error_t err;
 
@@ -625,13 +625,13 @@ brcm_usb_bs_txctl(struct brcm_softc *bsc, const void *buf, size_t len)
 
 /* unused: replies arrive via the control-read thread */
 static int
-brcm_usb_bs_rxctl(struct brcm_softc *bsc, void *buf, size_t *lenp,
+bwfm_usb_bs_rxctl(struct bwfm_softc *bsc, void *buf, size_t *lenp,
     int timeout_ms)
 {
 	/*
 	 * Not used by the core: the ctlrx kthread
-	 * (brcm_usb_ctlrx_thread) calls brcm_rxctl() directly with each
-	 * incoming reply, and brcm_dcmd_get() waits on the per-request
+	 * (bwfm_usb_ctlrx_thread) calls bwfm_rxctl() directly with each
+	 * incoming reply, and bwfm_dcmd_get() waits on the per-request
 	 * sleep channel.  The stub keeps the vtable shape the same for
 	 * transports that prefer a caller-pulled rxctl.
 	 */
@@ -644,19 +644,19 @@ brcm_usb_bs_rxctl(struct brcm_softc *bsc, void *buf, size_t *lenp,
 
 /* queue a data frame to send */
 static int
-brcm_usb_bs_txdata(struct brcm_softc *bsc, struct mbuf *m)
+bwfm_usb_bs_txdata(struct bwfm_softc *bsc, struct mbuf *m)
 {
-	struct brcm_usb_softc *sc = SC_TO_USB(bsc);
-	struct brcm_tx_pending *p;
+	struct bwfm_usb_softc *sc = SC_TO_USB(bsc);
+	struct bwfm_tx_pending *p;
 	int err;
 
-	/* 802.11 from net80211 -> 802.3 for the firmware; see brcm.c. */
-	if ((err = brcm_deencap_80211(&m)) != 0) {
+	/* 802.11 from net80211 -> 802.3 for the firmware; see bwfm.c. */
+	if ((err = bwfm_deencap_80211(&m)) != 0) {
 		if (m != NULL)
 			m_freem(m);
 		return (err == EAGAIN ? 0 : err);	/* EAGAIN: mgmt, dropped */
 	}
-	p = malloc(sizeof(*p), M_BRCM, M_NOWAIT);
+	p = malloc(sizeof(*p), M_BWFM, M_NOWAIT);
 	if (p == NULL) {
 		m_freem(m);
 		return (ENOMEM);
@@ -667,12 +667,12 @@ brcm_usb_bs_txdata(struct brcm_softc *bsc, struct mbuf *m)
 	if (bsc->sc_dying) {
 		mtx_unlock(&bsc->sc_mtx);
 		m_freem(m);
-		free(p, M_BRCM);
+		free(p, M_BWFM);
 		return (ENXIO);
 	}
 	STAILQ_INSERT_TAIL(&sc->sc_tx_q, p, link);
 	if (!sc->sc_tx_running)
-		usbd_transfer_start(sc->sc_xfer[BRCM_BULK_TX_OUT]);
+		usbd_transfer_start(sc->sc_xfer[BWFM_BULK_TX_OUT]);
 	mtx_unlock(&bsc->sc_mtx);
 	return (0);
 }
@@ -699,16 +699,16 @@ brcm_usb_bs_txdata(struct brcm_softc *bsc, struct mbuf *m)
  *   7. mtx_destroy after all sleepers are gone.
  */
 static void
-brcm_usb_teardown(struct brcm_usb_softc *sc)
+bwfm_usb_teardown(struct bwfm_usb_softc *sc)
 {
-	struct brcm_softc *bsc = &sc->bus_sc;
+	struct bwfm_softc *bsc = &sc->bus_sc;
 
 	/*
-	 * Common prologue, shared with SDIO and PCIe in brcm.c: set
+	 * Common prologue, shared with SDIO and PCIe in bwfm.c: set
 	 * sc_dying, wake ctl_pending waiters, drain in_flight_dcmd,
 	 * drain the scan_done and link tasks, ieee80211_ifdetach.
 	 */
-	brcm_transport_teardown(bsc);
+	bwfm_transport_teardown(bsc);
 
 	/*
 	 * USB-specific: drain the control-RX ithread proc that owns
@@ -719,20 +719,20 @@ brcm_usb_teardown(struct brcm_usb_softc *sc)
 		mtx_lock(&bsc->sc_mtx);
 		while (sc->sc_ctlrx_proc != NULL)
 			(void)mtx_sleep(&sc->sc_ctlrx_proc, &bsc->sc_mtx, 0,
-			    "brcmctlx", hz);
+			    "bwfmctlx", hz);
 		mtx_unlock(&bsc->sc_mtx);
 	}
 
 	if (sc->sc_xfer[0] != NULL)
-		usbd_transfer_unsetup(sc->sc_xfer, BRCM_N_XFER);
+		usbd_transfer_unsetup(sc->sc_xfer, BWFM_N_XFER);
 
 	/* Drain any TX mbufs still queued; xfer is already shut down. */
 	while (!STAILQ_EMPTY(&sc->sc_tx_q)) {
-		struct brcm_tx_pending *p = STAILQ_FIRST(&sc->sc_tx_q);
+		struct bwfm_tx_pending *p = STAILQ_FIRST(&sc->sc_tx_q);
 
 		STAILQ_REMOVE_HEAD(&sc->sc_tx_q, link);
 		m_freem(p->m);
-		free(p, M_BRCM);
+		free(p, M_BWFM);
 	}
 
 	if (mtx_initialized(&bsc->sc_ctl_mtx))
@@ -743,16 +743,16 @@ brcm_usb_teardown(struct brcm_usb_softc *sc)
 
 /* stop the device */
 static void
-brcm_usb_bs_stop(struct brcm_softc *bsc)
+bwfm_usb_bs_stop(struct bwfm_softc *bsc)
 {
 
-	brcm_usb_teardown(SC_TO_USB(bsc));
+	bwfm_usb_teardown(SC_TO_USB(bsc));
 }
 
 /* ------------------- newbus probe / attach / detach ---------------- */
 
 static int
-brcm_usb_probe(device_t dev)
+bwfm_usb_probe(device_t dev)
 {
 	struct usb_attach_arg *uaa = device_get_ivars(dev);
 
@@ -762,28 +762,28 @@ brcm_usb_probe(device_t dev)
 		return (ENXIO);
 	if (uaa->info.bIfaceIndex != 0)
 		return (ENXIO);
-	return (usbd_lookup_id_by_uaa(brcm_usb_devs,
-	    sizeof(brcm_usb_devs), uaa));
+	return (usbd_lookup_id_by_uaa(bwfm_usb_devs,
+	    sizeof(bwfm_usb_devs), uaa));
 }
 
 /* set up the USB device and load firmware */
 static int
-brcm_usb_attach(device_t dev)
+bwfm_usb_attach(device_t dev)
 {
-	struct brcm_usb_softc *sc = device_get_softc(dev);
-	struct brcm_softc *bsc = &sc->bus_sc;
+	struct bwfm_usb_softc *sc = device_get_softc(dev);
+	struct bwfm_softc *bsc = &sc->bus_sc;
 	struct usb_attach_arg *uaa = device_get_ivars(dev);
 	const struct firmware *fw;
 	uint32_t chip, chiprev;
 	int error;
 
 	bsc->sc_dev = dev;
-	bsc->sc_bus_ops = &brcm_usb_bus_ops;
+	bsc->sc_bus_ops = &bwfm_usb_bus_ops;
 	sc->sc_udev = uaa->device;
 	sc->sc_iface_index = uaa->info.bIfaceIndex;
 
 	mtx_init(&bsc->sc_mtx, device_get_nameunit(dev), NULL, MTX_DEF);
-	mtx_init(&bsc->sc_ctl_mtx, "brcm ctl", NULL, MTX_DEF);
+	mtx_init(&bsc->sc_ctl_mtx, "bwfm ctl", NULL, MTX_DEF);
 	TAILQ_INIT(&bsc->sc_ctl_pending);
 	STAILQ_INIT(&sc->sc_tx_q);
 	/*
@@ -806,14 +806,14 @@ brcm_usb_attach(device_t dev)
 
 	device_set_usb_desc(dev);
 
-	error = brcm_usb_enumerate_endpoints(sc, uaa);
+	error = bwfm_usb_enumerate_endpoints(sc, uaa);
 	if (error != 0) {
 		device_printf(dev, "endpoint discovery failed: %d\n", error);
 		goto fail;
 	}
 
 	error = usbd_transfer_setup(uaa->device, &sc->sc_iface_index,
-	    sc->sc_xfer, brcm_usb_config, BRCM_N_XFER, sc, &bsc->sc_mtx);
+	    sc->sc_xfer, bwfm_usb_config, BWFM_N_XFER, sc, &bsc->sc_mtx);
 	if (error != 0) {
 		device_printf(dev, "USB xfer setup failed: %s\n",
 		    usbd_errstr(error));
@@ -821,15 +821,15 @@ brcm_usb_attach(device_t dev)
 		goto fail;
 	}
 
-	error = brcm_usb_read_bootrom(sc);
+	error = bwfm_usb_read_bootrom(sc);
 	if (error != 0)
 		goto fail;
 
 	chip = le32toh(bsc->sc_brom.chip);
 	chiprev = le32toh(bsc->sc_brom.chiprev);
 
-	if (chip != BRCM_POSTBOOT_ID) {
-		bsc->sc_chip = brcm_chip_lookup(chip, chiprev);
+	if (chip != BWFM_POSTBOOT_ID) {
+		bsc->sc_chip = bwfm_chip_lookup(chip, chiprev);
 		if (bsc->sc_chip == NULL) {
 			device_printf(dev,
 			    "unsupported chip 0x%04x rev %u\n", chip, chiprev);
@@ -840,7 +840,7 @@ brcm_usb_attach(device_t dev)
 		    bsc->sc_chip->desc, chip, chiprev);
 
 		/*
-		 * Record the firmware basename so brcm_runtime_iovars
+		 * Record the firmware basename so bwfm_runtime_iovars
 		 * can look up the matching CLM.
 		 */
 		strlcpy(bsc->sc_fw_basename, bsc->sc_chip->fwname,
@@ -854,22 +854,22 @@ brcm_usb_attach(device_t dev)
 			error = ENOENT;
 			goto fail;
 		}
-		error = brcm_usb_load_firmware(sc, fw->data, fw->datasize);
+		error = bwfm_usb_load_firmware(sc, fw->data, fw->datasize);
 		firmware_put(fw, FIRMWARE_UNLOAD);
 		if (error != 0)
 			goto fail;
 
 		/* Poll for the post-boot sentinel. */
 		for (int i = 0; i < 20; i++) {
-			pause_sbt("brcmpb", SBT_1MS * 50, 0, 0);
+			pause_sbt("bwfmpb", SBT_1MS * 50, 0, 0);
 			memset(&bsc->sc_brom, 0, sizeof(bsc->sc_brom));
-			if (brcm_usb_dl_cmd(sc, BRCM_DL_GETVER, &bsc->sc_brom,
+			if (bwfm_usb_dl_cmd(sc, BWFM_DL_GETVER, &bsc->sc_brom,
 			    sizeof(bsc->sc_brom)) != 0)
 				continue;
-			if (le32toh(bsc->sc_brom.chip) == BRCM_POSTBOOT_ID)
+			if (le32toh(bsc->sc_brom.chip) == BWFM_POSTBOOT_ID)
 				break;
 		}
-		if (le32toh(bsc->sc_brom.chip) != BRCM_POSTBOOT_ID) {
+		if (le32toh(bsc->sc_brom.chip) != BWFM_POSTBOOT_ID) {
 			device_printf(dev,
 			    "firmware did not boot (chip=0x%08x)\n",
 			    le32toh(bsc->sc_brom.chip));
@@ -883,27 +883,27 @@ brcm_usb_attach(device_t dev)
 		    "chip already in firmware mode\n");
 	}
 
-	error = kproc_create(brcm_usb_ctlrx_thread, sc, &sc->sc_ctlrx_proc,
-	    0, 0, "brcm_ctlrx");
+	error = kproc_create(bwfm_usb_ctlrx_thread, sc, &sc->sc_ctlrx_proc,
+	    0, 0, "bwfm_ctlrx");
 	if (error != 0) {
 		device_printf(dev, "ctlrx thread spawn failed: %d\n", error);
 		goto fail;
 	}
 
 	mtx_lock(&bsc->sc_mtx);
-	usbd_transfer_start(sc->sc_xfer[BRCM_BULK_RX_IN]);
-	usbd_transfer_start(sc->sc_xfer[BRCM_INT_IN]);
+	usbd_transfer_start(sc->sc_xfer[BWFM_BULK_RX_IN]);
+	usbd_transfer_start(sc->sc_xfer[BWFM_INT_IN]);
 	mtx_unlock(&bsc->sc_mtx);
 
 	/*
-	 * Read MAC out of the firmware before brcm_attach() consumes it
+	 * Read MAC out of the firmware before bwfm_attach() consumes it
 	 * for ieee80211_ifattach().  iovar failure leaves bsc_macaddr as
 	 * zeros, which ieee80211_ifattach will treat as "device didn't
 	 * report" — acceptable degradation.
 	 */
 	{
 		size_t maclen = sizeof(bsc->sc_macaddr);
-		(void)brcm_iovar_get(bsc, "cur_etheraddr", bsc->sc_macaddr,
+		(void)bwfm_iovar_get(bsc, "cur_etheraddr", bsc->sc_macaddr,
 		    &maclen);
 	}
 
@@ -920,11 +920,11 @@ brcm_usb_attach(device_t dev)
 		size_t rlen = sizeof(rev);
 
 		memset(rev, 0, sizeof(rev));
-		if (brcm_dcmd_get(bsc, BRCM_C_GET_REVINFO, rev, &rlen) == 0 &&
+		if (bwfm_dcmd_get(bsc, BWFM_C_GET_REVINFO, rev, &rlen) == 0 &&
 		    rlen >= 12 * sizeof(uint32_t)) {
 			chip = le32toh(rev[11]);
 			chiprev = le32toh(rev[3]);
-			bsc->sc_chip = brcm_chip_lookup(chip, chiprev);
+			bsc->sc_chip = bwfm_chip_lookup(chip, chiprev);
 		}
 		device_printf(dev, "running firmware reports chip 0x%04x "
 		    "rev %u: %s\n", chip, chiprev,
@@ -934,44 +934,44 @@ brcm_usb_attach(device_t dev)
 			    sizeof(bsc->sc_fw_basename));
 	}
 
-	error = brcm_attach(bsc);
+	error = bwfm_attach(bsc);
 	if (error != 0)
 		goto fail;
-	brcm_runtime_iovars(bsc);
-	brcm_sysctl_attach(bsc);
+	bwfm_runtime_iovars(bsc);
+	bwfm_sysctl_attach(bsc);
 
 	return (0);
 
 fail:
-	brcm_usb_teardown(sc);
+	bwfm_usb_teardown(sc);
 	return (error);
 }
 
 /* tear down the USB device */
 static int
-brcm_usb_detach(device_t dev)
+bwfm_usb_detach(device_t dev)
 {
-	struct brcm_usb_softc *sc = device_get_softc(dev);
+	struct bwfm_usb_softc *sc = device_get_softc(dev);
 
-	brcm_usb_teardown(sc);
+	bwfm_usb_teardown(sc);
 	return (0);
 }
 
-static device_method_t brcm_usb_methods[] = {
-	DEVMETHOD(device_probe, brcm_usb_probe),
-	DEVMETHOD(device_attach, brcm_usb_attach),
-	DEVMETHOD(device_detach, brcm_usb_detach),
+static device_method_t bwfm_usb_methods[] = {
+	DEVMETHOD(device_probe, bwfm_usb_probe),
+	DEVMETHOD(device_attach, bwfm_usb_attach),
+	DEVMETHOD(device_detach, bwfm_usb_detach),
 	DEVMETHOD_END
 };
 
-static driver_t brcm_usb_driver = {
-	"brcm",
-	brcm_usb_methods,
-	sizeof(struct brcm_usb_softc),
+static driver_t bwfm_usb_driver = {
+	"bwfm",
+	bwfm_usb_methods,
+	sizeof(struct bwfm_usb_softc),
 };
 
-DRIVER_MODULE(brcm, uhub, brcm_usb_driver, NULL, NULL);
-MODULE_DEPEND(brcm, usb, 1, 1, 1);
-MODULE_DEPEND(brcm, wlan, 1, 1, 1);
-MODULE_VERSION(brcm, 1);
-USB_PNP_HOST_INFO(brcm_usb_devs);
+DRIVER_MODULE(bwfm, uhub, bwfm_usb_driver, NULL, NULL);
+MODULE_DEPEND(bwfm, usb, 1, 1, 1);
+MODULE_DEPEND(bwfm, wlan, 1, 1, 1);
+MODULE_VERSION(bwfm, 1);
+USB_PNP_HOST_INFO(bwfm_usb_devs);

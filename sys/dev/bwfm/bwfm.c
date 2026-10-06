@@ -3,20 +3,20 @@
  *
  * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
  *
- * Broadcom FullMAC (brcm) bus-agnostic core.
+ * Broadcom FullMAC (bwfm) bus-agnostic core.
  *
  * This module is the layer above the transport (USB, SDIO, PCIe).  It
  * owns the chip-info dispatch table, the BCDC dcmd / iovar request
  * machinery, and the net80211 attachment (ieee80211_ifattach,
  * vap_create, scans, joins and key install).  Bus transports call into here
- * via brcm_attach() and the bus_ops vtable; we call back through
+ * via bwfm_attach() and the bus_ops vtable; we call back through
  * sc->sc_bus_ops to push BCDC frames out to the chip.
  *
  * Design reference: OpenBSD sys/dev/ic/bwfm.c.  No source lines are
  * carried over; the protocol-level structure mirrors Patrick Wildt's
  * 2016-2017 work but the FreeBSD-native shape (taskqueue(9),
  * mtx + sx locks, ieee80211vap clone tracking, firmware(9) loader,
- * malloc(9) M_BRCM region) is original.
+ * malloc(9) M_BWFM region) is original.
  */
 
 #include <sys/param.h>
@@ -45,11 +45,11 @@
 #include <net80211/ieee80211_input.h>
 #include <net80211/ieee80211_scan.h>
 
-#include "brcmvar.h"
-#include "brcmreg.h"
+#include "bwfmvar.h"
+#include "bwfmreg.h"
 #include "ieee80211_fullmac.h"
 
-MALLOC_DEFINE(M_BRCM, "brcm", "Broadcom FullMAC scratch");
+MALLOC_DEFINE(M_BWFM, "bwfm", "Broadcom FullMAC scratch");
 
 /*
  * Cached chanspec from the last ESCAN_RESULT for a given BSSID --
@@ -62,7 +62,7 @@ MALLOC_DEFINE(M_BRCM, "brcm", "Broadcom FullMAC scratch");
  * with BCME_BADCHAN.
  */
 static void
-brcm_cache_bssid_chanspec(struct brcm_softc *sc, const uint8_t bssid[6],
+bwfm_cache_bssid_chanspec(struct bwfm_softc *sc, const uint8_t bssid[6],
     uint16_t chanspec)
 {
 	memcpy(sc->sc_join_cs_bssid, bssid, 6);
@@ -71,7 +71,7 @@ brcm_cache_bssid_chanspec(struct brcm_softc *sc, const uint8_t bssid[6],
 
 /* recall the saved channel for an AP, or 0 if none */
 static uint16_t
-brcm_lookup_bssid_chanspec(struct brcm_softc *sc, const uint8_t bssid[6])
+bwfm_lookup_bssid_chanspec(struct bwfm_softc *sc, const uint8_t bssid[6])
 {
 	if (memcmp(sc->sc_join_cs_bssid, bssid, 6) == 0)
 		return (sc->sc_join_cs);
@@ -83,24 +83,24 @@ brcm_lookup_bssid_chanspec(struct brcm_softc *sc, const uint8_t bssid[6])
  * dispatch wedged (chip silently never emitted LINK/SET_SSID/DISASSOC),
  * sc_join_busy stays set forever and blocks every subsequent attempt.
  *
- * Caller pattern: `if (brcm_join_busy_acquire(sc, "open")) return EAGAIN;`
+ * Caller pattern: `if (bwfm_join_busy_acquire(sc, "open")) return EAGAIN;`
  * Returns 0 on success (busy now claimed) or 1 if another join is
- * legitimately in flight (less than BRCM_JOIN_BUSY_TIMEOUT_S old).
+ * legitimately in flight (less than BWFM_JOIN_BUSY_TIMEOUT_S old).
  *
  * 15 s is our own choice.  Linux brcmfmac has no driver-side join timeout
  * (cfg80211's SME owns it); its BRCMF_VIF_EVENT_TIMEOUT is 1.5 s and only
  * covers virtual-interface add/delete events.
  */
-#define	BRCM_JOIN_BUSY_TIMEOUT_S	15
+#define	BWFM_JOIN_BUSY_TIMEOUT_S	15
 
 static int
-brcm_join_busy_acquire(struct brcm_softc *sc, const char *who)
+bwfm_join_busy_acquire(struct bwfm_softc *sc, const char *who)
 {
 	time_t now = time_uptime;
 
 	if (sc->sc_join_busy != 0) {
 		if (sc->sc_join_busy_ts != 0 &&
-		    now - sc->sc_join_busy_ts >= BRCM_JOIN_BUSY_TIMEOUT_S) {
+		    now - sc->sc_join_busy_ts >= BWFM_JOIN_BUSY_TIMEOUT_S) {
 			DPRINTF(sc, 0,
 			    "%s: stale join_busy after %llds -- force-reset\n",
 			    who,
@@ -121,7 +121,7 @@ brcm_join_busy_acquire(struct brcm_softc *sc, const char *who)
  * suffix; firmware(9) handles resolution).  Adding a row makes a new
  * chip recognized across all transports.
  */
-const struct brcm_chip_info brcm_chip_table[] = {
+const struct bwfm_chip_info bwfm_chip_table[] = {
 	{ 0xa887, 0,  0xff, "brcmfmac43143",  "BCM43143",        true  },
 	{ 0xa8e4, 3,  0xff, "brcmfmac43236b", "BCM43236 rev B",  true  },
 	{ 0xa8ea, 0,  0xff, "brcmfmac43242a", "BCM43242",        true  },
@@ -130,12 +130,12 @@ const struct brcm_chip_info brcm_chip_table[] = {
 };
 
 /* find the table entry for a given chip id and revision */
-const struct brcm_chip_info *
-brcm_chip_lookup(uint32_t chip, uint32_t chiprev)
+const struct bwfm_chip_info *
+bwfm_chip_lookup(uint32_t chip, uint32_t chiprev)
 {
-	const struct brcm_chip_info *info;
+	const struct bwfm_chip_info *info;
 
-	for (info = brcm_chip_table; info->fwname != NULL; info++) {
+	for (info = bwfm_chip_table; info->fwname != NULL; info++) {
 		if (info->chip != chip)
 			continue;
 		if (chiprev < info->chiprev_min ||
@@ -160,10 +160,10 @@ brcm_chip_lookup(uint32_t chip, uint32_t chiprev)
  * can demultiplex replies vs. unrelated events.
  */
 size_t
-brcm_proto_bcdc_pack(uint16_t reqid, uint32_t cmd, uint32_t flags,
+bwfm_proto_bcdc_pack(uint16_t reqid, uint32_t cmd, uint32_t flags,
     const void *payload, size_t payload_len, void *out, size_t out_cap)
 {
-	struct brcm_bcdc_dcmd hdr;
+	struct bwfm_bcdc_dcmd hdr;
 	uint8_t *p = out;
 
 	if (out_cap < sizeof(hdr) + payload_len)
@@ -173,8 +173,8 @@ brcm_proto_bcdc_pack(uint16_t reqid, uint32_t cmd, uint32_t flags,
 	hdr.cmd = htole32(cmd);
 	hdr.len = htole32((uint32_t)payload_len);
 	hdr.flags = htole32(flags |
-	    (((uint32_t)reqid & BRCM_BCDC_DCMD_ID_MASK) <<
-	    BRCM_BCDC_DCMD_ID_SHIFT));
+	    (((uint32_t)reqid & BWFM_BCDC_DCMD_ID_MASK) <<
+	    BWFM_BCDC_DCMD_ID_SHIFT));
 	hdr.status = 0;
 	memcpy(p, &hdr, sizeof(hdr));
 	if (payload_len != 0)
@@ -193,10 +193,10 @@ brcm_proto_bcdc_pack(uint16_t reqid, uint32_t cmd, uint32_t flags,
  * and copies the payload into the matching req's reply_buf.
  */
 int
-brcm_dcmd_get(struct brcm_softc *sc, uint32_t cmd, void *buf, size_t *lenp)
+bwfm_dcmd_get(struct bwfm_softc *sc, uint32_t cmd, void *buf, size_t *lenp)
 {
-	uint8_t stage[sizeof(struct brcm_bcdc_dcmd) + 4096];
-	struct brcm_ctl_req req;
+	uint8_t stage[sizeof(struct bwfm_bcdc_dcmd) + 4096];
+	struct bwfm_ctl_req req;
 	uint32_t flags;
 	size_t framelen;
 	size_t want;
@@ -233,8 +233,8 @@ brcm_dcmd_get(struct brcm_softc *sc, uint32_t cmd, void *buf, size_t *lenp)
 	TAILQ_INSERT_TAIL(&sc->sc_ctl_pending, &req, link);
 	mtx_unlock(&sc->sc_ctl_mtx);
 
-	flags = BRCM_BCDC_DCMD_GET;
-	framelen = brcm_proto_bcdc_pack(req.reqid, cmd, flags, buf, want,
+	flags = BWFM_BCDC_DCMD_GET;
+	framelen = bwfm_proto_bcdc_pack(req.reqid, cmd, flags, buf, want,
 	    stage, sizeof(stage));
 	if (framelen == 0) {
 		error = ENOMEM;
@@ -254,7 +254,7 @@ brcm_dcmd_get(struct brcm_softc *sc, uint32_t cmd, void *buf, size_t *lenp)
 	 */
 	mtx_lock(&sc->sc_ctl_mtx);
 	while (!req.done && !sc->sc_dying) {
-		error = mtx_sleep(&req, &sc->sc_ctl_mtx, PCATCH, "brcmdcmd",
+		error = mtx_sleep(&req, &sc->sc_ctl_mtx, PCATCH, "bwfmdcmd",
 		    hz * 2);
 		if (error == EWOULDBLOCK)
 			break;
@@ -266,7 +266,7 @@ brcm_dcmd_get(struct brcm_softc *sc, uint32_t cmd, void *buf, size_t *lenp)
 		goto out;
 	}
 	*lenp = req.reply_actlen;
-	if (req.reply_flags & BRCM_BCDC_DCMD_ERROR) {
+	if (req.reply_flags & BWFM_BCDC_DCMD_ERROR) {
 		DPRINTF(sc, 0,
 		    "dcmd_get cmd=%u BCME=%d\n", cmd, req.reply_status);
 		error = EIO;
@@ -284,15 +284,15 @@ out:
 
 /* send a command with data to the firmware */
 int
-brcm_dcmd_set(struct brcm_softc *sc, uint32_t cmd, const void *buf, size_t len)
+bwfm_dcmd_set(struct bwfm_softc *sc, uint32_t cmd, const void *buf, size_t len)
 {
-	uint8_t stage[sizeof(struct brcm_bcdc_dcmd) + 4096];
-	struct brcm_ctl_req req;
+	uint8_t stage[sizeof(struct bwfm_bcdc_dcmd) + 4096];
+	struct bwfm_ctl_req req;
 	uint32_t flags;
 	size_t framelen;
 	int error;
 
-	/* See banner on brcm_dcmd_get for the rationale. */
+	/* See banner on bwfm_dcmd_get for the rationale. */
 	if (sc->sc_bus_ops->bs_dcmd_set != NULL)
 		return (sc->sc_bus_ops->bs_dcmd_set(sc, cmd, buf, len));
 
@@ -312,8 +312,8 @@ brcm_dcmd_set(struct brcm_softc *sc, uint32_t cmd, const void *buf, size_t len)
 	TAILQ_INSERT_TAIL(&sc->sc_ctl_pending, &req, link);
 	mtx_unlock(&sc->sc_ctl_mtx);
 
-	flags = BRCM_BCDC_DCMD_SET;
-	framelen = brcm_proto_bcdc_pack(req.reqid, cmd, flags, buf, len,
+	flags = BWFM_BCDC_DCMD_SET;
+	framelen = bwfm_proto_bcdc_pack(req.reqid, cmd, flags, buf, len,
 	    stage, sizeof(stage));
 	if (framelen == 0) {
 		error = ENOMEM;
@@ -326,7 +326,7 @@ brcm_dcmd_set(struct brcm_softc *sc, uint32_t cmd, const void *buf, size_t len)
 
 	mtx_lock(&sc->sc_ctl_mtx);
 	while (!req.done && !sc->sc_dying) {
-		error = mtx_sleep(&req, &sc->sc_ctl_mtx, PCATCH, "brcmdcmd",
+		error = mtx_sleep(&req, &sc->sc_ctl_mtx, PCATCH, "bwfmdcmd",
 		    hz * 2);
 		if (error == EWOULDBLOCK)
 			break;
@@ -335,7 +335,7 @@ brcm_dcmd_set(struct brcm_softc *sc, uint32_t cmd, const void *buf, size_t len)
 
 	if (!req.done)
 		error = sc->sc_dying ? ENXIO : ETIMEDOUT;
-	else if (req.reply_flags & BRCM_BCDC_DCMD_ERROR) {
+	else if (req.reply_flags & BWFM_BCDC_DCMD_ERROR) {
 		/*
 		 * Expose the firmware BCME_* code so join
 		 * failures (rc=EIO from callers) point at the real cause
@@ -363,7 +363,7 @@ out:
  * followed by the value.
  */
 int
-brcm_iovar_get(struct brcm_softc *sc, const char *name, void *buf, size_t *lenp)
+bwfm_iovar_get(struct bwfm_softc *sc, const char *name, void *buf, size_t *lenp)
 {
 	uint8_t scratch[1024];
 	size_t namelen, want, total;
@@ -394,7 +394,7 @@ brcm_iovar_get(struct brcm_softc *sc, const char *name, void *buf, size_t *lenp)
 	memset(scratch, 0, sizeof(scratch));
 	memcpy(scratch, name, namelen);
 	*lenp = total;
-	error = brcm_dcmd_get(sc, BRCM_C_GET_VAR, scratch, lenp);
+	error = bwfm_dcmd_get(sc, BWFM_C_GET_VAR, scratch, lenp);
 	if (error != 0)
 		return (error);
 	if (*lenp > want)
@@ -405,7 +405,7 @@ brcm_iovar_get(struct brcm_softc *sc, const char *name, void *buf, size_t *lenp)
 
 /* set a named firmware variable */
 int
-brcm_iovar_set(struct brcm_softc *sc, const char *name, const void *buf,
+bwfm_iovar_set(struct bwfm_softc *sc, const char *name, const void *buf,
     size_t len)
 {
 	uint8_t scratch[1024];
@@ -415,7 +415,7 @@ brcm_iovar_set(struct brcm_softc *sc, const char *name, const void *buf,
 	if (name == NULL)
 		return (EINVAL);
 
-	/* See banner on brcm_iovar_get for the fallback rationale. */
+	/* See banner on bwfm_iovar_get for the fallback rationale. */
 	if (sc->sc_bus_ops->bs_iovar_set != NULL) {
 		error = sc->sc_bus_ops->bs_iovar_set(sc, name, buf, len);
 		if (error != ENOENT)
@@ -431,18 +431,18 @@ brcm_iovar_set(struct brcm_softc *sc, const char *name, const void *buf,
 	memcpy(scratch, name, namelen);
 	if (len != 0)
 		memcpy(scratch + namelen, buf, len);
-	return (brcm_dcmd_set(sc, BRCM_C_SET_VAR, scratch, total));
+	return (bwfm_dcmd_set(sc, BWFM_C_SET_VAR, scratch, total));
 }
 
 /*
- * Variant of brcm_iovar_get that lets the caller append `plen` bytes
+ * Variant of bwfm_iovar_get that lets the caller append `plen` bytes
  * of params after the iovar name, then fetches up to `*lenp` bytes of
  * reply.  Used by sup_dump (and any other patched iovar that wants
  * input params): the chip's iovar dispatcher only forwards bytes
  * AFTER the name into the handler's params buffer.
  */
 int
-brcm_iovar_get_with_params(struct brcm_softc *sc, const char *name,
+bwfm_iovar_get_with_params(struct bwfm_softc *sc, const char *name,
     const void *params, size_t plen, void *buf, size_t *lenp)
 {
 	uint8_t scratch[1024];
@@ -464,7 +464,7 @@ brcm_iovar_get_with_params(struct brcm_softc *sc, const char *name,
 	if (params != NULL && plen != 0)
 		memcpy(scratch + namelen, params, plen);
 	*lenp = total;
-	error = brcm_dcmd_get(sc, BRCM_C_GET_VAR, scratch, lenp);
+	error = bwfm_dcmd_get(sc, BWFM_C_GET_VAR, scratch, lenp);
 	if (error != 0)
 		return (error);
 	if (*lenp > want)
@@ -481,10 +481,10 @@ brcm_iovar_get_with_params(struct brcm_softc *sc, const char *name,
  * events the transport is routing through the wrong path).
  */
 void
-brcm_rxctl(struct brcm_softc *sc, const void *buf, size_t len)
+bwfm_rxctl(struct bwfm_softc *sc, const void *buf, size_t len)
 {
-	struct brcm_bcdc_dcmd hdr;
-	struct brcm_ctl_req *req;
+	struct bwfm_bcdc_dcmd hdr;
+	struct bwfm_ctl_req *req;
 	uint32_t flags;
 	uint16_t reqid;
 	size_t payload_len;
@@ -493,7 +493,7 @@ brcm_rxctl(struct brcm_softc *sc, const void *buf, size_t len)
 		return;
 	memcpy(&hdr, buf, sizeof(hdr));
 	flags = le32toh(hdr.flags);
-	reqid = (flags >> BRCM_BCDC_DCMD_ID_SHIFT) & BRCM_BCDC_DCMD_ID_MASK;
+	reqid = (flags >> BWFM_BCDC_DCMD_ID_SHIFT) & BWFM_BCDC_DCMD_ID_MASK;
 	payload_len = len - sizeof(hdr);
 
 	/*
@@ -537,7 +537,7 @@ brcm_rxctl(struct brcm_softc *sc, const void *buf, size_t len)
  * overflow the kthread stack.
  */
 static void
-brcm_walk_ies(const uint8_t *ies, size_t ies_len,
+bwfm_walk_ies(const uint8_t *ies, size_t ies_len,
     struct ieee80211_scanparams *sp)
 {
 	const uint8_t *frm, *efrm;
@@ -626,8 +626,8 @@ brcm_walk_ies(const uint8_t *ies, size_t ies_len,
  * ieee80211_ies_init does the copy under the scan-table lock.
  */
 static void
-brcm_add_scan_result(struct brcm_softc *sc,
-    const struct brcm_bss_info *bss, uint32_t blen, int16_t rssi)
+bwfm_add_scan_result(struct bwfm_softc *sc,
+    const struct bwfm_bss_info *bss, uint32_t blen, int16_t rssi)
 {
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ieee80211vap *vap;
@@ -658,11 +658,11 @@ brcm_add_scan_result(struct brcm_softc *sc,
 	 * Cache the fw-reported chanspec for this BSSID before the
 	 * net80211-scan gate below.  The cache is consulted by the join
 	 * path so it can pass the chip's preferred chanspec back verbatim;
-	 * a driver-initiated scan (dev.brcm.0.cmd_scan) bypasses
+	 * a driver-initiated scan (dev.bwfm.0.cmd_scan) bypasses
 	 * ieee80211_F_SCAN and would otherwise leave the cache empty,
-	 * forcing brcm_chan_to_chanspec_d11ac's minimal 20MHz fallback.
+	 * forcing bwfm_chan_to_chanspec_d11ac's minimal 20MHz fallback.
 	 */
-	brcm_cache_bssid_chanspec(sc, bss->bssid, le16toh(bss->chanspec));
+	bwfm_cache_bssid_chanspec(sc, bss->bssid, le16toh(bss->chanspec));
 
 	vap = TAILQ_FIRST(&ic->ic_vaps);
 	if (vap == NULL)
@@ -690,9 +690,9 @@ brcm_add_scan_result(struct brcm_softc *sc,
 		return;
 
 	chanspec = le16toh(bss->chanspec);
-	is5g = brcm_chanspec_is_5ghz(chanspec);
+	is5g = bwfm_chanspec_is_5ghz(chanspec);
 	chan = bss->ctl_ch != 0 ? bss->ctl_ch :
-	    brcm_chanspec_to_chan(chanspec);
+	    bwfm_chanspec_to_chan(chanspec);
 	freq = ieee80211_ieee2mhz(chan,
 	    is5g ? IEEE80211_CHAN_5GHZ : IEEE80211_CHAN_2GHZ);
 	rxchan = ieee80211_find_channel(ic, freq,
@@ -718,7 +718,7 @@ brcm_add_scan_result(struct brcm_softc *sc,
 	sp.ies = __DECONST(uint8_t *, ies);
 	sp.ies_len = ie_length;
 	sp.tstamp = tstamp_zero;	/* sta_add memcpys 8 B from this */
-	brcm_walk_ies(ies, ie_length, &sp);
+	bwfm_walk_ies(ies, ie_length, &sp);
 
 	/*
 	 * sta_add (ieee80211_scan_sta.c:280) does
@@ -764,11 +764,11 @@ brcm_add_scan_result(struct brcm_softc *sc,
  * each as a synthesised beacon to net80211's scan cache.
  */
 static void
-brcm_parse_escan_partial(struct brcm_softc *sc, const uint8_t *p, size_t len,
+bwfm_parse_escan_partial(struct bwfm_softc *sc, const uint8_t *p, size_t len,
     size_t pos)
 {
-	const struct brcm_escan_results *res;
-	const struct brcm_bss_info *bss;
+	const struct bwfm_escan_results *res;
+	const struct bwfm_bss_info *bss;
 	const uint8_t *cursor, *end;
 	uint32_t blen;
 	uint16_t bss_count;
@@ -776,10 +776,10 @@ brcm_parse_escan_partial(struct brcm_softc *sc, const uint8_t *p, size_t len,
 
 	if (len < pos + sizeof(*res))
 		return;
-	res = (const struct brcm_escan_results *)(p + pos);
+	res = (const struct bwfm_escan_results *)(p + pos);
 	/*
-	 * bss_count is uint16_t on the wire (see brcm_escan_results in
-	 * brcmreg.h).  A 32-bit read would pick up the first 2 bytes of
+	 * bss_count is uint16_t on the wire (see bwfm_escan_results in
+	 * bwfmreg.h).  A 32-bit read would pick up the first 2 bytes of
 	 * the bss_info that follows, and the resulting huge count would
 	 * walk the loop through arbitrary kernel memory.
 	 */
@@ -790,7 +790,7 @@ brcm_parse_escan_partial(struct brcm_softc *sc, const uint8_t *p, size_t len,
 	for (uint32_t i = 0; i < bss_count && cursor < end; i++) {
 		if (cursor + sizeof(*bss) > end)
 			break;
-		bss = (const struct brcm_bss_info *)cursor;
+		bss = (const struct bwfm_bss_info *)cursor;
 		blen = le32toh(bss->length);
 		if (blen < sizeof(*bss) || cursor + blen > end)
 			break;
@@ -804,15 +804,15 @@ brcm_parse_escan_partial(struct brcm_softc *sc, const uint8_t *p, size_t len,
 		    bss->bssid[3], bss->bssid[4], bss->bssid[5],
 		    rssi, (int)bss->phy_noise, (int)le16toh(bss->snr),
 		    le16toh(bss->chanspec), bss->ctl_ch);
-		brcm_add_scan_result(sc, bss, blen, rssi);
+		bwfm_add_scan_result(sc, bss, blen, rssi);
 
 		cursor += blen;
 	}
 }
 
 /*
- * Handle one decoded BRCM firmware event.  Called from brcm_rx_frame
- * after the BCDC + Ethernet + BRCM headers have been peeled.  Each
+ * Handle one decoded BWFM firmware event.  Called from bwfm_rx_frame
+ * after the BCDC + Ethernet + BWFM headers have been peeled.  Each
  * event_type runs a tiny state machine over net80211 — most fast
  * transitions belong here because the firmware has already done the
  * mgmt-frame work for us.
@@ -822,10 +822,10 @@ brcm_parse_escan_partial(struct brcm_softc *sc, const uint8_t *p, size_t len,
  * the driver.
  */
 void
-brcm_handle_event(struct brcm_softc *sc, const uint8_t *p, size_t len,
+bwfm_handle_event(struct bwfm_softc *sc, const uint8_t *p, size_t len,
     size_t evpos)
 {
-	const struct brcm_event_msg *emsg;
+	const struct bwfm_event_msg *emsg;
 	struct ieee80211com *ic = &sc->sc_ic;
 	struct ieee80211vap *vap;
 	uint32_t evtype, status;
@@ -833,19 +833,19 @@ brcm_handle_event(struct brcm_softc *sc, const uint8_t *p, size_t len,
 
 	if (len < evpos + sizeof(*emsg))
 		return;
-	emsg = (const struct brcm_event_msg *)(p + evpos);
+	emsg = (const struct bwfm_event_msg *)(p + evpos);
 	evtype = be32toh(emsg->event_type);
 	status = be32toh(emsg->status);
 	if (evtype < nitems(sc->sc_evt_by_type))
 		atomic_add_32(&sc->sc_evt_by_type[evtype], 1);
 
-	if (evtype == BRCM_E_TYPE_ESCAN_RESULT &&
-	    status == BRCM_E_STATUS_PARTIAL) {
-		brcm_parse_escan_partial(sc, p, len, evpos + sizeof(*emsg));
+	if (evtype == BWFM_E_TYPE_ESCAN_RESULT &&
+	    status == BWFM_E_STATUS_PARTIAL) {
+		bwfm_parse_escan_partial(sc, p, len, evpos + sizeof(*emsg));
 		return;
 	}
-	if (evtype == BRCM_E_TYPE_ESCAN_RESULT &&
-	    status != BRCM_E_STATUS_PARTIAL) {
+	if (evtype == BWFM_E_TYPE_ESCAN_RESULT &&
+	    status != BWFM_E_STATUS_PARTIAL) {
 		/*
 		 * Terminator ESCAN_RESULT: status is SUCCESS, ABORT,
 		 * or one of the failure codes.  Clear the in-flight
@@ -863,11 +863,11 @@ brcm_handle_event(struct brcm_softc *sc, const uint8_t *p, size_t len,
 		}
 		return;
 	}
-	if (evtype == BRCM_E_TYPE_LINK) {
+	if (evtype == BWFM_E_TYPE_LINK) {
 		eflags = be16toh(emsg->flags);
 		DPRINTF(sc, 0, "LINK %s status=%u\n",
-		    (eflags & BRCM_E_FLAG_LINK_UP) ? "up" : "down", status);
-		sc->sc_link_up = (eflags & BRCM_E_FLAG_LINK_UP) != 0;
+		    (eflags & BWFM_E_FLAG_LINK_UP) ? "up" : "down", status);
+		sc->sc_link_up = (eflags & BWFM_E_FLAG_LINK_UP) != 0;
 		sc->sc_join_busy = 0;	/* terminator: either success or fail */
 		if (sc->sc_ic_attached) {
 			atomic_add_32(&sc->sc_link_reqs, 1);
@@ -876,7 +876,7 @@ brcm_handle_event(struct brcm_softc *sc, const uint8_t *p, size_t len,
 		}
 		return;
 	}
-	if (evtype == BRCM_E_TYPE_SET_SSID) {
+	if (evtype == BWFM_E_TYPE_SET_SSID) {
 		/*
 		 * Per Linux brcmf_is_linkup (cfg80211.c:6040), E_SET_SSID
 		 * status=SUCCESS is the PRIMARY linkup trigger for our
@@ -886,9 +886,9 @@ brcm_handle_event(struct brcm_softc *sc, const uint8_t *p, size_t len,
 		 * existing E_LINK handler above.
 		 */
 		DPRINTF(sc, 0, "SET_SSID status=%u%s\n", status,
-		    status == BRCM_E_STATUS_SUCCESS ?
+		    status == BWFM_E_STATUS_SUCCESS ?
 		    " -> linkup" : " -> failure");
-		if (status == BRCM_E_STATUS_SUCCESS) {
+		if (status == BWFM_E_STATUS_SUCCESS) {
 			sc->sc_link_up = 1;
 			sc->sc_join_busy = 0;
 			if (sc->sc_ic_attached) {
@@ -902,9 +902,9 @@ brcm_handle_event(struct brcm_softc *sc, const uint8_t *p, size_t len,
 		}
 		return;
 	}
-	if (evtype == BRCM_E_TYPE_AUTH || evtype == BRCM_E_TYPE_ASSOC) {
+	if (evtype == BWFM_E_TYPE_AUTH || evtype == BWFM_E_TYPE_ASSOC) {
 		DPRINTF(sc, 1, "%s status=%u reason=%u\n",
-		    evtype == BRCM_E_TYPE_AUTH ? "AUTH" : "ASSOC",
+		    evtype == BWFM_E_TYPE_AUTH ? "AUTH" : "ASSOC",
 		    status, be32toh(emsg->reason));
 		/*
 		 * On ASSOC success, dispatch post-assoc handshake taskqueue.
@@ -928,8 +928,8 @@ brcm_handle_event(struct brcm_softc *sc, const uint8_t *p, size_t len,
 		 * Walk vap AUTH/ASSOC -> RUN via the framework's
 		 * fast-forward (link_task -> ieee80211_fmac_link_up).
 		 */
-		if (evtype == BRCM_E_TYPE_ASSOC &&
-		    status == BRCM_E_STATUS_SUCCESS && sc->sc_ic_attached) {
+		if (evtype == BWFM_E_TYPE_ASSOC &&
+		    status == BWFM_E_STATUS_SUCCESS && sc->sc_ic_attached) {
 			(void)taskqueue_enqueue(taskqueue_thread,
 			    &sc->sc_post_assoc_task);
 			sc->sc_link_up = 1;
@@ -940,7 +940,7 @@ brcm_handle_event(struct brcm_softc *sc, const uint8_t *p, size_t len,
 		}
 		return;
 	}
-	if (evtype == BRCM_E_TYPE_DISASSOC) {
+	if (evtype == BWFM_E_TYPE_DISASSOC) {
 		DPRINTF(sc, 0, "DISASSOC reason=%u\n",
 		    be32toh(emsg->reason));
 		sc->sc_join_busy = 0;	/* allow next join attempt */
@@ -963,7 +963,7 @@ brcm_handle_event(struct brcm_softc *sc, const uint8_t *p, size_t len,
 		}
 		return;
 	}
-	if (evtype == BRCM_E_EAPOL_MSG) {
+	if (evtype == BWFM_E_EAPOL_MSG) {
 		/*
 		 * Firmware-delivered EAPOL frame.  With sup_wpa=0 the chip
 		 * emits each EAPOL packet from the AP as event type 25
@@ -1001,15 +1001,15 @@ brcm_handle_event(struct brcm_softc *sc, const uint8_t *p, size_t len,
 
 /*
  * RX data path.  Transport supplies an mbuf with the BCDC bulk-IN
- * header at the head.  We strip the BCDC header, demultiplex BRCM
+ * header at the head.  We strip the BCDC header, demultiplex BWFM
  * event frames (ethertype 0x886c) from real 802.3 data, and either
  * dispatch the event or hand the frame to net80211 via
  * ieee80211_input_all.
  */
 void
-brcm_rx_frame(struct brcm_softc *sc, struct mbuf *m)
+bwfm_rx_frame(struct bwfm_softc *sc, struct mbuf *m)
 {
-	struct brcm_bcdc_hdr bcdc;
+	struct bwfm_bcdc_hdr bcdc;
 	const uint8_t *p;
 	size_t offset, len, evpos;
 	uint16_t ethertype;
@@ -1046,7 +1046,7 @@ brcm_rx_frame(struct brcm_softc *sc, struct mbuf *m)
 	len = m->m_pkthdr.len;
 	ethertype = (uint16_t)p[12] << 8 | p[13];
 
-	if (ethertype != BRCM_ETHERTYPE_BRCM) {
+	if (ethertype != BWFM_ETHERTYPE_BWFM) {
 		struct ieee80211com *ic = &sc->sc_ic;
 		struct ieee80211vap *vap;
 
@@ -1063,7 +1063,7 @@ brcm_rx_frame(struct brcm_softc *sc, struct mbuf *m)
 		/*
 		 * EAPOL fast path: chip in FWSUP_NONE mode (sup_wpa=0)
 		 * delivers 802.1X frames as plain DATA (ethertype 0x888e),
-		 * NOT as BRCM_E_EAPOL_MSG events.  ieee80211_input_all
+		 * NOT as BWFM_E_EAPOL_MSG events.  ieee80211_input_all
 		 * expects 802.11 frames, not 802.3, so handing them there
 		 * would never get them to wpa_supplicant.
 		 *
@@ -1095,9 +1095,9 @@ brcm_rx_frame(struct brcm_softc *sc, struct mbuf *m)
 		return;
 	}
 
-	evpos = 14 + sizeof(struct brcm_brcm_ethhdr);
+	evpos = 14 + sizeof(struct bwfm_bwfm_ethhdr);
 	atomic_add_int(&sc->sc_evt_count, 1);
-	brcm_handle_event(sc, p, len, evpos);
+	bwfm_handle_event(sc, p, len, evpos);
 	m_freem(m);
 }
 
@@ -1105,21 +1105,21 @@ brcm_rx_frame(struct brcm_softc *sc, struct mbuf *m)
  * Push a WPA2 PMK / passphrase down to the firmware so its 4-way
  * handshake runs without host involvement.  Pulls the staged secret
  * from the softc: raw 32-byte PMK preferred if both are set.
- * Tries BRCM_C_SET_WSEC_PMK opcode 268 (legacy / 2011 firmware) first
+ * Tries BWFM_C_SET_WSEC_PMK opcode 268 (legacy / 2011 firmware) first
  * and falls back to the SET_VAR "wsec_pmk" iovar.
  */
 static int
-brcm_install_pmk(struct brcm_softc *sc)
+bwfm_install_pmk(struct bwfm_softc *sc)
 {
-	struct brcm_wsec_pmk wp;
+	struct bwfm_wsec_pmk wp;
 	int error_op, error_iovar;
 
 	memset(&wp, 0, sizeof(wp));
 
 	if (sc->sc_wpa_pmk_raw_set) {
-		wp.key_len = htole16(BRCM_WSEC_MAX_PSK_LEN);
+		wp.key_len = htole16(BWFM_WSEC_MAX_PSK_LEN);
 		wp.flags = 0;
-		memcpy(wp.key, sc->sc_wpa_pmk_raw, BRCM_WSEC_MAX_PSK_LEN);
+		memcpy(wp.key, sc->sc_wpa_pmk_raw, BWFM_WSEC_MAX_PSK_LEN);
 	} else if (sc->sc_wpa_set) {
 		size_t pmklen = strlen(sc->sc_wpa_pmk);
 
@@ -1128,19 +1128,19 @@ brcm_install_pmk(struct brcm_softc *sc)
 		 * struct so the on-chip PBKDF2 path accepts at most 32-char
 		 * passphrases.  Standard WPA2 allows up to 63 chars; longer
 		 * ones must be pre-derived on the host and pushed via the
-		 * raw-PMK path (dev.brcm.<n>.wpa_pmk_hex).
+		 * raw-PMK path (dev.bwfm.<n>.wpa_pmk_hex).
 		 */
-		if (pmklen < 8 || pmklen > BRCM_WSEC_MAX_PSK_LEN)
+		if (pmklen < 8 || pmklen > BWFM_WSEC_MAX_PSK_LEN)
 			return (EINVAL);
 		wp.key_len = htole16((uint16_t)pmklen);
-		wp.flags = htole16(BRCM_WSEC_PASSPHRASE);
+		wp.flags = htole16(BWFM_WSEC_PASSPHRASE);
 		memcpy(wp.key, sc->sc_wpa_pmk, pmklen);
 	} else {
 		return (EINVAL);
 	}
 
 	/*
-	 * Linux brcmfmac drives this exclusively via BRCM_C_SET_WSEC_PMK
+	 * Linux brcmfmac drives this exclusively via BWFM_C_SET_WSEC_PMK
 	 * opcode 268, never the "wsec_pmk" iovar.  For the 2011 firmware
 	 * the iovar string is not in the dispatcher at all (confirmed by
 	 * scanning the blob's string table), so the opcode is the only
@@ -1148,10 +1148,10 @@ brcm_install_pmk(struct brcm_softc *sc)
 	 * fallback for completeness so newer firmware that exposes it as
 	 * a named iovar also works.
 	 */
-	error_op = brcm_dcmd_set(sc, BRCM_C_SET_WSEC_PMK, &wp, sizeof(wp));
+	error_op = bwfm_dcmd_set(sc, BWFM_C_SET_WSEC_PMK, &wp, sizeof(wp));
 	if (error_op == 0)
 		return (0);
-	error_iovar = brcm_iovar_set(sc, "wsec_pmk", &wp, sizeof(wp));
+	error_iovar = bwfm_iovar_set(sc, "wsec_pmk", &wp, sizeof(wp));
 	if (error_iovar == 0)
 		return (0);
 	DPRINTF(sc, 0,
@@ -1178,37 +1178,37 @@ brcm_install_pmk(struct brcm_softc *sc)
  * from an earlier join.
  */
 static int
-brcm_join_wpa2_raw(struct brcm_softc *sc, const uint8_t bssid[6],
+bwfm_join_wpa2_raw(struct bwfm_softc *sc, const uint8_t bssid[6],
     const char *ssid, size_t ssid_len)
 {
 	uint32_t v;
 	int error;
 
-	if (brcm_join_busy_acquire(sc, "wpa2_raw"))
+	if (bwfm_join_busy_acquire(sc, "wpa2_raw"))
 		return (EAGAIN);
-	if (ssid_len > BRCM_MAX_SSID_LEN)
-		ssid_len = BRCM_MAX_SSID_LEN;
+	if (ssid_len > BWFM_MAX_SSID_LEN)
+		ssid_len = BWFM_MAX_SSID_LEN;
 
 	v = htole32(0);
-	(void)brcm_dcmd_set(sc, BRCM_C_DOWN, &v, sizeof(v));
+	(void)bwfm_dcmd_set(sc, BWFM_C_DOWN, &v, sizeof(v));
 
 	v = htole32(1);
-	error = brcm_dcmd_set(sc, BRCM_C_SET_INFRA, &v, sizeof(v));
+	error = bwfm_dcmd_set(sc, BWFM_C_SET_INFRA, &v, sizeof(v));
 	if (error != 0)
 		goto fail;
 
-	v = htole32(BRCM_AUTH_OPEN);
-	error = brcm_dcmd_set(sc, BRCM_C_SET_AUTH, &v, sizeof(v));
+	v = htole32(BWFM_AUTH_OPEN);
+	error = bwfm_dcmd_set(sc, BWFM_C_SET_AUTH, &v, sizeof(v));
 	if (error != 0)
 		goto fail;
 
-	v = htole32(BRCM_WSEC_AES);
-	error = brcm_iovar_set(sc, "wsec", &v, sizeof(v));
+	v = htole32(BWFM_WSEC_AES);
+	error = bwfm_iovar_set(sc, "wsec", &v, sizeof(v));
 	if (error != 0)
 		goto fail;
 
-	v = htole32(BRCM_WPA_AUTH_WPA2_PSK);
-	error = brcm_iovar_set(sc, "wpa_auth", &v, sizeof(v));
+	v = htole32(BWFM_WPA_AUTH_WPA2_PSK);
+	error = bwfm_iovar_set(sc, "wpa_auth", &v, sizeof(v));
 	if (error != 0)
 		goto fail;
 
@@ -1218,13 +1218,13 @@ brcm_join_wpa2_raw(struct brcm_softc *sc, const uint8_t bssid[6],
 	 * rejects the wsec_pmk install with BCME_BADARG (-2) and the 4-way
 	 * handshake never runs.  Linux brcmfmac sets this before
 	 * brcmf_set_pmk for FWSUP_PSK, at connect time rather than at
-	 * bringup.  Do NOT gate this on brcm_probe_wpa_sup(): the bringup
+	 * bringup.  Do NOT gate this on bwfm_probe_wpa_sup(): the bringup
 	 * probe can reject sup_wpa before the security mode is configured.
 	 * A failure is logged so it surfaces, but the join carries on.
 	 */
 	{
 		v = htole32(1);
-		error = brcm_iovar_set(sc, "sup_wpa", &v, sizeof(v));
+		error = bwfm_iovar_set(sc, "sup_wpa", &v, sizeof(v));
 		if (error != 0) {
 			DPRINTF(sc, 0,
 			    "sup_wpa=1 rejected at join (rc=%d) — "
@@ -1236,7 +1236,7 @@ brcm_join_wpa2_raw(struct brcm_softc *sc, const uint8_t bssid[6],
 		}
 	}
 
-	error = brcm_install_pmk(sc);
+	error = bwfm_install_pmk(sc);
 	if (error != 0) {
 		DPRINTF(sc, 0,
 		    "wsec_pmk failed (%d) -- continuing; firmware may "
@@ -1246,23 +1246,23 @@ brcm_join_wpa2_raw(struct brcm_softc *sc, const uint8_t bssid[6],
 	}
 
 	v = htole32(1);
-	(void)brcm_dcmd_set(sc, BRCM_C_UP, &v, sizeof(v));
+	(void)bwfm_dcmd_set(sc, BWFM_C_UP, &v, sizeof(v));
 
 	/* join_pref: matches Linux brcmf_c_set_joinpref_default. */
 	{
-		struct brcm_join_pref_params jp[2];
+		struct bwfm_join_pref_params jp[2];
 		int rc;
 
 		memset(jp, 0, sizeof(jp));
-		jp[0].type = BRCM_JOIN_PREF_RSSI_DELTA;
+		jp[0].type = BWFM_JOIN_PREF_RSSI_DELTA;
 		jp[0].len = 2;
-		jp[0].rssi_gain = BRCM_JOIN_PREF_RSSI_BOOST;
-		jp[0].band = BRCM_WLC_BAND_5G;
-		jp[1].type = BRCM_JOIN_PREF_RSSI;
+		jp[0].rssi_gain = BWFM_JOIN_PREF_RSSI_BOOST;
+		jp[0].band = BWFM_WLC_BAND_5G;
+		jp[1].type = BWFM_JOIN_PREF_RSSI;
 		jp[1].len = 2;
 		jp[1].rssi_gain = 0;
 		jp[1].band = 0;
-		rc = brcm_iovar_set(sc, "join_pref", jp, sizeof(jp));
+		rc = bwfm_iovar_set(sc, "join_pref", jp, sizeof(jp));
 		DPRINTF(sc, 0, "join WPA2: join_pref rc=%d\n", rc);
 	}
 
@@ -1273,11 +1273,11 @@ brcm_join_wpa2_raw(struct brcm_softc *sc, const uint8_t bssid[6],
 	 * fw-supplicant 4-way incomplete on this fw (LINK reason=2).
 	 */
 	{
-		struct brcm_ext_join_params ejp;
+		struct bwfm_ext_join_params ejp;
 		size_t join_params_size;
 		uint16_t chanspec;
 
-		chanspec = brcm_lookup_bssid_chanspec(sc, bssid);
+		chanspec = bwfm_lookup_bssid_chanspec(sc, bssid);
 		if (chanspec == 0) {
 			/*
 			 * The chanspec cache holds only the last-scanned
@@ -1292,7 +1292,7 @@ brcm_join_wpa2_raw(struct brcm_softc *sc, const uint8_t bssid[6],
 			    jv->iv_bss->ni_chan != NULL &&
 			    jv->iv_bss->ni_chan != IEEE80211_CHAN_ANYC &&
 			    jv->iv_bss->ni_chan->ic_ieee != 0)
-				chanspec = brcm_chan_to_chanspec(sc,
+				chanspec = bwfm_chan_to_chanspec(sc,
 				    jv->iv_bss->ni_chan->ic_ieee);
 		}
 
@@ -1314,8 +1314,8 @@ brcm_join_wpa2_raw(struct brcm_softc *sc, const uint8_t bssid[6],
 			ejp.scan.active_time  = htole32((uint32_t)-1);
 			ejp.scan.passive_time = htole32((uint32_t)-1);
 			join_params_size =
-			    offsetof(struct brcm_ext_join_params, assoc) +
-			    offsetof(struct brcm_ext_assoc_params,
+			    offsetof(struct bwfm_ext_join_params, assoc) +
+			    offsetof(struct bwfm_ext_assoc_params,
 			    chanspec_list);
 		}
 
@@ -1327,7 +1327,7 @@ brcm_join_wpa2_raw(struct brcm_softc *sc, const uint8_t bssid[6],
 		    bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
 		    chanspec, join_params_size);
 
-		error = brcm_iovar_set(sc, "join", &ejp, join_params_size);
+		error = bwfm_iovar_set(sc, "join", &ejp, join_params_size);
 		if (error != 0)
 			goto fail;
 	}
@@ -1340,14 +1340,14 @@ fail:
 
 /* join a WPA2 network using the stored passphrase */
 static int
-brcm_join_wpa2(struct brcm_softc *sc, struct ieee80211vap *vap)
+bwfm_join_wpa2(struct bwfm_softc *sc, struct ieee80211vap *vap)
 {
 	struct ieee80211_node *ni;
 
 	ni = vap->iv_bss;
 	if (ni == NULL)
 		return (EINVAL);
-	return (brcm_join_wpa2_raw(sc, ni->ni_bssid,
+	return (bwfm_join_wpa2_raw(sc, ni->ni_bssid,
 	    (const char *)ni->ni_essid, ni->ni_esslen));
 }
 
@@ -1358,9 +1358,9 @@ brcm_join_wpa2(struct brcm_softc *sc, struct ieee80211vap *vap)
  * on success.
  */
 static int
-brcm_join_open(struct brcm_softc *sc, struct ieee80211vap *vap)
+bwfm_join_open(struct bwfm_softc *sc, struct ieee80211vap *vap)
 {
-	struct brcm_join_params join;
+	struct bwfm_join_params join;
 	struct ieee80211_node *ni;
 	size_t jlen;
 	uint16_t chanspec;
@@ -1368,7 +1368,7 @@ brcm_join_open(struct brcm_softc *sc, struct ieee80211vap *vap)
 	uint32_t v;
 	int error;
 
-	if (brcm_join_busy_acquire(sc, "open"))
+	if (bwfm_join_busy_acquire(sc, "open"))
 		return (EAGAIN);
 	ni = vap->iv_bss;
 	if (ni == NULL) {
@@ -1377,13 +1377,13 @@ brcm_join_open(struct brcm_softc *sc, struct ieee80211vap *vap)
 	}
 
 	slen = ni->ni_esslen;
-	if (slen > BRCM_MAX_SSID_LEN)
-		slen = BRCM_MAX_SSID_LEN;
+	if (slen > BWFM_MAX_SSID_LEN)
+		slen = BWFM_MAX_SSID_LEN;
 
 	/*
 	 * Reset chip security/infra state to known-open before
 	 * SET_SSID.  Without this, leftover wsec=AES + wpa_auth=
-	 * WPA2_PSK from an earlier brcm_join_wpa2_raw keeps the
+	 * WPA2_PSK from an earlier bwfm_join_wpa2_raw keeps the
 	 * chip in WPA2 mode -- it'll silently drop probe responses
 	 * that don't include matching RSN IEs and never reach AUTH.
 	 *
@@ -1394,13 +1394,13 @@ brcm_join_open(struct brcm_softc *sc, struct ieee80211vap *vap)
 	 * Just program the iovars on the already-UP chip.
 	 */
 	v = htole32(1);
-	(void)brcm_dcmd_set(sc, BRCM_C_SET_INFRA, &v, sizeof(v));
-	v = htole32(BRCM_AUTH_OPEN);
-	(void)brcm_dcmd_set(sc, BRCM_C_SET_AUTH, &v, sizeof(v));
+	(void)bwfm_dcmd_set(sc, BWFM_C_SET_INFRA, &v, sizeof(v));
+	v = htole32(BWFM_AUTH_OPEN);
+	(void)bwfm_dcmd_set(sc, BWFM_C_SET_AUTH, &v, sizeof(v));
 	v = htole32(0);
-	(void)brcm_iovar_set(sc, "wsec", &v, sizeof(v));
+	(void)bwfm_iovar_set(sc, "wsec", &v, sizeof(v));
 	v = htole32(0);
-	(void)brcm_iovar_set(sc, "wpa_auth", &v, sizeof(v));
+	(void)bwfm_iovar_set(sc, "wpa_auth", &v, sizeof(v));
 
 	memset(&join, 0, sizeof(join));
 	join.ssid.len = htole32(slen);
@@ -1416,14 +1416,14 @@ brcm_join_open(struct brcm_softc *sc, struct ieee80211vap *vap)
 	 * exact chanspec the fw itself reported in the last ESCAN_RESULT
 	 * lets the chip skip the rediscovery and park directly.
 	 */
-	chanspec = brcm_lookup_bssid_chanspec(sc, ni->ni_bssid);
+	chanspec = bwfm_lookup_bssid_chanspec(sc, ni->ni_bssid);
 	if (chanspec != 0) {
 		join.assoc.chanspec_num = htole32(1);
 		join.assoc.chanspec_list[0] = htole16(chanspec);
-		jlen = BRCM_JOIN_PARAMS_FIXED_SIZE + sizeof(uint16_t);
+		jlen = BWFM_JOIN_PARAMS_FIXED_SIZE + sizeof(uint16_t);
 	} else {
 		join.assoc.chanspec_num = 0;
-		jlen = BRCM_JOIN_PARAMS_FIXED_SIZE;
+		jlen = BWFM_JOIN_PARAMS_FIXED_SIZE;
 	}
 
 	DPRINTF(sc, 0,
@@ -1434,7 +1434,7 @@ brcm_join_open(struct brcm_softc *sc, struct ieee80211vap *vap)
 	    ni->ni_bssid[3], ni->ni_bssid[4], ni->ni_bssid[5],
 	    chanspec, jlen);
 
-	error = brcm_dcmd_set(sc, BRCM_C_SET_SSID, &join, jlen);
+	error = bwfm_dcmd_set(sc, BWFM_C_SET_SSID, &join, jlen);
 	DPRINTF(sc, 0, "join OPEN: SET_SSID rc=%d\n", error);
 	if (error != 0)
 		sc->sc_join_busy = 0;
@@ -1443,22 +1443,22 @@ brcm_join_open(struct brcm_softc *sc, struct ieee80211vap *vap)
 
 /*
  * Trace-only newstate hook.  AUTH/ASSOC join dispatch is owned by
- * the FullMAC framework (fmac_newstate -> brcm_fmop_assoc, which
- * defers to brcm_assoc_task on taskqueue_thread); this wrapper
+ * the FullMAC framework (fmac_newstate -> bwfm_fmop_assoc, which
+ * defers to bwfm_assoc_task on taskqueue_thread); this wrapper
  * keeps the per-transition log line and chains to net80211's
  * default sta_newstate so SCAN / INIT / RUN walks behave.
  */
 static int
-brcm_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
+bwfm_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 {
-	struct brcm_vap *bv = BRCM_VAP(vap);
-	struct brcm_softc *sc = vap->iv_ic->ic_softc;
+	struct bwfm_vap *bv = BWFM_VAP(vap);
+	struct bwfm_softc *sc = vap->iv_ic->ic_softc;
 
 	DPRINTF(sc, 1, "newstate %d -> %d arg=%d\n",
 	    vap->iv_state, nstate, arg);
 	/*
 	 * Give the bss node its association ID before net80211 runs RUN,
-	 * not after (brcm_link_ran does it too, late).  sta_newstate's RUN
+	 * not after (bwfm_link_ran does it too, late).  sta_newstate's RUN
 	 * notifies wpa_supplicant, which answers an already-queued message
 	 * 1 within a millisecond.  When the firmware's EAPOL arrives ahead
 	 * of the link-up and ni_associd is still 0, ieee80211_start_pkt
@@ -1480,9 +1480,9 @@ brcm_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
  * callback context is not safe.
  */
 static void
-brcm_scan_done_task(void *arg, int pending)
+bwfm_scan_done_task(void *arg, int pending)
 {
-	struct brcm_softc *sc = arg;
+	struct bwfm_softc *sc = arg;
 	struct ieee80211vap *vap;
 
 	atomic_add_32(&sc->sc_scan_done_cover, (uint32_t)pending);
@@ -1518,9 +1518,9 @@ brcm_scan_done_task(void *arg, int pending)
  * This is the iwm-style hook-override pattern: each transition
  * shortcuts to the next because the chip is already past it.
  */
-static int	brcm_sta_join_from_cache(struct brcm_softc *sc);
+static int	bwfm_sta_join_from_cache(struct bwfm_softc *sc);
 
-static int	brcm_scb_authorize(struct brcm_softc *, const uint8_t[6]);
+static int	bwfm_scb_authorize(struct bwfm_softc *, const uint8_t[6]);
 
 /*
  * net80211 has just been walked to RUN on the firmware's link-up: give
@@ -1528,7 +1528,7 @@ static int	brcm_scb_authorize(struct brcm_softc *, const uint8_t[6]);
  * itself, open the 802.1x port.
  */
 static void
-brcm_link_ran(struct brcm_softc *sc, struct ieee80211vap *vap)
+bwfm_link_ran(struct bwfm_softc *sc, struct ieee80211vap *vap)
 {
 	/*
 	 * net80211 was fast-forwarded to RUN without parsing a real
@@ -1559,19 +1559,19 @@ brcm_link_ran(struct brcm_softc *sc, struct ieee80211vap *vap)
 		 * Also authorize the chip data-plane SCB, or the
 		 * fw drops every data frame despite the completed
 		 * 4-way.  The host-EAPOL path does this from
-		 * brcm_fmop_set_key; the fw-supplicant path never
+		 * bwfm_fmop_set_key; the fw-supplicant path never
 		 * calls set_key, so do it here on link-up.
 		 */
-		(void)brcm_scb_authorize(sc, vap->iv_bss->ni_bssid);
+		(void)bwfm_scb_authorize(sc, vap->iv_bss->ni_bssid);
 		DPRINTF(sc, 0, "link task: authorized 802.1x port "
 		    "+ SCB data plane (fw supplicant)\n");
 	}
 }
 
 static void
-brcm_link_task(void *arg, int pending)
+bwfm_link_task(void *arg, int pending)
 {
-	struct brcm_softc *sc = arg;
+	struct bwfm_softc *sc = arg;
 	struct ieee80211vap *vap;
 	struct ieee80211_node *ni;
 
@@ -1605,11 +1605,11 @@ brcm_link_task(void *arg, int pending)
 	 * scan-cache lookup / kick-a-scan recovery below.  Without
 	 * this fallback, raw join dispatch leaves the vap stuck in
 	 * INIT and the EAPOL events the chip is forwarding
-	 * (BRCM_E_EAPOL_MSG) hit a vap with no listener.
+	 * (BWFM_E_EAPOL_MSG) hit a vap with no listener.
 	 */
 	if (ieee80211_fmac_link_up(&sc->sc_ic, NULL) == 0) {
 		DPRINTF(sc, 0, "link task: framework walked vap to RUN\n");
-		brcm_link_ran(sc, vap);
+		bwfm_link_ran(sc, vap);
 		return;
 	}
 
@@ -1636,14 +1636,14 @@ brcm_link_task(void *arg, int pending)
 			ieee80211_cancel_scan(vap);
 			for (i = 0; i < 20 &&
 			    (sc->sc_ic.ic_flags & IEEE80211_F_SCAN); i++)
-				pause("brcmscx", hz / 20);
+				pause("bwfmscx", hz / 20);
 			if (sc->sc_ic.ic_flags & IEEE80211_F_SCAN) {
 				DPRINTF(sc, 0, "link task: scan would not stop; "
 				    "not joining from the cache\n");
 				return;
 			}
 		}
-		rc = brcm_sta_join_from_cache(sc);
+		rc = bwfm_sta_join_from_cache(sc);
 
 		DPRINTF(sc, 0, "link task: vap state=%d, "
 		    "sta_join_from_cache rc=%d\n", vap->iv_state, rc);
@@ -1658,11 +1658,11 @@ brcm_link_task(void *arg, int pending)
 		}
 		/* sta_join's walk to AUTH runs on net80211's taskqueue. */
 		for (i = 0; i < 20 && !sc->sc_dying && sc->sc_link_up; i++) {
-			pause("brcmlnk", hz / 10);
+			pause("bwfmlnk", hz / 10);
 			if (ieee80211_fmac_link_up(&sc->sc_ic, NULL) == 0) {
 				DPRINTF(sc, 0, "link task: walked vap to RUN "
 				    "after sta_join (%d ms)\n", (i + 1) * 100);
-				brcm_link_ran(sc, vap);
+				bwfm_link_ran(sc, vap);
 				return;
 			}
 		}
@@ -1686,11 +1686,11 @@ brcm_link_task(void *arg, int pending)
  * slot.
  */
 static int
-brcm_set_key(struct brcm_softc *sc, uint32_t key_index, uint32_t algo,
+bwfm_set_key(struct bwfm_softc *sc, uint32_t key_index, uint32_t algo,
     uint32_t flags, const uint8_t *key, uint32_t key_len,
     const uint8_t ea[6])
 {
-	struct brcm_wsec_key_le wk;
+	struct bwfm_wsec_key_le wk;
 	int error;
 
 	if (key_len > sizeof(wk.data))
@@ -1698,7 +1698,7 @@ brcm_set_key(struct brcm_softc *sc, uint32_t key_index, uint32_t algo,
 
 	/*
 	 * 164-byte "wsec_key" iovar -- matches Linux brcmf_wsec_key_le
-	 * exactly.  Used instead of the 37-byte BRCM_C_SET_KEY=45 dcmd:
+	 * exactly.  Used instead of the 37-byte BWFM_C_SET_KEY=45 dcmd:
 	 * BCM43455 fw 7.45.x rejects the legacy dcmd with BCME_BADARG
 	 * and only services the iovar form.
 	 */
@@ -1717,7 +1717,7 @@ brcm_set_key(struct brcm_softc *sc, uint32_t key_index, uint32_t algo,
 	    key_index, key_len, algo, flags,
 	    ea[0], ea[1], ea[2], ea[3], ea[4], ea[5]);
 
-	error = brcm_iovar_set(sc, "wsec_key", &wk, sizeof(wk));
+	error = bwfm_iovar_set(sc, "wsec_key", &wk, sizeof(wk));
 	DPRINTF(sc, 0, "wsec_key: rc=%d\n", error);
 	return (error);
 }
@@ -1731,13 +1731,13 @@ brcm_set_key(struct brcm_softc *sc, uint32_t key_index, uint32_t algo,
  * the chip drops every data frame even after successful 4-way.
  */
 static int
-brcm_scb_authorize(struct brcm_softc *sc, const uint8_t ap_mac[6])
+bwfm_scb_authorize(struct bwfm_softc *sc, const uint8_t ap_mac[6])
 {
 	uint8_t buf[6];
 	int error;
 
 	memcpy(buf, ap_mac, 6);
-	error = brcm_dcmd_set(sc, BRCM_C_SET_SCB_AUTHORIZE,
+	error = bwfm_dcmd_set(sc, BWFM_C_SET_SCB_AUTHORIZE,
 	    buf, sizeof(buf));
 	DPRINTF(sc, 0,
 	    "scb_authorize: ap=%02x:%02x:%02x:%02x:%02x:%02x rc=%d\n",
@@ -1752,29 +1752,29 @@ brcm_scb_authorize(struct brcm_softc *sc, const uint8_t ap_mac[6])
  * then asks net80211 to install the derived PTK + GTK.  net80211 calls
  * these hooks; we forward the keys to the chip via the "wsec_key" iovar.
  *
- * net80211's IEEE80211_CIPHER_* maps to BRCM_CRYPTO_ALGO_* one-to-one
+ * net80211's IEEE80211_CIPHER_* maps to BWFM_CRYPTO_ALGO_* one-to-one
  * for AES-CCM and TKIP.  WEP is supported for completeness.
  */
 static uint32_t
-brcm_cipher_to_algo(uint8_t cipher)
+bwfm_cipher_to_algo(uint8_t cipher)
 {
 
 	switch (cipher) {
 	case IEEE80211_CIPHER_AES_CCM:
-		return (BRCM_CRYPTO_ALGO_AES_CCM);
+		return (BWFM_CRYPTO_ALGO_AES_CCM);
 	case IEEE80211_CIPHER_TKIP:
-		return (BRCM_CRYPTO_ALGO_TKIP);
+		return (BWFM_CRYPTO_ALGO_TKIP);
 	case IEEE80211_CIPHER_WEP:
-		return (BRCM_CRYPTO_ALGO_WEP1);
+		return (BWFM_CRYPTO_ALGO_WEP1);
 	default:
-		return (BRCM_CRYPTO_ALGO_OFF);
+		return (BWFM_CRYPTO_ALGO_OFF);
 	}
 }
 
 /*
  * net80211 vap clone hook.  Returns a freshly-minted ieee80211vap
  * wrapper; we chain the parent's iv_newstate through bv_newstate so
- * the brcm hook can intercept transitions and push them to the
+ * the bwfm hook can intercept transitions and push them to the
  * firmware before falling through to the net80211 default.
  */
 /*
@@ -1786,7 +1786,7 @@ brcm_cipher_to_algo(uint8_t cipher)
  * address back after an override.
  */
 static void
-brcm_set_fw_macaddr(struct brcm_softc *sc,
+bwfm_set_fw_macaddr(struct bwfm_softc *sc,
     const uint8_t mac[IEEE80211_ADDR_LEN])
 {
 	uint8_t cur[IEEE80211_ADDR_LEN];
@@ -1794,7 +1794,7 @@ brcm_set_fw_macaddr(struct brcm_softc *sc,
 	uint32_t v = 0;
 	int error;
 
-	if (brcm_iovar_get(sc, "cur_etheraddr", cur, &len) == 0 &&
+	if (bwfm_iovar_get(sc, "cur_etheraddr", cur, &len) == 0 &&
 	    len >= sizeof(cur) && IEEE80211_ADDR_EQ(cur, mac))
 		return;
 	/*
@@ -1803,9 +1803,9 @@ brcm_set_fw_macaddr(struct brcm_softc *sc,
 	 * firmware kept join state from the old address, and joins from the
 	 * new one timed out authenticating.
 	 */
-	(void)brcm_dcmd_set(sc, BRCM_C_DOWN, &v, sizeof(v));
-	error = brcm_iovar_set(sc, "cur_etheraddr", mac, IEEE80211_ADDR_LEN);
-	(void)brcm_dcmd_set(sc, BRCM_C_UP, &v, sizeof(v));
+	(void)bwfm_dcmd_set(sc, BWFM_C_DOWN, &v, sizeof(v));
+	error = bwfm_iovar_set(sc, "cur_etheraddr", mac, IEEE80211_ADDR_LEN);
+	(void)bwfm_dcmd_set(sc, BWFM_C_UP, &v, sizeof(v));
 	if (error != 0)
 		device_printf(sc->sc_dev, "vap: setting cur_etheraddr %6D "
 		    "failed (%d); the chip keeps its own address\n", mac, ":",
@@ -1816,30 +1816,30 @@ brcm_set_fw_macaddr(struct brcm_softc *sc,
 }
 
 static struct ieee80211vap *
-brcm_vap_create(struct ieee80211com *ic, const char name[IFNAMSIZ],
+bwfm_vap_create(struct ieee80211com *ic, const char name[IFNAMSIZ],
     int unit, enum ieee80211_opmode opmode, int flags,
     const uint8_t bssid[IEEE80211_ADDR_LEN],
     const uint8_t mac[IEEE80211_ADDR_LEN])
 {
-	struct brcm_softc *sc = ic->ic_softc;
-	struct brcm_vap *bv;
+	struct bwfm_softc *sc = ic->ic_softc;
+	struct bwfm_vap *bv;
 	struct ieee80211vap *vap;
 
 	if (!TAILQ_EMPTY(&ic->ic_vaps))
 		return (NULL);
 
-	bv = malloc(sizeof(*bv), M_BRCM, M_WAITOK | M_ZERO);
+	bv = malloc(sizeof(*bv), M_BWFM, M_WAITOK | M_ZERO);
 	vap = &bv->bv_vap;
 	if (ieee80211_vap_setup(ic, vap, name, unit, opmode,
 	    flags | IEEE80211_CLONE_NOBEACONS, bssid) != 0) {
-		free(bv, M_BRCM);
+		free(bv, M_BWFM);
 		return (NULL);
 	}
 
 	bv->bv_newstate = vap->iv_newstate;
-	vap->iv_newstate = brcm_newstate;
+	vap->iv_newstate = bwfm_newstate;
 
-	brcm_set_fw_macaddr(sc, mac);
+	bwfm_set_fw_macaddr(sc, mac);
 
 	/*
 	 * FullMAC: the firmware monitors the BSS and reports LINK-down
@@ -1857,10 +1857,10 @@ brcm_vap_create(struct ieee80211com *ic, const char name[IFNAMSIZ],
 	/*
 	 * Hand vap-level slots to the FullMAC framework.  fmac_newstate
 	 * intercepts AUTH/ASSOC and side-effect-dispatches the join via
-	 * fmop_assoc, then chains to brcm_newstate (the saved hook).
+	 * fmop_assoc, then chains to bwfm_newstate (the saved hook).
 	 * fmac_key_set / fmac_key_delete forward straight into the
 	 * fmop_set_key / fmop_del_key ops; the chip-side dispatch lives
-	 * in brcm_fmop_*.
+	 * in bwfm_fmop_*.
 	 */
 	ieee80211_fmac_vap_attach(vap);
 
@@ -1887,9 +1887,9 @@ brcm_vap_create(struct ieee80211com *ic, const char name[IFNAMSIZ],
  * and need it done before they go on.
  */
 static void
-brcm_leave(struct brcm_softc *sc, const struct ieee80211vap *vap)
+bwfm_leave(struct bwfm_softc *sc, const struct ieee80211vap *vap)
 {
-	struct brcm_scb_val_le sv;
+	struct bwfm_scb_val_le sv;
 	int error;
 
 	if (!sc->sc_link_up)
@@ -1898,20 +1898,20 @@ brcm_leave(struct brcm_softc *sc, const struct ieee80211vap *vap)
 	sv.val = htole32(IEEE80211_REASON_AUTH_LEAVE);
 	if (vap != NULL && vap->iv_bss != NULL)
 		memcpy(sv.ea, vap->iv_bss->ni_bssid, sizeof(sv.ea));
-	error = brcm_dcmd_set(sc, BRCM_C_DISASSOC, &sv, sizeof(sv));
+	error = bwfm_dcmd_set(sc, BWFM_C_DISASSOC, &sv, sizeof(sv));
 	DPRINTF(sc, 0, "leave: WLC_DISASSOC rc=%d\n", error);
 	sc->sc_join_busy = 0;
 }
 
 /* tear down a virtual wifi interface */
 static void
-brcm_vap_delete(struct ieee80211vap *vap)
+bwfm_vap_delete(struct ieee80211vap *vap)
 {
-	struct brcm_vap *bv = BRCM_VAP(vap);
+	struct bwfm_vap *bv = BWFM_VAP(vap);
 
-	brcm_leave(vap->iv_ic->ic_softc, vap);
+	bwfm_leave(vap->iv_ic->ic_softc, vap);
 	ieee80211_vap_detach(vap);
-	free(bv, M_BRCM);
+	free(bv, M_BWFM);
 }
 
 /*
@@ -1925,25 +1925,25 @@ brcm_vap_delete(struct ieee80211vap *vap)
  * sends WLC_UP once, when the dongle is configured on open.
  */
 static void
-brcm_parent(struct ieee80211com *ic)
+bwfm_parent(struct ieee80211com *ic)
 {
-	struct brcm_softc *sc = ic->ic_softc;
+	struct bwfm_softc *sc = ic->ic_softc;
 	uint32_t v = htole32(1);
 	int error;
 
 	if (sc->sc_dying)
 		return;
 	if (ic->ic_nrunning == 0) {
-		brcm_leave(sc, TAILQ_FIRST(&ic->ic_vaps));
+		bwfm_leave(sc, TAILQ_FIRST(&ic->ic_vaps));
 		if (!sc->sc_wlc_up)
 			return;
-		error = brcm_dcmd_set(sc, BRCM_C_DOWN, &v, sizeof(v));
+		error = bwfm_dcmd_set(sc, BWFM_C_DOWN, &v, sizeof(v));
 		DPRINTF(sc, 0, "parent: last vap down; WLC_DOWN rc=%d\n",
 		    error);
 		if (error == 0)
 			sc->sc_wlc_up = false;
 	} else if (!sc->sc_wlc_up) {
-		error = brcm_dcmd_set(sc, BRCM_C_UP, &v, sizeof(v));
+		error = bwfm_dcmd_set(sc, BWFM_C_UP, &v, sizeof(v));
 		DPRINTF(sc, 0, "parent: vap up; WLC_UP rc=%d\n", error);
 		if (error == 0)
 			sc->sc_wlc_up = true;
@@ -1954,7 +1954,7 @@ brcm_parent(struct ieee80211com *ic)
 /*
  * net80211 hands ic_transmit 802.11-encapsulated frames (802.11 header +
  * RFC1042 LLC/SNAP); FullMAC firmware takes plain 802.3 and does its own
- * encapsulation.  Convert back.  The same as brcm_pci_deencap_80211, which
+ * encapsulation.  Convert back.  The same as bwfm_pci_deencap_80211, which
  * the PCI transport keeps; the SDIO and USB transports use this one.  The
  * firmware cannot parse 802.11 frames sent as if they were Ethernet, and
  * wpa_supplicant's 4-way replies would never reach the AP.
@@ -1964,7 +1964,7 @@ brcm_parent(struct ieee80211com *ic)
  * made contiguous (*mp is then NULL).
  */
 int
-brcm_deencap_80211(struct mbuf **mp)
+bwfm_deencap_80211(struct mbuf **mp)
 {
 	struct mbuf *m = *mp;
 	struct ieee80211_frame *wh;
@@ -2023,9 +2023,9 @@ brcm_deencap_80211(struct mbuf **mp)
 }
 
 static int
-brcm_transmit(struct ieee80211com *ic, struct mbuf *m)
+bwfm_transmit(struct ieee80211com *ic, struct mbuf *m)
 {
-	struct brcm_softc *sc = ic->ic_softc;
+	struct bwfm_softc *sc = ic->ic_softc;
 
 	return (sc->sc_bus_ops->bs_txdata(sc, m));
 }
@@ -2037,12 +2037,12 @@ brcm_transmit(struct ieee80211com *ic, struct mbuf *m)
  * so complete the frame as sent and drop it.  Passing it on would be
  * wrong twice over: the chip cannot use it, and on SDIO the send sleeps
  * in the MMC stack while net80211's scan task holds the com lock, which
- * panics ("sleeping thread holds brcm0_com_lock").
+ * panics ("sleeping thread holds bwfm0_com_lock").
  * ieee80211_tx_complete frees the mbuf and the node reference
  * ieee80211_raw_output took.
  */
 static int
-brcm_raw_xmit(struct ieee80211_node *ni, struct mbuf *m,
+bwfm_raw_xmit(struct ieee80211_node *ni, struct mbuf *m,
     const struct ieee80211_bpf_params *params __unused)
 {
 	ieee80211_tx_complete(ni, m, 0);
@@ -2057,14 +2057,14 @@ brcm_raw_xmit(struct ieee80211_node *ni, struct mbuf *m,
  * ESCAN_RESULT with status=SUCCESS.
  */
 static int
-brcm_dispatch_scan(struct brcm_softc *sc)
+bwfm_dispatch_scan(struct bwfm_softc *sc)
 {
-	struct brcm_escan_params_v0 params;
+	struct bwfm_escan_params_v0 params;
 	int err;
 
 	/*
 	 * Refuse if a scan is already in flight.  Same guard as
-	 * brcm_sdio_sysctl_cmd_scan but at the brcm_softc layer so
+	 * bwfm_sdio_sysctl_cmd_scan but at the bwfm_softc layer so
 	 * BOTH the fmop_scan_start path (this function) and the
 	 * cmd_scan sysctl share state.  Mirrors Linux brcmfmac's
 	 * BRCMF_SCAN_STATUS_BUSY (cfg80211.c:1524) returning
@@ -2074,7 +2074,7 @@ brcm_dispatch_scan(struct brcm_softc *sc)
 	 * streams interleave through the SDPCM ctl path.
 	 *
 	 * Cleared by the terminator ESCAN_RESULT (any non-PARTIAL
-	 * status) routed through brcm_handle_event, mirroring
+	 * status) routed through bwfm_handle_event, mirroring
 	 * brcmf_notify_escan_complete.
 	 */
 	if (sc->sc_scan_busy)
@@ -2084,19 +2084,19 @@ brcm_dispatch_scan(struct brcm_softc *sc)
 	memset(&params, 0, sizeof(params));
 	memset(params.scan_params.bssid, 0xff,
 	    sizeof(params.scan_params.bssid));
-	params.scan_params.bss_type = BRCM_DOT11_BSSTYPE_ANY;
-	params.scan_params.scan_type = BRCM_SCANTYPE_PASSIVE;
+	params.scan_params.bss_type = BWFM_DOT11_BSSTYPE_ANY;
+	params.scan_params.scan_type = BWFM_SCANTYPE_PASSIVE;
 	params.scan_params.nprobes = htole32((uint32_t)-1);
 	params.scan_params.active_time = htole32((uint32_t)-1);
 	params.scan_params.passive_time = htole32((uint32_t)-1);
 	params.scan_params.home_time = htole32((uint32_t)-1);
 	params.scan_params.channel_num = 0;	/* all channels */
 
-	params.version = htole32(BRCM_ESCAN_REQ_VERSION);
-	params.action = htole16(BRCM_WL_ESCAN_ACTION_START);
+	params.version = htole32(BWFM_ESCAN_REQ_VERSION);
+	params.action = htole16(BWFM_WL_ESCAN_ACTION_START);
 	params.sync_id = htole16(0x1234);
 
-	err = brcm_iovar_set(sc, "escan", &params, sizeof(params));
+	err = bwfm_iovar_set(sc, "escan", &params, sizeof(params));
 	if (err != 0) {
 		sc->sc_scan_busy = 0;	/* fw rejected; nothing to wait for */
 		return (err);
@@ -2120,9 +2120,9 @@ brcm_dispatch_scan(struct brcm_softc *sc)
 
 /* switch the radio to a channel (not yet implemented) */
 static void
-brcm_set_channel(struct ieee80211com *ic)
+bwfm_set_channel(struct ieee80211com *ic)
 {
-	/* TODO: BRCM_C_SET_CHANNEL.  Needs HW. */
+	/* TODO: BWFM_C_SET_CHANNEL.  Needs HW. */
 	(void)ic;
 }
 
@@ -2131,7 +2131,7 @@ brcm_set_channel(struct ieee80211com *ic)
  * net80211's update_promisc / update_mcast taskqueue entrypoints
  * (ieee80211_proto.c:1832-1846) -- safe to sleep, BCDC iovars OK.
  *
- * What Linux does (brcmfmac/core.c:_brcmf_set_multicast_list):
+ * What Linux does (brcmfmac/core.c:_bwfmf_set_multicast_list):
  *   - mcast_list iovar:  list of host's multicast group MAC addresses
  *     so chip RXes their frames.  Payload = {u32 count; u8 mac[count][6];}.
  *   - allmulti iovar:    bool; if true chip RXes ALL multicast (promisc
@@ -2148,9 +2148,9 @@ brcm_set_channel(struct ieee80211com *ic)
  * it; we already filter by MAC at the chip via cur_etheraddr.
  */
 static void
-brcm_update_promisc(struct ieee80211com *ic)
+bwfm_update_promisc(struct ieee80211com *ic)
 {
-	struct brcm_softc *sc = ic->ic_softc;
+	struct bwfm_softc *sc = ic->ic_softc;
 	struct ieee80211vap *vap = TAILQ_FIRST(&ic->ic_vaps);
 	uint32_t v;
 	int error;
@@ -2158,21 +2158,21 @@ brcm_update_promisc(struct ieee80211com *ic)
 	if (vap == NULL || vap->iv_ifp == NULL)
 		return;
 	v = htole32((if_getflags(vap->iv_ifp) & IFF_PROMISC) ? 1 : 0);
-	error = brcm_dcmd_set(sc, 10 /* BRCM_C_SET_PROMISC */,
+	error = bwfm_dcmd_set(sc, 10 /* BWFM_C_SET_PROMISC */,
 	    &v, sizeof(v));
 	DPRINTF(sc, 1, "SET_PROMISC=%u rc=%d\n", le32toh(v), error);
 }
 
 /* update the chip's multicast reception setting */
 static void
-brcm_update_mcast(struct ieee80211com *ic)
+bwfm_update_mcast(struct ieee80211com *ic)
 {
-	struct brcm_softc *sc = ic->ic_softc;
+	struct bwfm_softc *sc = ic->ic_softc;
 	uint32_t v;
 	int error;
 
 	v = htole32(1);	/* always-on multicast pass-through */
-	error = brcm_iovar_set(sc, "allmulti", &v, sizeof(v));
+	error = bwfm_iovar_set(sc, "allmulti", &v, sizeof(v));
 	DPRINTF(sc, 1, "allmulti=1 rc=%d\n", error);
 }
 
@@ -2183,7 +2183,7 @@ brcm_update_mcast(struct ieee80211com *ic)
  * (band in the top 2 bits); see below for how both are handled.
  */
 bool
-brcm_chanspec_is_5ghz(uint16_t chanspec)
+bwfm_chanspec_is_5ghz(uint16_t chanspec)
 {
 	uint8_t chan = (uint8_t)(chanspec & 0xff);
 
@@ -2212,7 +2212,7 @@ brcm_chanspec_is_5ghz(uint16_t chanspec)
 
 /* pull the channel number out of a chanspec */
 uint8_t
-brcm_chanspec_to_chan(uint16_t chanspec)
+bwfm_chanspec_to_chan(uint16_t chanspec)
 {
 
 	return ((uint8_t)(chanspec & 0xff));
@@ -2231,7 +2231,7 @@ brcm_chanspec_to_chan(uint16_t chanspec)
  * Examples: ch1/2.4G/20MHz = 0x1001; ch36/5G/20MHz = 0xd024.
  */
 uint16_t
-brcm_chan_to_chanspec_d11ac(uint8_t chan)
+bwfm_chan_to_chanspec_d11ac(uint8_t chan)
 {
 	uint16_t chanspec = chan;
 
@@ -2256,7 +2256,7 @@ brcm_chan_to_chanspec_d11ac(uint8_t chan)
  * is left at 00 (0x2809), and likewise for the D11AC value 0x1009.
  */
 uint16_t
-brcm_chan_to_chanspec_d11n(uint8_t chan)
+bwfm_chan_to_chanspec_d11n(uint8_t chan)
 {
 	uint16_t chanspec = chan;
 
@@ -2275,16 +2275,16 @@ brcm_chan_to_chanspec_d11n(uint8_t chan)
  * unrecognized chip that reached attach anyway).
  */
 uint16_t
-brcm_chan_to_chanspec(struct brcm_softc *sc, uint8_t chan)
+bwfm_chan_to_chanspec(struct bwfm_softc *sc, uint8_t chan)
 {
 	if (sc->sc_chip != NULL && sc->sc_chip->d11n)
-		return (brcm_chan_to_chanspec_d11n(chan));
-	return (brcm_chan_to_chanspec_d11ac(chan));
+		return (bwfm_chan_to_chanspec_d11n(chan));
+	return (bwfm_chan_to_chanspec_d11ac(chan));
 }
 
 /* report which channels the radio supports */
 static void
-brcm_getradiocaps(struct ieee80211com *ic, int maxchans, int *nchans,
+bwfm_getradiocaps(struct ieee80211com *ic, int maxchans, int *nchans,
     struct ieee80211_channel chans[])
 {
 	static const uint8_t unii_1[] = { 36, 40, 44, 48 };
@@ -2323,11 +2323,11 @@ brcm_getradiocaps(struct ieee80211com *ic, int maxchans, int *nchans,
  * propagates to the caller as a real error.
  */
 static int
-brcm_fmop_scan_start(struct ieee80211com *ic,
+bwfm_fmop_scan_start(struct ieee80211com *ic,
     const uint8_t *ssid __unused, size_t ssidlen __unused,
     bool active __unused)
 {
-	struct brcm_softc *sc = ic->ic_softc;
+	struct bwfm_softc *sc = ic->ic_softc;
 	uint32_t v;
 	int error;
 
@@ -2335,7 +2335,7 @@ brcm_fmop_scan_start(struct ieee80211com *ic,
 	 * Bring the WLC layer up first if nothing has yet.
 	 *
 	 * Firmware refuses a scan with BCME_NOTUP (-4) until it has seen
-	 * BRCM_C_UP, and nothing else on the net80211 path issues it.
+	 * BWFM_C_UP, and nothing else on the net80211 path issues it.
 	 * The fullmac ops have no "interface up" hook, and the join paths
 	 * that do issue UP cannot run first, because associating needs
 	 * scan results.  Without this a freshly created wlan0 comes up,
@@ -2348,7 +2348,7 @@ brcm_fmop_scan_start(struct ieee80211com *ic,
 	 */
 	if (!sc->sc_wlc_up) {
 		v = htole32(1);
-		error = brcm_dcmd_set(sc, BRCM_C_UP, &v, sizeof(v));
+		error = bwfm_dcmd_set(sc, BWFM_C_UP, &v, sizeof(v));
 		if (error != 0) {
 			device_printf(sc->sc_dev,
 			    "scan_start: WLC_UP failed rc=%d\n", error);
@@ -2358,32 +2358,32 @@ brcm_fmop_scan_start(struct ieee80211com *ic,
 		DPRINTF(sc, 0, "scan_start: WLC_UP issued\n");
 	}
 
-	return (brcm_dispatch_scan(sc));
+	return (bwfm_dispatch_scan(sc));
 }
 
 /*
  * Configure chip for WPA2 with HOST-side EAPOL.  Used when net80211
  * (or wpa_supplicant via net80211) requests a WPA-protected assoc
- * but no PSK was staged via dev.brcm.<n>.wpa_pmk -- meaning the
+ * but no PSK was staged via dev.bwfm.<n>.wpa_pmk -- meaning the
  * 4-way handshake will run in userspace, not in firmware.
  *
- * Differs from brcm_join_wpa2_raw in two ways:
+ * Differs from bwfm_join_wpa2_raw in two ways:
  *   - Skips sup_wpa (in-firmware supplicant enable).  BCM43455 fw
  *     7.45.x returns BCME_UNSUPPORTED on it anyway.
  *   - Skips wsec_pmk install entirely.  Host will install PTK/GTK
- *     via iv_key_set -> brcm_fmop_set_key after the 4-way completes.
+ *     via iv_key_set -> bwfm_fmop_set_key after the 4-way completes.
  *
  * Chip-side: SET_INFRA + SET_AUTH(OPEN) + wsec=AES + wpa_auth=
  * WPA2_PSK + UP + SET_SSID.  Chip then does OPEN auth + ASSOC with
  * RSN IE; AP sends EAPOL M1 as a regular DATA frame (ethertype
- * 0x888e); chip emits BRCM_E_EAPOL_MSG event; brcm_handle_event
+ * 0x888e); chip emits BWFM_E_EAPOL_MSG event; bwfm_handle_event
  * forwards via ieee80211_fmac_eapol_rx -> ieee80211_vap_deliver_data
  * -> BPF where wpa_supplicant picks it up.
  */
 static int
-brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
+bwfm_join_wpa2_host_eapol(struct bwfm_softc *sc, struct ieee80211vap *vap)
 {
-	struct brcm_ext_join_params ejp;
+	struct bwfm_ext_join_params ejp;
 	struct ieee80211_node *ni;
 	size_t join_params_size;
 	uint16_t chanspec;
@@ -2391,7 +2391,7 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 	uint32_t v;
 	int error;
 
-	if (brcm_join_busy_acquire(sc, "host_eapol"))
+	if (bwfm_join_busy_acquire(sc, "host_eapol"))
 		return (EAGAIN);
 	ni = vap->iv_bss;
 	if (ni == NULL) {
@@ -2400,8 +2400,8 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 	}
 
 	slen = ni->ni_esslen;
-	if (slen > BRCM_MAX_SSID_LEN)
-		slen = BRCM_MAX_SSID_LEN;
+	if (slen > BWFM_MAX_SSID_LEN)
+		slen = BWFM_MAX_SSID_LEN;
 
 	/*
 	 * BCM43455 fw requires DOWN/UP around wsec + wpa_auth for
@@ -2419,14 +2419,14 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 
 	/*
 	 * DOWN before iovar block.  The chip-supplicant path
-	 * (brcm_join_wpa2_raw) does DOWN->iovars->UP->join and
+	 * (bwfm_join_wpa2_raw) does DOWN->iovars->UP->join and
 	 * AUTH+ASSOC succeed; without the DOWN/UP wrap here host-EAPOL
 	 * gets AUTH status=2 TIMEOUT.  The wpaie, double wpa_auth,
 	 * cmd 205 and mfp/join_pref iovars below are compatible with
 	 * the DOWN/UP wrap.
 	 */
 	v = htole32(0);
-	(void)brcm_dcmd_set(sc, BRCM_C_DOWN, &v, sizeof(v));
+	(void)bwfm_dcmd_set(sc, BWFM_C_DOWN, &v, sizeof(v));
 	DPRINTF(sc, 0, "host-EAPOL: DOWN\n");
 
 	/*
@@ -2434,7 +2434,7 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 	 * this point breaks DHCP against a freshly restarted AP (the STA
 	 * associates and the 4-way appears to complete, but DHCPDISCOVER
 	 * never gets an OFFER and hostapd disassociates).  The purge
-	 * itself works (dev.brcm_pci.N.delete_flowring); calling it here
+	 * itself works (dev.bwfm_pci.N.delete_flowring); calling it here
 	 * is the wrong place.  The cause is not yet understood, likely
 	 * M4/M2 racing the PTK install on the fresh TID-7 ring, so the
 	 * hook stays in bus_ops until a better trigger point is found.
@@ -2442,7 +2442,7 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 
 	v = htole32(1);
 	HOSTEAP_RC("SET_INFRA",
-	    brcm_dcmd_set(sc, BRCM_C_SET_INFRA, &v, sizeof(v)));
+	    bwfm_dcmd_set(sc, BWFM_C_SET_INFRA, &v, sizeof(v)));
 
 	/*
 	 * wpaie iovar - required together with the rest of the sequence
@@ -2462,7 +2462,7 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 	{
 		const uint8_t *rsn_ie = NULL;
 		size_t rsn_ie_len = 0;
-		uint32_t mfp = BRCM_MFP_NONE;
+		uint32_t mfp = BWFM_MFP_NONE;
 		static const uint8_t wpa2_psk_ccmp_rsn_ie[] = {
 			0x30, 0x14, 0x01, 0x00,
 			0x00, 0x0f, 0xac, 0x04,
@@ -2478,7 +2478,7 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 			/*
 			 * Walk the RSN IE to find the RSN capabilities word
 			 * and translate MFPC (0x0080) / MFPR (0x0040) into
-			 * BRCM_MFP_CAPABLE / BRCM_MFP_REQUIRED.  Layout is
+			 * BWFM_MFP_CAPABLE / BWFM_MFP_REQUIRED.  Layout is
 			 * tag(1) len(1) ver(2) group(4) pcnt(2)
 			 * pcs(4*pcnt) akmcnt(2) akm(4*akmcnt) caps(2)
 			 * ... optional pmkid + group_mgmt after caps.  Send
@@ -2536,10 +2536,10 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 						    << 8);
 						if (caps & 0x0040)
 							mfp =
-							  BRCM_MFP_REQUIRED;
+							  BWFM_MFP_REQUIRED;
 						else if (caps & 0x0080)
 							mfp =
-							  BRCM_MFP_CAPABLE;
+							  BWFM_MFP_CAPABLE;
 					}
 				}
 			}
@@ -2549,30 +2549,30 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 		}
 		/* WPA3-SAE requires MFP by spec — force REQUIRED. */
 		if (sc->sc_sae_join)
-			mfp = BRCM_MFP_REQUIRED;
+			mfp = BWFM_MFP_REQUIRED;
 
 		DPRINTF(sc, 1,
 		    "wpaie source=%s len=%zu mfp=%u\n",
 		    (vap->iv_appie_wpa != NULL) ? "iv_appie_wpa" : "default",
 		    rsn_ie_len, mfp);
 		HOSTEAP_RC("wpaie",
-		    brcm_iovar_set(sc, "wpaie", rsn_ie, rsn_ie_len));
+		    bwfm_iovar_set(sc, "wpaie", rsn_ie, rsn_ie_len));
 
 		{
 			uint32_t mfpv = htole32(mfp);
 			HOSTEAP_RC("mfp",
-			    brcm_iovar_set(sc, "mfp", &mfpv, sizeof(mfpv)));
+			    bwfm_iovar_set(sc, "mfp", &mfpv, sizeof(mfpv)));
 		}
 	}
 
 	/*
-	 * Use the BRCM_C_SET_AUTH dcmd (cmd 22) for auth, NOT the "auth"
-	 * iovar -- the chip-supplicant path (brcm_join_wpa2_raw) succeeds
+	 * Use the BWFM_C_SET_AUTH dcmd (cmd 22) for auth, NOT the "auth"
+	 * iovar -- the chip-supplicant path (bwfm_join_wpa2_raw) succeeds
 	 * with the dcmd form.
 	 */
-	v = htole32(BRCM_AUTH_OPEN);
+	v = htole32(BWFM_AUTH_OPEN);
 	HOSTEAP_RC("SET_AUTH dcmd",
-	    brcm_dcmd_set(sc, BRCM_C_SET_AUTH, &v, sizeof(v)));
+	    bwfm_dcmd_set(sc, BWFM_C_SET_AUTH, &v, sizeof(v)));
 
 	/*
 	 * Linux brcmfmac writes wpa_auth TWICE around wsec/mfp:
@@ -2592,29 +2592,29 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 		 * SET_WSEC_PMK below carries the plaintext password with
 		 * PASSPHRASE flag — same shape as WPA2, different AKM.
 		 */
-		v = htole32(BRCM_WPA_AUTH_WPA3_SAE_PSK);
+		v = htole32(BWFM_WPA_AUTH_WPA3_SAE_PSK);
 		HOSTEAP_RC("wpa_auth=0x40000(SAE)",
-		    brcm_iovar_set(sc, "wpa_auth", &v, sizeof(v)));
+		    bwfm_iovar_set(sc, "wpa_auth", &v, sizeof(v)));
 
-		v = htole32(BRCM_WSEC_AES);
-		HOSTEAP_RC("wsec", brcm_iovar_set(sc, "wsec", &v, sizeof(v)));
+		v = htole32(BWFM_WSEC_AES);
+		HOSTEAP_RC("wsec", bwfm_iovar_set(sc, "wsec", &v, sizeof(v)));
 
 		/* Second wpa_auth pass — keep SAE AKM. */
-		v = htole32(BRCM_WPA_AUTH_WPA3_SAE_PSK);
+		v = htole32(BWFM_WPA_AUTH_WPA3_SAE_PSK);
 		HOSTEAP_RC("wpa_auth=0x40000(SAE-final)",
-		    brcm_iovar_set(sc, "wpa_auth", &v, sizeof(v)));
+		    bwfm_iovar_set(sc, "wpa_auth", &v, sizeof(v)));
 	} else {
-		v = htole32(BRCM_WPA_AUTH_WPA2_UNSPEC | BRCM_WPA_AUTH_WPA2_PSK);
+		v = htole32(BWFM_WPA_AUTH_WPA2_UNSPEC | BWFM_WPA_AUTH_WPA2_PSK);
 		HOSTEAP_RC("wpa_auth=0xc0(first)",
-		    brcm_iovar_set(sc, "wpa_auth", &v, sizeof(v)));
+		    bwfm_iovar_set(sc, "wpa_auth", &v, sizeof(v)));
 
-		v = htole32(BRCM_WSEC_AES);
-		HOSTEAP_RC("wsec", brcm_iovar_set(sc, "wsec", &v, sizeof(v)));
+		v = htole32(BWFM_WSEC_AES);
+		HOSTEAP_RC("wsec", bwfm_iovar_set(sc, "wsec", &v, sizeof(v)));
 
 		/* Second wpa_auth pass = final AKM (plain WPA2_PSK). */
-		v = htole32(BRCM_WPA_AUTH_WPA2_PSK);
+		v = htole32(BWFM_WPA_AUTH_WPA2_PSK);
 		HOSTEAP_RC("wpa_auth=0x80(final)",
-		    brcm_iovar_set(sc, "wpa_auth", &v, sizeof(v)));
+		    bwfm_iovar_set(sc, "wpa_auth", &v, sizeof(v)));
 	}
 
 	/*
@@ -2622,7 +2622,7 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 	 * state machine to start AUTH.
 	 */
 	v = htole32(1);
-	(void)brcm_dcmd_set(sc, BRCM_C_UP, &v, sizeof(v));
+	(void)bwfm_dcmd_set(sc, BWFM_C_UP, &v, sizeof(v));
 	sc->sc_wlc_up = true;
 	DPRINTF(sc, 0, "host-EAPOL: UP\n");
 
@@ -2633,26 +2633,26 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 	 * well, empirically.  The 4-way still runs in userspace either way.
 	 */
 	if (sc->sc_wpa_set || sc->sc_wpa_pmk_raw_set) {
-		struct brcm_wsec_pmk_le wp;
+		struct bwfm_wsec_pmk_le wp;
 		size_t klen;
 		int rc;
 
 		memset(&wp, 0, sizeof(wp));
 		if (sc->sc_wpa_pmk_raw_set) {
-			klen = BRCM_WSEC_MAX_PSK_LEN;
+			klen = BWFM_WSEC_MAX_PSK_LEN;
 			wp.key_len = htole16((uint16_t)klen);
 			wp.flags = 0;
 			memcpy(wp.key, sc->sc_wpa_pmk_raw, klen);
 		} else {
 			klen = strlen(sc->sc_wpa_pmk);
-			if (klen < 8 || klen > BRCM_WSEC_MAX_PSK_LEN)
+			if (klen < 8 || klen > BWFM_WSEC_MAX_PSK_LEN)
 				klen = 0;
 			wp.key_len = htole16((uint16_t)klen);
-			wp.flags = htole16(BRCM_WSEC_PASSPHRASE);
+			wp.flags = htole16(BWFM_WSEC_PASSPHRASE);
 			memcpy(wp.key, sc->sc_wpa_pmk, klen);
 		}
 		if (klen > 0) {
-			rc = brcm_dcmd_set(sc, BRCM_C_SET_WSEC_PMK, &wp,
+			rc = bwfm_dcmd_set(sc, BWFM_C_SET_WSEC_PMK, &wp,
 			    sizeof(wp));
 			DPRINTF(sc, 0,
 			    "host-EAPOL: SET_WSEC_PMK(132) rc=%d klen=%zu\n",
@@ -2668,23 +2668,23 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 	 * bsscfg:join for MFP-negotiated joins.
 	 */
 	{
-		struct brcm_join_pref_params jp[2];
+		struct bwfm_join_pref_params jp[2];
 		int rc;
 
 		memset(jp, 0, sizeof(jp));
-		jp[0].type = BRCM_JOIN_PREF_RSSI_DELTA;
+		jp[0].type = BWFM_JOIN_PREF_RSSI_DELTA;
 		jp[0].len = 2;
-		jp[0].rssi_gain = BRCM_JOIN_PREF_RSSI_BOOST;
-		jp[0].band = BRCM_WLC_BAND_5G;
-		jp[1].type = BRCM_JOIN_PREF_RSSI;
+		jp[0].rssi_gain = BWFM_JOIN_PREF_RSSI_BOOST;
+		jp[0].band = BWFM_WLC_BAND_5G;
+		jp[1].type = BWFM_JOIN_PREF_RSSI;
 		jp[1].len = 2;
 		jp[1].rssi_gain = 0;
 		jp[1].band = 0;
-		rc = brcm_iovar_set(sc, "join_pref", jp, sizeof(jp));
+		rc = bwfm_iovar_set(sc, "join_pref", jp, sizeof(jp));
 		DPRINTF(sc, 0, "host-EAPOL: join_pref rc=%d\n", rc);
 
-		v = htole32(BRCM_WLC_BAND_AUTO);
-		rc = brcm_dcmd_set(sc, BRCM_C_SET_ASSOC_PREFER, &v, sizeof(v));
+		v = htole32(BWFM_WLC_BAND_AUTO);
+		rc = bwfm_dcmd_set(sc, BWFM_C_SET_ASSOC_PREFER, &v, sizeof(v));
 		DPRINTF(sc, 0, "host-EAPOL: SET_ASSOC_PREFER rc=%d\n", rc);
 	}
 
@@ -2694,7 +2694,7 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 	 * Prefer the "join" iovar (bsscfg:join) on recent fw.  Bundles
 	 * scan params + an explicit chanspec_list so the chip parks the
 	 * radio on the target channel before issuing AUTH.  Plain
-	 * BRCM_C_SET_SSID can leave the chip never reaching AUTH on
+	 * BWFM_C_SET_SSID can leave the chip never reaching AUTH on
 	 * BCM43455 fw 7.45.x when no chanspec is known.
 	 */
 	/*
@@ -2709,9 +2709,9 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 	 * (captures AP's real BW + sideband); fall back to computed BW20
 	 * from ni->ni_chan as last resort.
 	 */
-	chanspec = brcm_lookup_bssid_chanspec(sc, ni->ni_bssid);
+	chanspec = bwfm_lookup_bssid_chanspec(sc, ni->ni_bssid);
 	if (chanspec == 0 && chan != 0)
-		chanspec = brcm_chan_to_chanspec(sc, chan);
+		chanspec = bwfm_chan_to_chanspec(sc, chan);
 
 	memset(&ejp, 0, sizeof(ejp));
 	ejp.ssid.len = htole32(slen);
@@ -2753,19 +2753,19 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 		ejp.scan.nprobes      = htole32((uint32_t)-1);
 		ejp.scan.active_time  = htole32((uint32_t)-1);
 		ejp.scan.passive_time = htole32((uint32_t)-1);
-		join_params_size = offsetof(struct brcm_ext_join_params,
-		    assoc) + offsetof(struct brcm_ext_assoc_params,
+		join_params_size = offsetof(struct bwfm_ext_join_params,
+		    assoc) + offsetof(struct bwfm_ext_assoc_params,
 		    chanspec_list);
 	}
 
 	/*
 	 * Remember what we asked the firmware to join, so the link-up path
 	 * can put net80211 on the same BSS if it is still in SCAN when the
-	 * firmware reports the link (brcm_link_task).  The join sysctl sets
+	 * firmware reports the link (bwfm_link_task).  The join sysctl sets
 	 * these too; a wpa_supplicant join only comes through here.
 	 */
 	memcpy(sc->sc_join_bssid, ni->ni_bssid, sizeof(sc->sc_join_bssid));
-	sc->sc_join_ssid_len = (uint8_t)MIN(slen, BRCM_MAX_SSID_LEN);
+	sc->sc_join_ssid_len = (uint8_t)MIN(slen, BWFM_MAX_SSID_LEN);
 	memcpy(sc->sc_join_ssid, ni->ni_essid, sc->sc_join_ssid_len);
 	sc->sc_join_ssid[sc->sc_join_ssid_len] = '\0';
 
@@ -2792,7 +2792,7 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 	 * sequence Linux uses; with the full sequence in place it is the
 	 * path the fw expects.
 	 */
-	error = brcm_iovar_set(sc, "join", &ejp, join_params_size);
+	error = bwfm_iovar_set(sc, "join", &ejp, join_params_size);
 	DPRINTF(sc, 0,
 	    "host-EAPOL: bsscfg:join iovar rc=%d (size=%zu)\n",
 	    error, join_params_size);
@@ -2804,9 +2804,9 @@ brcm_join_wpa2_host_eapol(struct brcm_softc *sc, struct ieee80211vap *vap)
 
 /* deferred work that joins the chosen network */
 static void
-brcm_assoc_task(void *arg, int pending)
+bwfm_assoc_task(void *arg, int pending)
 {
-	struct brcm_softc *sc = arg;
+	struct bwfm_softc *sc = arg;
 	struct ieee80211vap *vap = sc->sc_assoc_vap;
 	bool wpa_vap;
 	int error;
@@ -2818,7 +2818,7 @@ brcm_assoc_task(void *arg, int pending)
 
 	/*
 	 * Dispatch by intended security mode:
-	 *   - PSK staged via dev.brcm.<n>.wpa_pmk[_hex] => in-firmware
+	 *   - PSK staged via dev.bwfm.<n>.wpa_pmk[_hex] => in-firmware
 	 *     supplicant path (legacy / old fw).
 	 *   - net80211 vap has WPA flags set but no PSK staged =>
 	 *     host-EAPOL path (wpa_supplicant runs the 4-way).
@@ -2832,20 +2832,20 @@ brcm_assoc_task(void *arg, int pending)
 	    (IEEE80211_F_WPA1 | IEEE80211_F_WPA2)) != 0;
 
 	if (sc->sc_wpa_set || sc->sc_wpa_pmk_raw_set)
-		error = brcm_join_wpa2(sc, vap);
+		error = bwfm_join_wpa2(sc, vap);
 	else if (wpa_vap)
-		error = brcm_join_wpa2_host_eapol(sc, vap);
+		error = bwfm_join_wpa2_host_eapol(sc, vap);
 	else
-		error = brcm_join_open(sc, vap);
+		error = bwfm_join_open(sc, vap);
 	if (error != 0)
 		DPRINTF(sc, 0, "assoc task: join dispatch rc=%d\n", error);
 }
 
 /* framework asks us to associate to a network */
 static int
-brcm_fmop_assoc(struct ieee80211com *ic, const struct ieee80211_fmac_assoc *fa)
+bwfm_fmop_assoc(struct ieee80211com *ic, const struct ieee80211_fmac_assoc *fa)
 {
-	struct brcm_softc *sc = ic->ic_softc;
+	struct bwfm_softc *sc = ic->ic_softc;
 	struct ieee80211vap *vap = TAILQ_FIRST(&ic->ic_vaps);
 	time_t now;
 
@@ -2863,10 +2863,10 @@ brcm_fmop_assoc(struct ieee80211com *ic, const struct ieee80211_fmac_assoc *fa)
 	 * wpa_supplicant time to run 4-way if a join lands.  The cooldown
 	 * is our own; Linux brcmfmac has no such throttle.
 	 */
-#define	BRCM_ASSOC_MIN_INTERVAL_S	3
+#define	BWFM_ASSOC_MIN_INTERVAL_S	3
 	now = time_uptime;
 	if (sc->sc_last_assoc_ts != 0 &&
-	    now - sc->sc_last_assoc_ts < BRCM_ASSOC_MIN_INTERVAL_S) {
+	    now - sc->sc_last_assoc_ts < BWFM_ASSOC_MIN_INTERVAL_S) {
 		DPRINTF(sc, 1, "fmop_assoc: throttled (%llds since last)\n",
 		    (long long)(now - sc->sc_last_assoc_ts));
 		return (0);	/* pretend success; wpa_supplicant will retry */
@@ -2897,9 +2897,9 @@ brcm_fmop_assoc(struct ieee80211com *ic, const struct ieee80211_fmac_assoc *fa)
  * Runs on taskqueue_thread; safe to sleep in iovar_get.
  */
 static void
-brcm_post_assoc_task(void *arg, int pending __unused)
+bwfm_post_assoc_task(void *arg, int pending __unused)
 {
-	struct brcm_softc *sc = arg;
+	struct bwfm_softc *sc = arg;
 	uint8_t buf[512];
 	size_t len;
 	int rc;
@@ -2915,20 +2915,20 @@ brcm_post_assoc_task(void *arg, int pending __unused)
 	memset(buf, 0, sizeof(buf));
 	*(uint32_t *)buf = htole32(sizeof(buf));
 	len = sizeof(buf);
-	rc = brcm_dcmd_get(sc, BRCM_C_GET_BSS_INFO, buf, &len);
+	rc = bwfm_dcmd_get(sc, BWFM_C_GET_BSS_INFO, buf, &len);
 	DPRINTF(sc, 0, "post-assoc: GET_BSS_INFO rc=%d len=%zu\n", rc, len);
 
 	/* assoc_info -- returns req_len + resp_len */
 	len = sizeof(buf);
-	rc = brcm_iovar_get(sc, "assoc_info", buf, &len);
+	rc = bwfm_iovar_get(sc, "assoc_info", buf, &len);
 	DPRINTF(sc, 0, "post-assoc: assoc_info rc=%d len=%zu\n", rc, len);
 
 	/* assoc_req_ies / assoc_resp_ies -- IE bytes */
 	len = sizeof(buf);
-	rc = brcm_iovar_get(sc, "assoc_req_ies", buf, &len);
+	rc = bwfm_iovar_get(sc, "assoc_req_ies", buf, &len);
 	DPRINTF(sc, 1, "post-assoc: assoc_req_ies rc=%d len=%zu\n", rc, len);
 	len = sizeof(buf);
-	rc = brcm_iovar_get(sc, "assoc_resp_ies", buf, &len);
+	rc = bwfm_iovar_get(sc, "assoc_resp_ies", buf, &len);
 	DPRINTF(sc, 1, "post-assoc: assoc_resp_ies rc=%d len=%zu\n", rc, len);
 
 	/*
@@ -2946,16 +2946,16 @@ brcm_post_assoc_task(void *arg, int pending __unused)
 	 * chip's link machine happy.
 	 */
 	len = sizeof(buf);
-	rc = brcm_iovar_get(sc, "wme_ac_sta", buf, &len);
+	rc = bwfm_iovar_get(sc, "wme_ac_sta", buf, &len);
 	DPRINTF(sc, 0, "post-assoc: wme_ac_sta rc=%d len=%zu\n", rc, len);
 }
 
 /* deferred work that leaves the current network */
 static void
-brcm_disassoc_task(void *arg, int pending __unused)
+bwfm_disassoc_task(void *arg, int pending __unused)
 {
-	struct brcm_softc *sc = arg;
-	struct brcm_scb_val_le sv;
+	struct bwfm_softc *sc = arg;
+	struct bwfm_scb_val_le sv;
 	struct ieee80211vap *vap;
 	struct ieee80211_node *ni;
 	int error;
@@ -2965,7 +2965,7 @@ brcm_disassoc_task(void *arg, int pending __unused)
 
 	/*
 	 * Linux brcmf_cfg80211_disconnect (cfg80211.c:2595) sends a
-	 * 12-byte brcmf_scb_val_le payload to BRCM_C_DISASSOC (cmd 52):
+	 * 12-byte brcmf_scb_val_le payload to BWFM_C_DISASSOC (cmd 52):
 	 *   { __le32 reason; u8 bssid[6]; }
 	 * GCC pads to 12 bytes (2-byte alignment after bssid).  A bare
 	 * 4-byte zero payload is also accepted, but the 12-byte form is
@@ -2982,7 +2982,7 @@ brcm_disassoc_task(void *arg, int pending __unused)
 	if (vap != NULL && (ni = vap->iv_bss) != NULL)
 		memcpy(sv.ea, ni->ni_bssid, 6);
 
-	error = brcm_dcmd_set(sc, BRCM_C_DISASSOC, &sv, sizeof(sv));
+	error = bwfm_dcmd_set(sc, BWFM_C_DISASSOC, &sv, sizeof(sv));
 	if (error != 0)
 		DPRINTF(sc, 0, "disassoc task: WLC_DISASSOC rc=%d "
 		    "(reason=%u)\n", error, le32toh(sv.val));
@@ -2992,9 +2992,9 @@ brcm_disassoc_task(void *arg, int pending __unused)
 
 /* framework asks us to leave the network */
 static int
-brcm_fmop_disassoc(struct ieee80211com *ic, uint16_t reason)
+bwfm_fmop_disassoc(struct ieee80211com *ic, uint16_t reason)
 {
-	struct brcm_softc *sc = ic->ic_softc;
+	struct bwfm_softc *sc = ic->ic_softc;
 	time_t now;
 
 	/*
@@ -3015,10 +3015,10 @@ brcm_fmop_disassoc(struct ieee80211com *ic, uint16_t reason)
 	 * INIT/AUTH rapidly.  3 s matches assoc side; drop redundant
 	 * fires with rc=0 so the newstate walk still succeeds.
 	 */
-#define	BRCM_DISASSOC_MIN_INTERVAL_S	3
+#define	BWFM_DISASSOC_MIN_INTERVAL_S	3
 	now = time_uptime;
 	if (sc->sc_last_disassoc_ts != 0 &&
-	    now - sc->sc_last_disassoc_ts < BRCM_DISASSOC_MIN_INTERVAL_S) {
+	    now - sc->sc_last_disassoc_ts < BWFM_DISASSOC_MIN_INTERVAL_S) {
 		DPRINTF(sc, 1, "fmop_disassoc: throttled (%llds since last)\n",
 		    (long long)(now - sc->sc_last_disassoc_ts));
 		return (0);
@@ -3043,14 +3043,14 @@ brcm_fmop_disassoc(struct ieee80211com *ic, uint16_t reason)
 /*
  * Perform one deferred firmware key operation.  net80211 hands us key
  * installs and removals with its node lock held, but the firmware command
- * sleeps, so brcm_fmop_set_key / brcm_fmop_del_key only queue the work and
+ * sleeps, so bwfm_fmop_set_key / bwfm_fmop_del_key only queue the work and
  * this task runs it here on taskqueue_thread, where sleeping is allowed.
  */
 static void
-brcm_key_task(void *arg, int pending __unused)
+bwfm_key_task(void *arg, int pending __unused)
 {
-	struct brcm_softc *sc = arg;
-	struct brcm_key_op *ko;
+	struct bwfm_softc *sc = arg;
+	struct bwfm_key_op *ko;
 	int rc;
 
 	for (;;) {
@@ -3073,11 +3073,11 @@ brcm_key_task(void *arg, int pending __unused)
 		    sc->sc_bus_ops->bs_wait_eapol_drain != NULL)
 			(void)sc->sc_bus_ops->bs_wait_eapol_drain(sc, 100);
 
-		rc = brcm_set_key(sc, ko->ko_index, ko->ko_algo, ko->ko_flags,
+		rc = bwfm_set_key(sc, ko->ko_index, ko->ko_algo, ko->ko_flags,
 		    ko->ko_key, ko->ko_key_len, ko->ko_ea);
 		if (rc != 0)
 			DPRINTF(sc, 0, "key task: %s rc=%d\n",
-			    ko->ko_algo == BRCM_CRYPTO_ALGO_OFF ?
+			    ko->ko_algo == BWFM_CRYPTO_ALGO_OFF ?
 			    "del_key (failure ignored)" : "set_key", rc);
 
 		/*
@@ -3086,26 +3086,26 @@ brcm_key_task(void *arg, int pending __unused)
 		 * when wpa_supplicant marks the peer authorized.)
 		 */
 		if (rc == 0 && ko->ko_authorize)
-			(void)brcm_scb_authorize(sc, ko->ko_auth_mac);
+			(void)bwfm_scb_authorize(sc, ko->ko_auth_mac);
 
-		free(ko, M_BRCM);
+		free(ko, M_BWFM);
 	}
 }
 
 /*
- * Copy a key request onto the deferred queue and wake brcm_key_task.
+ * Copy a key request onto the deferred queue and wake bwfm_key_task.
  * Safe to call with a net80211 lock held: it allocates with M_NOWAIT and
  * takes only the leaf sc_key_mtx, so it never sleeps.  Returns 0 once the
  * request is queued; the real firmware result is logged from the task.
  */
 static int
-brcm_key_enqueue(struct brcm_softc *sc, uint32_t index, uint32_t algo,
+bwfm_key_enqueue(struct bwfm_softc *sc, uint32_t index, uint32_t algo,
     uint32_t flags, const uint8_t *key, uint32_t key_len, const uint8_t ea[6],
     bool wait_eapol, const uint8_t *authorize_mac)
 {
-	struct brcm_key_op *ko;
+	struct bwfm_key_op *ko;
 
-	ko = malloc(sizeof(*ko), M_BRCM, M_NOWAIT | M_ZERO);
+	ko = malloc(sizeof(*ko), M_BWFM, M_NOWAIT | M_ZERO);
 	if (ko == NULL) {
 		DPRINTF(sc, 0, "key enqueue: out of memory\n");
 		return (ENOMEM);
@@ -3135,9 +3135,9 @@ brcm_key_enqueue(struct brcm_softc *sc, uint32_t index, uint32_t algo,
 
 /* install an encryption key on the chip */
 static int
-brcm_fmop_set_key(struct ieee80211com *ic, const struct ieee80211_key *k)
+bwfm_fmop_set_key(struct ieee80211com *ic, const struct ieee80211_key *k)
 {
-	struct brcm_softc *sc = ic->ic_softc;
+	struct bwfm_softc *sc = ic->ic_softc;
 	struct ieee80211vap *vap;
 	uint32_t algo, flags = 0;
 	const uint8_t *ea, *authorize;
@@ -3152,16 +3152,16 @@ brcm_fmop_set_key(struct ieee80211com *ic, const struct ieee80211_key *k)
 	 */
 	static const uint8_t group_ea[6] = { 0 };
 
-	algo = brcm_cipher_to_algo(k->wk_cipher->ic_cipher);
-	if (algo == BRCM_CRYPTO_ALGO_OFF) {
+	algo = bwfm_cipher_to_algo(k->wk_cipher->ic_cipher);
+	if (algo == BWFM_CRYPTO_ALGO_OFF) {
 		DPRINTF(sc, 0, "fmop_set_key: unsupported cipher %u\n",
 		    k->wk_cipher->ic_cipher);
 		return (EINVAL);
 	}
 
 	/*
-	 * Pull the peer BSSID off the first STA vap.  brcm rejects
-	 * multi-vap configurations in brcm_vap_create so this is
+	 * Pull the peer BSSID off the first STA vap.  bwfm rejects
+	 * multi-vap configurations in bwfm_vap_create so this is
 	 * unambiguous; if no vap exists yet the broadcast EA is the
 	 * safe default for a group key install.
 	 */
@@ -3171,19 +3171,19 @@ brcm_fmop_set_key(struct ieee80211com *ic, const struct ieee80211_key *k)
 	    (k->wk_flags & IEEE80211_KEY_GROUP) == 0) {
 		/*
 		 * Pairwise key.  Drain EAPOL first, and afterwards authorize
-		 * the peer's data path (both done by brcm_key_task).
+		 * the peer's data path (both done by bwfm_key_task).
 		 */
-		flags |= BRCM_WSEC_PRIMARY_KEY;
+		flags |= BWFM_WSEC_PRIMARY_KEY;
 		ea = (vap != NULL && vap->iv_bss != NULL) ?
 		    vap->iv_bss->ni_bssid : bcast;
 		authorize = (vap != NULL && vap->iv_bss != NULL) ?
 		    vap->iv_bss->ni_bssid : NULL;
-		return (brcm_key_enqueue(sc, 0, algo, flags,
+		return (bwfm_key_enqueue(sc, 0, algo, flags,
 		    k->wk_key, k->wk_keylen, ea, true, authorize));
 	}
 
 	/* Group key. */
-	if (algo == BRCM_CRYPTO_ALGO_TKIP) {
+	if (algo == BWFM_CRYPTO_ALGO_TKIP) {
 		uint8_t tk[32];
 		int rc;
 
@@ -3199,20 +3199,20 @@ brcm_fmop_set_key(struct ieee80211com *ic, const struct ieee80211_key *k)
 		memcpy(tk, k->wk_key, 16);
 		memcpy(tk + 16, k->wk_rxmic, 8);
 		memcpy(tk + 24, k->wk_txmic, 8);
-		rc = brcm_key_enqueue(sc, k->wk_keyix, algo, flags, tk,
+		rc = bwfm_key_enqueue(sc, k->wk_keyix, algo, flags, tk,
 		    sizeof(tk), group_ea, false, NULL);
 		explicit_bzero(tk, sizeof(tk));
 		return (rc);
 	}
-	return (brcm_key_enqueue(sc, k->wk_keyix, algo, flags,
+	return (bwfm_key_enqueue(sc, k->wk_keyix, algo, flags,
 	    k->wk_key, k->wk_keylen, group_ea, false, NULL));
 }
 
 /* remove an encryption key from the chip */
 static int
-brcm_fmop_del_key(struct ieee80211com *ic, const struct ieee80211_key *k)
+bwfm_fmop_del_key(struct ieee80211com *ic, const struct ieee80211_key *k)
 {
-	struct brcm_softc *sc = ic->ic_softc;
+	struct bwfm_softc *sc = ic->ic_softc;
 	static const uint8_t bcast[6] = {
 	    0xff, 0xff, 0xff, 0xff, 0xff, 0xff
 	};
@@ -3232,35 +3232,35 @@ brcm_fmop_del_key(struct ieee80211com *ic, const struct ieee80211_key *k)
 	 * dropping a working link over, so the request is still sent and
 	 * its result is logged, but a failure is not propagated.
 	 */
-	(void)brcm_key_enqueue(sc, idx, BRCM_CRYPTO_ALGO_OFF, 0, NULL, 0,
+	(void)bwfm_key_enqueue(sc, idx, BWFM_CRYPTO_ALGO_OFF, 0, NULL, 0,
 	    bcast, false, NULL);
 	return (0);
 }
 
 /* tell the chip which country's rules to use */
 static int
-brcm_fmop_set_country(struct ieee80211com *ic, const char cc[3])
+bwfm_fmop_set_country(struct ieee80211com *ic, const char cc[3])
 {
-	struct brcm_softc *sc = ic->ic_softc;
+	struct bwfm_softc *sc = ic->ic_softc;
 	uint8_t country[4] = { (uint8_t)cc[0], (uint8_t)cc[1], 0, 0 };
 
 	(void)cc[2];
-	return (brcm_iovar_set(sc, "country", country, sizeof(country)));
+	return (bwfm_iovar_set(sc, "country", country, sizeof(country)));
 }
 
-static const struct ieee80211_fullmac_ops brcm_fmops = {
-	.fmop_name	   = "brcm",
-	.fmop_scan_start   = brcm_fmop_scan_start,
-	.fmop_assoc	   = brcm_fmop_assoc,
-	.fmop_disassoc	   = brcm_fmop_disassoc,
-	.fmop_set_key	   = brcm_fmop_set_key,
-	.fmop_del_key	   = brcm_fmop_del_key,
-	.fmop_set_country  = brcm_fmop_set_country,
+static const struct ieee80211_fullmac_ops bwfm_fmops = {
+	.fmop_name	   = "bwfm",
+	.fmop_scan_start   = bwfm_fmop_scan_start,
+	.fmop_assoc	   = bwfm_fmop_assoc,
+	.fmop_disassoc	   = bwfm_fmop_disassoc,
+	.fmop_set_key	   = bwfm_fmop_set_key,
+	.fmop_del_key	   = bwfm_fmop_del_key,
+	.fmop_set_country  = bwfm_fmop_set_country,
 };
 
 /* set up the driver and attach it to the wifi stack */
 int
-brcm_attach(struct brcm_softc *sc)
+bwfm_attach(struct bwfm_softc *sc)
 {
 	struct ieee80211com *ic;
 
@@ -3269,13 +3269,13 @@ brcm_attach(struct brcm_softc *sc)
 	 * so they survive a failure after kproc_create.  Re-initing them
 	 * here would clobber pointers the ctlrx thread is already using.
 	 */
-	TASK_INIT(&sc->sc_scan_done_task, 0, brcm_scan_done_task, sc);
-	TASK_INIT(&sc->sc_link_task, 0, brcm_link_task, sc);
-	TASK_INIT(&sc->sc_assoc_task, 0, brcm_assoc_task, sc);
-	TASK_INIT(&sc->sc_disassoc_task, 0, brcm_disassoc_task, sc);
-	TASK_INIT(&sc->sc_post_assoc_task, 0, brcm_post_assoc_task, sc);
-	TASK_INIT(&sc->sc_key_task, 0, brcm_key_task, sc);
-	mtx_init(&sc->sc_key_mtx, "brcm key", NULL, MTX_DEF);
+	TASK_INIT(&sc->sc_scan_done_task, 0, bwfm_scan_done_task, sc);
+	TASK_INIT(&sc->sc_link_task, 0, bwfm_link_task, sc);
+	TASK_INIT(&sc->sc_assoc_task, 0, bwfm_assoc_task, sc);
+	TASK_INIT(&sc->sc_disassoc_task, 0, bwfm_disassoc_task, sc);
+	TASK_INIT(&sc->sc_post_assoc_task, 0, bwfm_post_assoc_task, sc);
+	TASK_INIT(&sc->sc_key_task, 0, bwfm_key_task, sc);
+	mtx_init(&sc->sc_key_mtx, "bwfm key", NULL, MTX_DEF);
 	TAILQ_INIT(&sc->sc_key_ops);
 	sc->sc_tasks_inited = true;
 
@@ -3300,7 +3300,7 @@ brcm_attach(struct brcm_softc *sc)
 	    IEEE80211_CRYPTO_TKIP |
 	    IEEE80211_CRYPTO_WEP;
 
-	brcm_getradiocaps(ic, IEEE80211_CHAN_MAX, &ic->ic_nchans,
+	bwfm_getradiocaps(ic, IEEE80211_CHAN_MAX, &ic->ic_nchans,
 	    ic->ic_channels);
 
 	IEEE80211_ADDR_COPY(ic->ic_macaddr, sc->sc_macaddr);
@@ -3312,45 +3312,45 @@ brcm_attach(struct brcm_softc *sc)
 	 * Attach the FullMAC framework.  It takes over ic_scan_start /
 	 * ic_scan_end here; the vap-level shims (fmac_newstate,
 	 * fmac_key_set) are installed by ieee80211_fmac_vap_attach()
-	 * from brcm_vap_create.
+	 * from bwfm_vap_create.
 	 */
-	(void)ieee80211_fmac_attach(ic, &brcm_fmops,
+	(void)ieee80211_fmac_attach(ic, &bwfm_fmops,
 	    IEEE80211_FMAC_CAP_FW_SCAN | IEEE80211_FMAC_CAP_ONCHIP_SUP);
 
-	ic->ic_vap_create = brcm_vap_create;
-	ic->ic_vap_delete = brcm_vap_delete;
-	ic->ic_parent = brcm_parent;
-	ic->ic_transmit = brcm_transmit;
-	ic->ic_raw_xmit = brcm_raw_xmit;
-	ic->ic_set_channel = brcm_set_channel;
+	ic->ic_vap_create = bwfm_vap_create;
+	ic->ic_vap_delete = bwfm_vap_delete;
+	ic->ic_parent = bwfm_parent;
+	ic->ic_transmit = bwfm_transmit;
+	ic->ic_raw_xmit = bwfm_raw_xmit;
+	ic->ic_set_channel = bwfm_set_channel;
 	/* ic_scan_start / ic_scan_end belong to the FullMAC framework. */
-	ic->ic_getradiocaps = brcm_getradiocaps;
-	ic->ic_update_promisc = brcm_update_promisc;
-	ic->ic_update_mcast = brcm_update_mcast;
+	ic->ic_getradiocaps = bwfm_getradiocaps;
+	ic->ic_update_promisc = bwfm_update_promisc;
+	ic->ic_update_mcast = bwfm_update_mcast;
 
 	/*
 	 * Tell devd the device is ready for a vap.  The firmware can come up
 	 * after rc's netif has already created the wlans_<dev> interfaces,
-	 * or the device can be plugged in later; etc/devd/brcm.conf creates
+	 * or the device can be plugged in later; etc/devd/bwfm.conf creates
 	 * them on this event.
 	 */
-	devctl_notify("BRCM", device_get_nameunit(sc->sc_dev), "ATTACH", NULL);
+	devctl_notify("BWFM", device_get_nameunit(sc->sc_dev), "ATTACH", NULL);
 
 	return (0);
 }
 
 /*
  * WPA2-PSK passphrase sysctl.  Stores the ASCII passphrase (8..63
- * bytes per WPA2 spec) in the softc; brcm_assoc_task checks
+ * bytes per WPA2 spec) in the softc; bwfm_assoc_task checks
  * sc_wpa_set on the next join to pick the WPA2 dispatch path.
  * Read-back returns the "<set>" sentinel so the
  * passphrase does not leak through sysctl introspection.  Empty
  * write clears.
  */
 static int
-brcm_pmk_sysctl(SYSCTL_HANDLER_ARGS)
+bwfm_pmk_sysctl(SYSCTL_HANDLER_ARGS)
 {
-	struct brcm_softc *sc = arg1;
+	struct bwfm_softc *sc = arg1;
 	char buf[64];
 	size_t len;
 	int error;
@@ -3405,7 +3405,7 @@ brcm_pmk_sysctl(SYSCTL_HANDLER_ARGS)
  * The scan cache must be populated for this to work — caller is
  * expected to have triggered a scan before the direct-join sysctl.
  */
-struct brcm_mlme_lookup {
+struct bwfm_mlme_lookup {
 	const uint8_t			*bssid;
 	const char			*ssid;
 	uint8_t				 ssid_len;
@@ -3415,9 +3415,9 @@ struct brcm_mlme_lookup {
 
 /* scan-cache callback: match one saved AP entry */
 static void
-brcm_mlme_iter(void *arg, const struct ieee80211_scan_entry *se)
+bwfm_mlme_iter(void *arg, const struct ieee80211_scan_entry *se)
 {
-	struct brcm_mlme_lookup *l = arg;
+	struct bwfm_mlme_lookup *l = arg;
 
 	if (l->found)
 		return;
@@ -3433,7 +3433,7 @@ brcm_mlme_iter(void *arg, const struct ieee80211_scan_entry *se)
 	 * Copy the entry, but give the copy its own IE buffer.  The struct
 	 * copy shares se_ies.data with the scan entry; ieee80211_ies_init
 	 * would reuse that buffer (same length) and ieee80211_ies_cleanup in
-	 * brcm_sta_join_from_cache would free it under the live entry, a
+	 * bwfm_sta_join_from_cache would free it under the live entry, a
 	 * use-after-free that corrupts net80211's scan list.  net80211's own
 	 * mlmelookup clears the pointer first for the same reason.
 	 */
@@ -3447,10 +3447,10 @@ brcm_mlme_iter(void *arg, const struct ieee80211_scan_entry *se)
 }
 
 static int
-brcm_sta_join_from_cache(struct brcm_softc *sc)
+bwfm_sta_join_from_cache(struct bwfm_softc *sc)
 {
 	struct ieee80211vap *vap;
-	struct brcm_mlme_lookup lookup;
+	struct bwfm_mlme_lookup lookup;
 	int rv;
 
 	if (!sc->sc_ic_attached)
@@ -3463,7 +3463,7 @@ brcm_sta_join_from_cache(struct brcm_softc *sc)
 	lookup.bssid = sc->sc_join_bssid;
 	lookup.ssid = sc->sc_join_ssid;
 	lookup.ssid_len = sc->sc_join_ssid_len;
-	ieee80211_scan_iterate(vap, brcm_mlme_iter, &lookup);
+	ieee80211_scan_iterate(vap, bwfm_mlme_iter, &lookup);
 	if (!lookup.found) {
 		DPRINTF(sc, 0,
 		    "sta_join: BSS %02x:%02x:%02x:%02x:%02x:%02x not in "
@@ -3490,9 +3490,9 @@ brcm_sta_join_from_cache(struct brcm_softc *sc)
  * everything out).
  */
 static int
-brcm_scan_sysctl(SYSCTL_HANDLER_ARGS)
+bwfm_scan_sysctl(SYSCTL_HANDLER_ARGS)
 {
-	struct brcm_softc *sc = arg1;
+	struct bwfm_softc *sc = arg1;
 	int trigger = 0;
 	int error;
 
@@ -3501,7 +3501,7 @@ brcm_scan_sysctl(SYSCTL_HANDLER_ARGS)
 		return (error);
 	if (trigger == 0)
 		return (0);
-	error = brcm_dispatch_scan(sc);
+	error = bwfm_dispatch_scan(sc);
 	DPRINTF(sc, 0, "scan_now dispatch rc=%d\n", error);
 	return (error);
 }
@@ -3513,12 +3513,12 @@ brcm_scan_sysctl(SYSCTL_HANDLER_ARGS)
  * installed via wpa_pmk.  Format: "BSSID:SSID" with BSSID as 6
  * colon-separated hex bytes.  Useful for radio-side testing without
  * net80211 or wpa_supplicant in the loop.
- * Empty string means "abort" (BRCM_C_DOWN).
+ * Empty string means "abort" (BWFM_C_DOWN).
  */
 static int
-brcm_join_sysctl(SYSCTL_HANDLER_ARGS)
+bwfm_join_sysctl(SYSCTL_HANDLER_ARGS)
 {
-	struct brcm_softc *sc = arg1;
+	struct bwfm_softc *sc = arg1;
 	char buf[96];
 	uint8_t bssid[6];
 	const char *ssid;
@@ -3533,12 +3533,12 @@ brcm_join_sysctl(SYSCTL_HANDLER_ARGS)
 	if (buf[0] == '\0') {
 		uint32_t v = htole32(0);
 
-		(void)brcm_dcmd_set(sc, BRCM_C_DOWN, &v, sizeof(v));
+		(void)bwfm_dcmd_set(sc, BWFM_C_DOWN, &v, sizeof(v));
 		DPRINTF(sc, 0, "join aborted\n");
 		return (0);
 	}
 	/*
-	 * If no PSK staged, fall through to brcm_join_open: useful for
+	 * If no PSK staged, fall through to bwfm_join_open: useful for
 	 * (a) joining an OPEN AP and (b) chip-side iovar validation
 	 * against a WPA2 AP (chip will auth + assoc, AP will deauth
 	 * after timeout; the chip's AUTH/ASSOC_IND events confirm the
@@ -3557,7 +3557,7 @@ brcm_join_sysctl(SYSCTL_HANDLER_ARGS)
 	}
 	ssid = buf + n;
 	ssid_len = strnlen(ssid, sizeof(buf) - n);
-	if (ssid_len == 0 || ssid_len > BRCM_MAX_SSID_LEN)
+	if (ssid_len == 0 || ssid_len > BWFM_MAX_SSID_LEN)
 		return (EINVAL);
 
 	memcpy(sc->sc_join_bssid, bssid, 6);
@@ -3569,9 +3569,9 @@ brcm_join_sysctl(SYSCTL_HANDLER_ARGS)
 	 * Preferred path: route the join through net80211's state
 	 * machine.  sta_join_from_cache calls ieee80211_sta_join, which
 	 * walks the vap to AUTH; the framework's newstate shim then
-	 * dispatches the firmware join (brcm_fmop_assoc).  When firmware
+	 * dispatches the firmware join (bwfm_fmop_assoc).  When firmware
 	 * emits LINK up,
-	 * brcm_link_task fast-forwards ASSOC -> RUN.  This is what makes
+	 * bwfm_link_task fast-forwards ASSOC -> RUN.  This is what makes
 	 * wlan0 usable from dhclient + userland sockets.
 	 *
 	 * If the scan cache has no matching BSS (no scan run yet, or BSS
@@ -3579,7 +3579,7 @@ brcm_join_sysctl(SYSCTL_HANDLER_ARGS)
 	 * gets the radio associated -- useful for end-to-end firmware
 	 * validation even if userland can't use the link.
 	 */
-	error = brcm_sta_join_from_cache(sc);
+	error = bwfm_sta_join_from_cache(sc);
 	if (error == 0) {
 		DPRINTF(sc, 0,
 		    "join_target: dispatched via sta_join (net80211 tracked)\n");
@@ -3590,10 +3590,10 @@ brcm_join_sysctl(SYSCTL_HANDLER_ARGS)
 	    "raw direct dispatch\n", error);
 
 	if (sc->sc_wpa_set || sc->sc_wpa_pmk_raw_set) {
-		error = brcm_join_wpa2_raw(sc, bssid, ssid, ssid_len);
+		error = bwfm_join_wpa2_raw(sc, bssid, ssid, ssid_len);
 		DPRINTF(sc, 0, "join_target raw WPA2 dispatch rc=%d\n", error);
 	} else {
-		struct brcm_join_params join;
+		struct bwfm_join_params join;
 		uint32_t v;
 
 		size_t jlen;
@@ -3611,13 +3611,13 @@ brcm_join_sysctl(SYSCTL_HANDLER_ARGS)
 		 * a DOWN/UP bounce.  Just reset RSN config in place.
 		 */
 		v = htole32(1);
-		(void)brcm_dcmd_set(sc, BRCM_C_SET_INFRA, &v, sizeof(v));
-		v = htole32(BRCM_AUTH_OPEN);
-		(void)brcm_dcmd_set(sc, BRCM_C_SET_AUTH, &v, sizeof(v));
+		(void)bwfm_dcmd_set(sc, BWFM_C_SET_INFRA, &v, sizeof(v));
+		v = htole32(BWFM_AUTH_OPEN);
+		(void)bwfm_dcmd_set(sc, BWFM_C_SET_AUTH, &v, sizeof(v));
 		v = htole32(0);
-		(void)brcm_iovar_set(sc, "wsec", &v, sizeof(v));
+		(void)bwfm_iovar_set(sc, "wsec", &v, sizeof(v));
 		v = htole32(0);
-		(void)brcm_iovar_set(sc, "wpa_auth", &v, sizeof(v));
+		(void)bwfm_iovar_set(sc, "wpa_auth", &v, sizeof(v));
 
 		memset(&join, 0, sizeof(join));
 		join.ssid.len = htole32(ssid_len);
@@ -3630,14 +3630,14 @@ brcm_join_sysctl(SYSCTL_HANDLER_ARGS)
 		 * a from-scratch SSID hunt that often doesn't converge to
 		 * AUTH on BCM43455 fw 7.45.x.
 		 */
-		chanspec = brcm_lookup_bssid_chanspec(sc, bssid);
+		chanspec = bwfm_lookup_bssid_chanspec(sc, bssid);
 		if (chanspec != 0) {
 			join.assoc.chanspec_num = htole32(1);
 			join.assoc.chanspec_list[0] = htole16(chanspec);
-			jlen = BRCM_JOIN_PARAMS_FIXED_SIZE + sizeof(uint16_t);
+			jlen = BWFM_JOIN_PARAMS_FIXED_SIZE + sizeof(uint16_t);
 		} else {
 			join.assoc.chanspec_num = 0;
-			jlen = BRCM_JOIN_PARAMS_FIXED_SIZE;
+			jlen = BWFM_JOIN_PARAMS_FIXED_SIZE;
 		}
 
 		DPRINTF(sc, 0,
@@ -3647,7 +3647,7 @@ brcm_join_sysctl(SYSCTL_HANDLER_ARGS)
 		    bssid[0], bssid[1], bssid[2],
 		    bssid[3], bssid[4], bssid[5],
 		    chanspec, jlen);
-		error = brcm_dcmd_set(sc, BRCM_C_SET_SSID, &join, jlen);
+		error = bwfm_dcmd_set(sc, BWFM_C_SET_SSID, &join, jlen);
 		if (error != 0)
 			sc->sc_join_busy = 0;
 		DPRINTF(sc, 0, "join_target raw OPEN dispatch rc=%d\n", error);
@@ -3663,9 +3663,9 @@ brcm_join_sysctl(SYSCTL_HANDLER_ARGS)
  * wsec_pmk install with BCME_BADARG.  Empty string clears.
  */
 static int
-brcm_pmk_hex_sysctl(SYSCTL_HANDLER_ARGS)
+bwfm_pmk_hex_sysctl(SYSCTL_HANDLER_ARGS)
 {
-	struct brcm_softc *sc = arg1;
+	struct bwfm_softc *sc = arg1;
 	char buf[80];
 	uint8_t pmk[32];
 	size_t len;
@@ -3707,22 +3707,22 @@ brcm_pmk_hex_sysctl(SYSCTL_HANDLER_ARGS)
  * probing the firmware's live state — caps, ver, mfp, etc.
  */
 static int
-brcm_iovar_get_sysctl(SYSCTL_HANDLER_ARGS)
+bwfm_iovar_get_sysctl(SYSCTL_HANDLER_ARGS)
 {
-	struct brcm_softc *sc = arg1;
+	struct bwfm_softc *sc = arg1;
 	char namebuf[64];
 	size_t outlen;
 	int error;
 
 	memset(namebuf, 0, sizeof(namebuf));
 	if (req->newptr == NULL) {
-		char hex[BRCM_IOVAR_DUMP_MAX * 3 + 1];
+		char hex[BWFM_IOVAR_DUMP_MAX * 3 + 1];
 		size_t i, n;
 
 		mtx_lock(&sc->sc_ctl_mtx);
 		n = sc->sc_iovar_value_len;
-		if (n > BRCM_IOVAR_DUMP_MAX)
-			n = BRCM_IOVAR_DUMP_MAX;
+		if (n > BWFM_IOVAR_DUMP_MAX)
+			n = BWFM_IOVAR_DUMP_MAX;
 		for (i = 0; i < n; i++)
 			snprintf(hex + i * 3, 4, "%02x ",
 			    sc->sc_iovar_value[i]);
@@ -3739,12 +3739,12 @@ brcm_iovar_get_sysctl(SYSCTL_HANDLER_ARGS)
 	strlcpy(sc->sc_iovar_name, namebuf, sizeof(sc->sc_iovar_name));
 	mtx_unlock(&sc->sc_ctl_mtx);
 
-	outlen = BRCM_IOVAR_DUMP_MAX;
+	outlen = BWFM_IOVAR_DUMP_MAX;
 	{
-		uint8_t scratch[BRCM_IOVAR_DUMP_MAX];
+		uint8_t scratch[BWFM_IOVAR_DUMP_MAX];
 
 		memset(scratch, 0, sizeof(scratch));
-		error = brcm_iovar_get(sc, namebuf, scratch, &outlen);
+		error = bwfm_iovar_get(sc, namebuf, scratch, &outlen);
 		mtx_lock(&sc->sc_ctl_mtx);
 		if (error != 0) {
 			sc->sc_iovar_value_len = 0;
@@ -3769,7 +3769,7 @@ brcm_iovar_get_sysctl(SYSCTL_HANDLER_ARGS)
  * request was lost (coalesced requests are covered by one run).
  */
 static int
-brcm_event_stats_sysctl(SYSCTL_HANDLER_ARGS)
+bwfm_event_stats_sysctl(SYSCTL_HANDLER_ARGS)
 {
 	static const struct { int t; const char *n; } names[] = {
 		{ 0, "SET_SSID" }, { 1, "JOIN" }, { 3, "AUTH" }, { 5, "DEAUTH" },
@@ -3778,7 +3778,7 @@ brcm_event_stats_sysctl(SYSCTL_HANDLER_ARGS)
 		{ 46, "PSK_SUP" }, { 54, "IF" }, { 69, "ESCAN_RESULT" },
 		{ 74, "FIFO_CREDIT_MAP" },
 	};
-	struct brcm_softc *sc = arg1;
+	struct bwfm_softc *sc = arg1;
 	struct sbuf *sb;
 	const char *nm;
 	int error, t;
@@ -3819,9 +3819,9 @@ brcm_event_stats_sysctl(SYSCTL_HANDLER_ARGS)
  * iovar payload for protocol forensics without recompiling.
  */
 static int
-brcm_iovar_set_sysctl(SYSCTL_HANDLER_ARGS)
+bwfm_iovar_set_sysctl(SYSCTL_HANDLER_ARGS)
 {
-	struct brcm_softc *sc = arg1;
+	struct bwfm_softc *sc = arg1;
 	char buf[768];
 	uint8_t bytes[256];
 	const char *colon, *hex;
@@ -3840,9 +3840,9 @@ brcm_iovar_set_sysctl(SYSCTL_HANDLER_ARGS)
 	 * Without this gate the ~65 iovar handlers on the chip (2011
 	 * blob) are a live pipe to a decade of Broadcom firmware CVEs
 	 * for anyone who owns root.  Compile with
-	 * `options BRCM_UNSAFE_IOVARS_DEFAULT_ON` to skip the opt-in flag.
+	 * `options BWFM_UNSAFE_IOVARS_DEFAULT_ON` to skip the opt-in flag.
 	 */
-#ifndef BRCM_UNSAFE_IOVARS_DEFAULT_ON
+#ifndef BWFM_UNSAFE_IOVARS_DEFAULT_ON
 	if (sc->sc_unsafe_iovars == 0)
 		return (EPERM);
 #endif
@@ -3877,7 +3877,7 @@ brcm_iovar_set_sysctl(SYSCTL_HANDLER_ARGS)
 		bytes[i] = (uint8_t)v;
 	}
 
-	error = brcm_iovar_set(sc, name, bytes, nbytes);
+	error = bwfm_iovar_set(sc, name, bytes, nbytes);
 	DPRINTF(sc, 0, "iovar_set(\"%s\", %zu bytes) rc=%d\n",
 	    name, nbytes, error);
 	return (error);
@@ -3897,19 +3897,19 @@ brcm_iovar_set_sysctl(SYSCTL_HANDLER_ARGS)
  * Reads:  return the last fetched bytes as space-separated hex.
  */
 static int
-brcm_sup_dump_sysctl(SYSCTL_HANDLER_ARGS)
+bwfm_sup_dump_sysctl(SYSCTL_HANDLER_ARGS)
 {
-	struct brcm_softc *sc = arg1;
+	struct bwfm_softc *sc = arg1;
 	char input[64];
 	uint8_t params[8];
-	uint8_t scratch[BRCM_SUP_DUMP_MAX];
+	uint8_t scratch[BWFM_SUP_DUMP_MAX];
 	uint64_t off, len;
 	char *p;
 	size_t outlen;
 	int error;
 
 	if (req->newptr == NULL) {
-		char hex[BRCM_SUP_DUMP_MAX * 3 + 64];
+		char hex[BWFM_SUP_DUMP_MAX * 3 + 64];
 		size_t i, n, used;
 
 		mtx_lock(&sc->sc_ctl_mtx);
@@ -3939,7 +3939,7 @@ brcm_sup_dump_sysctl(SYSCTL_HANDLER_ARGS)
 	while (*p == ' ' || *p == '\t')
 		p++;
 	len = strtouq(p, NULL, 0);
-	if (len == 0 || len > BRCM_SUP_DUMP_MAX)
+	if (len == 0 || len > BWFM_SUP_DUMP_MAX)
 		return (EINVAL);
 	if (off > 0xffffffffULL)
 		return (EINVAL);
@@ -3955,7 +3955,7 @@ brcm_sup_dump_sysctl(SYSCTL_HANDLER_ARGS)
 
 	outlen = (size_t)len;
 	memset(scratch, 0, sizeof(scratch));
-	error = brcm_iovar_get_with_params(sc, "sup_dump",
+	error = bwfm_iovar_get_with_params(sc, "sup_dump",
 	    params, sizeof(params), scratch, &outlen);
 
 	mtx_lock(&sc->sc_ctl_mtx);
@@ -3965,8 +3965,8 @@ brcm_sup_dump_sysctl(SYSCTL_HANDLER_ARGS)
 		DPRINTF(sc, 0, "sup_dump(off=%#jx len=%ju) rc=%d\n",
 		    (uintmax_t)off, (uintmax_t)len, error);
 	} else {
-		if (outlen > BRCM_SUP_DUMP_MAX)
-			outlen = BRCM_SUP_DUMP_MAX;
+		if (outlen > BWFM_SUP_DUMP_MAX)
+			outlen = BWFM_SUP_DUMP_MAX;
 		memcpy(sc->sc_sup_dump, scratch, outlen);
 		sc->sc_sup_dump_len = outlen;
 		DPRINTF(sc, 0,
@@ -3979,7 +3979,7 @@ brcm_sup_dump_sysctl(SYSCTL_HANDLER_ARGS)
 
 /*
  * Bring the firmware to the operating point net80211 expects.  Order:
- *   BRCM_C_UP            - data plane up
+ *   BWFM_C_UP            - data plane up
  *   event_msgs           - subscribe to the events the driver demuxes
  *   country = "US"       - regulatory domain (most blobs refuse to scan
  *                          until country is programmed)
@@ -3999,7 +3999,7 @@ brcm_sup_dump_sysctl(SYSCTL_HANDLER_ARGS)
  * operation on the target channel.
  *
  * Walks the blob in MAX_CHUNK_LEN-sized chunks; each chunk wraps the
- * payload in struct brcm_dload_data and sends via iovar_set("clmload").
+ * payload in struct bwfm_dload_data and sends via iovar_set("clmload").
  * First chunk has DL_BEGIN, last has DL_END (both set if the whole blob
  * fits in one chunk).
  *
@@ -4007,10 +4007,10 @@ brcm_sup_dump_sysctl(SYSCTL_HANDLER_ARGS)
  * "<fwname>.clm_blob" (see sys/modules/brcmfmac43455_fw/Makefile).
  */
 static int
-brcm_upload_clm_blob(struct brcm_softc *sc, const char *fwname)
+bwfm_upload_clm_blob(struct bwfm_softc *sc, const char *fwname)
 {
 	const struct firmware *fw;
-	struct brcm_dload_data *hdr;
+	struct bwfm_dload_data *hdr;
 	char blobname[64];
 	size_t hdrsz, bufsz, off;
 	uint16_t flag;
@@ -4029,28 +4029,28 @@ brcm_upload_clm_blob(struct brcm_softc *sc, const char *fwname)
 	    blobname, fw->datasize);
 
 	hdrsz = sizeof(*hdr);
-	bufsz = hdrsz + BRCM_DLOAD_MAX_CHUNK_LEN;
-	hdr = malloc(bufsz, M_BRCM, M_WAITOK | M_ZERO);
+	bufsz = hdrsz + BWFM_DLOAD_MAX_CHUNK_LEN;
+	hdr = malloc(bufsz, M_BWFM, M_WAITOK | M_ZERO);
 
 	off = 0;
-	flag = BRCM_DL_BEGIN;
+	flag = BWFM_DL_BEGIN;
 	error = 0;
 	while (off < fw->datasize) {
 		size_t chunk = fw->datasize - off;
-		if (chunk > BRCM_DLOAD_MAX_CHUNK_LEN)
-			chunk = BRCM_DLOAD_MAX_CHUNK_LEN;
+		if (chunk > BWFM_DLOAD_MAX_CHUNK_LEN)
+			chunk = BWFM_DLOAD_MAX_CHUNK_LEN;
 		else
-			flag |= BRCM_DL_END;
+			flag |= BWFM_DL_END;
 
 		memcpy(hdr->data, (const uint8_t *)fw->data + off, chunk);
 
 		hdr->flag = htole16(flag |
-		    (BRCM_DLOAD_HANDLER_VER << BRCM_DLOAD_FLAG_VER_SHIFT));
-		hdr->dload_type = htole16(BRCM_DL_TYPE_CLM);
+		    (BWFM_DLOAD_HANDLER_VER << BWFM_DLOAD_FLAG_VER_SHIFT));
+		hdr->dload_type = htole16(BWFM_DL_TYPE_CLM);
 		hdr->len = htole32((uint32_t)chunk);
 		hdr->crc = 0;
 
-		error = brcm_iovar_set(sc, "clmload", hdr, hdrsz + chunk);
+		error = bwfm_iovar_set(sc, "clmload", hdr, hdrsz + chunk);
 		if (error != 0) {
 			DPRINTF(sc, 0,
 			    "clmload: chunk@%zu (%zu bytes) failed rc=%d\n",
@@ -4058,10 +4058,10 @@ brcm_upload_clm_blob(struct brcm_softc *sc, const char *fwname)
 			break;
 		}
 		off += chunk;
-		flag &= ~BRCM_DL_BEGIN;
+		flag &= ~BWFM_DL_BEGIN;
 	}
 
-	free(hdr, M_BRCM);
+	free(hdr, M_BWFM);
 	firmware_put(fw, 0);
 	if (error == 0)
 		DPRINTF(sc, 0, "clmload: %zu bytes uploaded OK\n",
@@ -4071,9 +4071,9 @@ brcm_upload_clm_blob(struct brcm_softc *sc, const char *fwname)
 
 /* program the firmware's default settings after startup */
 void
-brcm_runtime_iovars(struct brcm_softc *sc)
+bwfm_runtime_iovars(struct bwfm_softc *sc)
 {
-	uint8_t mask[BRCM_EVENT_MASK_LEN];
+	uint8_t mask[BWFM_EVENT_MASK_LEN];
 	uint8_t country[4] = { 'U', 'S', 0, 0 };
 	uint32_t v;
 	int error;
@@ -4087,29 +4087,29 @@ brcm_runtime_iovars(struct brcm_softc *sc)
 	 * + AUTH without one.
 	 */
 	if (sc->sc_fw_basename[0] != '\0')
-		(void)brcm_upload_clm_blob(sc, sc->sc_fw_basename);
+		(void)bwfm_upload_clm_blob(sc, sc->sc_fw_basename);
 
 	v = htole32(1);
-	error = brcm_dcmd_set(sc, BRCM_C_UP, &v, sizeof(v));
-	DPRINTF(sc, 0, "BRCM_C_UP rc=%d\n", error);
+	error = bwfm_dcmd_set(sc, BWFM_C_UP, &v, sizeof(v));
+	DPRINTF(sc, 0, "BWFM_C_UP rc=%d\n", error);
 
 	memset(mask, 0, sizeof(mask));
 #define	SETBIT(m, b)	((m)[(b) / 8] |= 1u << ((b) % 8))
-	SETBIT(mask, BRCM_E_IF);
-	SETBIT(mask, BRCM_E_TYPE_SET_SSID);	/* primary linkup signal */
-	SETBIT(mask, BRCM_E_TYPE_JOIN);
-	SETBIT(mask, BRCM_E_TYPE_LINK);
-	SETBIT(mask, BRCM_E_TYPE_AUTH);
-	SETBIT(mask, BRCM_E_TYPE_ASSOC);
-	SETBIT(mask, BRCM_E_DEAUTH);
-	SETBIT(mask, BRCM_E_TYPE_DISASSOC);
-	SETBIT(mask, BRCM_E_EAPOL_MSG);
-	SETBIT(mask, BRCM_E_TYPE_ESCAN_RESULT);
+	SETBIT(mask, BWFM_E_IF);
+	SETBIT(mask, BWFM_E_TYPE_SET_SSID);	/* primary linkup signal */
+	SETBIT(mask, BWFM_E_TYPE_JOIN);
+	SETBIT(mask, BWFM_E_TYPE_LINK);
+	SETBIT(mask, BWFM_E_TYPE_AUTH);
+	SETBIT(mask, BWFM_E_TYPE_ASSOC);
+	SETBIT(mask, BWFM_E_DEAUTH);
+	SETBIT(mask, BWFM_E_TYPE_DISASSOC);
+	SETBIT(mask, BWFM_E_EAPOL_MSG);
+	SETBIT(mask, BWFM_E_TYPE_ESCAN_RESULT);
 #undef SETBIT
-	error = brcm_iovar_set(sc, "event_msgs", mask, sizeof(mask));
+	error = bwfm_iovar_set(sc, "event_msgs", mask, sizeof(mask));
 	DPRINTF(sc, 0, "event_msgs iovar rc=%d\n", error);
 
-	error = brcm_iovar_set(sc, "country", country, sizeof(country));
+	error = bwfm_iovar_set(sc, "country", country, sizeof(country));
 	DPRINTF(sc, 0, "country=US iovar rc=%d\n", error);
 
 	/*
@@ -4122,7 +4122,7 @@ brcm_runtime_iovars(struct brcm_softc *sc)
 	 * observed state in sc_sup_wpa_ok / sc_sup_wpa_current.
 	 */
 	v = htole32(0);
-	error = brcm_iovar_set(sc, "sup_wpa", &v, sizeof(v));
+	error = bwfm_iovar_set(sc, "sup_wpa", &v, sizeof(v));
 	if (error == 0) {
 		sc->sc_sup_wpa_ok = true;
 		sc->sc_sup_wpa_current = 0;
@@ -4132,7 +4132,7 @@ brcm_runtime_iovars(struct brcm_softc *sc)
 		int gerror;
 
 		v = 0;
-		gerror = brcm_iovar_get(sc, "sup_wpa", &v, &glen);
+		gerror = bwfm_iovar_get(sc, "sup_wpa", &v, &glen);
 		if (gerror == 0) {
 			sc->sc_sup_wpa_ok = true;
 			sc->sc_sup_wpa_current = le32toh(v);
@@ -4157,7 +4157,7 @@ brcm_runtime_iovars(struct brcm_softc *sc)
 	 * from this firmware revision (Cypress added them later) and
 	 * p2p_disc rejects a uint32 write — its argument shape is
 	 * undocumented for this blob, so leave it to manual probing via
-	 * dev.brcm.<n>.iovar_set.  See SECURITY.md for the CVE backlog
+	 * dev.bwfm.<n>.iovar_set.  See SECURITY.md for the CVE backlog
 	 * this firmware predates.
 	 *
 	 *   mpc=0        - radio stays on; closes the RX-window-gone
@@ -4167,7 +4167,7 @@ brcm_runtime_iovars(struct brcm_softc *sc)
 	 * but breaks joins; see below.
 	 */
 	v = htole32(0);
-	error = brcm_iovar_set(sc, "mpc", &v, sizeof(v));
+	error = bwfm_iovar_set(sc, "mpc", &v, sizeof(v));
 	DPRINTF(sc, 0, "harden mpc=0 rc=%d\n", error);
 	/*
 	 * mfp=0 (MFP_NONE).  Chip-default on BCM43455 fw 7.45.98 is
@@ -4177,11 +4177,11 @@ brcm_runtime_iovars(struct brcm_softc *sc)
 	 * ieee80211w) the chip emits SET_SSID rc=0 then silently
 	 * never fires AUTH because PMF can't be negotiated.  Set
 	 * MFP_NONE at attach so any join path -- open or WPA2 --
-	 * lands cleanly.  brcm_join_wpa2_host_eapol sets mfp again
+	 * lands cleanly.  bwfm_join_wpa2_host_eapol sets mfp again
 	 * per join, from the RSN IE.
 	 */
 	v = htole32(0);
-	error = brcm_iovar_set(sc, "mfp", &v, sizeof(v));
+	error = bwfm_iovar_set(sc, "mfp", &v, sizeof(v));
 	DPRINTF(sc, 0, "harden mfp=0 rc=%d\n", error);
 
 	/*
@@ -4199,8 +4199,8 @@ brcm_runtime_iovars(struct brcm_softc *sc)
 	 *   PM_FAST = 2  fast power save (Linux default)
 	 */
 	v = htole32(0);	/* PM_OFF */
-	error = brcm_dcmd_set(sc, BRCM_C_SET_PM, &v, sizeof(v));
-	DPRINTF(sc, 0, "BRCM_C_SET_PM=PM_OFF rc=%d\n", error);
+	error = bwfm_dcmd_set(sc, BWFM_C_SET_PM, &v, sizeof(v));
+	DPRINTF(sc, 0, "BWFM_C_SET_PM=PM_OFF rc=%d\n", error);
 
 	/*
 	 * Beacon timeout = 4 (Linux BRCMF_DEFAULT_BCN_TIMEOUT_ROAM_OFF).
@@ -4209,7 +4209,7 @@ brcm_runtime_iovars(struct brcm_softc *sc)
 	 * couple of beacons during 4-way the chip self-disassocs.
 	 */
 	v = htole32(4);
-	error = brcm_iovar_set(sc, "bcn_timeout", &v, sizeof(v));
+	error = bwfm_iovar_set(sc, "bcn_timeout", &v, sizeof(v));
 	DPRINTF(sc, 0, "bcn_timeout=4 rc=%d\n", error);
 
 	/*
@@ -4217,8 +4217,8 @@ brcm_runtime_iovars(struct brcm_softc *sc)
 	 * higher A-MPDU throughput.  Harmless if chip already enables it.
 	 */
 	v = htole32(1);
-	error = brcm_dcmd_set(sc, BRCM_C_SET_FAKEFRAG, &v, sizeof(v));
-	DPRINTF(sc, 0, "BRCM_C_SET_FAKEFRAG=1 rc=%d\n", error);
+	error = bwfm_dcmd_set(sc, BWFM_C_SET_FAKEFRAG, &v, sizeof(v));
+	DPRINTF(sc, 0, "BWFM_C_SET_FAKEFRAG=1 rc=%d\n", error);
 
 	/*
 	 * Scan dwell and txbf are left at the chip defaults: setting
@@ -4240,56 +4240,56 @@ brcm_runtime_iovars(struct brcm_softc *sc)
 
 	device_printf(sc->sc_dev,
 	    "WARNING: firmware blob is from 2011 and predates Broadpwn/Kr00k/"
-	    "FragAttacks; see brcm/SECURITY.md.  Use for experimental/CTF "
+	    "FragAttacks; see the driver's SECURITY.md.  Use for experimental/CTF "
 	    "only.\n");
 }
 
 /*
- * Register the operator-facing sysctls that live on the brcm core.
- * Transports call this after brcm_attach() so the sysctl tree exists
+ * Register the operator-facing sysctls that live on the bwfm core.
+ * Transports call this after bwfm_attach() so the sysctl tree exists
  * and the softc is fully initialised.
  */
 void
-brcm_sysctl_attach(struct brcm_softc *sc)
+bwfm_sysctl_attach(struct bwfm_softc *sc)
 {
 	struct sysctl_ctx_list *ctx = device_get_sysctl_ctx(sc->sc_dev);
 	struct sysctl_oid *tree = device_get_sysctl_tree(sc->sc_dev);
 
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "wpa_pmk",
 	    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_pmk_sysctl, "A",
+	    bwfm_pmk_sysctl, "A",
 	    "WPA2-PSK passphrase (8..63 ASCII; empty clears)");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "wpa_pmk_hex",
 	    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_pmk_hex_sysctl, "A",
+	    bwfm_pmk_hex_sysctl, "A",
 	    "Raw 32-byte PMK as 64 hex chars (preferred for "
 	    "2011 BCM43236 firmware; compute via wpa_passphrase)");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "scan_now",
 	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_scan_sysctl, "I",
+	    bwfm_scan_sysctl, "I",
 	    "Trigger broadcast escan (write 1)");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "join_target",
 	    CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_join_sysctl, "A",
+	    bwfm_join_sysctl, "A",
 	    "Direct WPA2 join: 'aa:bb:cc:dd:ee:ff:SSID' "
 	    "(set wpa_pmk first; empty to abort)");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "iovar_get",
 	    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_iovar_get_sysctl, "A",
+	    bwfm_iovar_get_sysctl, "A",
 	    "Write iovar name to fetch; read returns hex value");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "event_stats",
 	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_event_stats_sysctl, "A",
+	    bwfm_event_stats_sysctl, "A",
 	    "Firmware events by type, and each task's requests vs coverage");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "iovar_set",
 	    CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_iovar_set_sysctl, "A",
+	    bwfm_iovar_set_sysctl, "A",
 	    "Write 'name:hexpayload' to push a raw iovar "
-	    "(gated by dev.brcm.<n>.unsafe=1)");
+	    "(gated by dev.bwfm.<n>.unsafe=1)");
 	/*
 	 * Safety gate for the raw iovar_set path.  Also gates
 	 * the CMD52/CMD53 raw-SDIO path on the SDIO transport's cdev.
-	 * Default 0.  See sc_unsafe_iovars comment in brcmvar.h.
+	 * Default 0.  See sc_unsafe_iovars comment in bwfmvar.h.
 	 */
 	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "unsafe",
 	    CTLFLAG_RW, &sc->sc_unsafe_iovars, 0,
@@ -4297,14 +4297,14 @@ brcm_sysctl_attach(struct brcm_softc *sc)
 	    "0=off (default), 1=on (root+PRIV_DRIVER still required).");
 	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "sup_dump",
 	    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_sup_dump_sysctl, "A",
+	    bwfm_sup_dump_sysctl, "A",
 	    "Write 'OFFSET LEN' (patched fw); read returns hex bytes "
 	    "from *(wlc+0x12)+OFFSET");
 }
 
 /* detach the driver from the wifi stack */
 void
-brcm_detach(struct brcm_softc *sc)
+bwfm_detach(struct bwfm_softc *sc)
 {
 	/*
 	 * Net80211 detach only.  Transport owns the mutex + ctl_pending
@@ -4345,9 +4345,9 @@ brcm_detach(struct brcm_softc *sc)
  * freed while the ic is still attached.
  */
 void
-brcm_transport_teardown(struct brcm_softc *sc)
+bwfm_transport_teardown(struct bwfm_softc *sc)
 {
-	struct brcm_ctl_req *r;
+	struct bwfm_ctl_req *r;
 
 	if (!mtx_initialized(&sc->sc_ctl_mtx)) {
 		sc->sc_dying = true;
@@ -4360,17 +4360,17 @@ brcm_transport_teardown(struct brcm_softc *sc)
 		wakeup(r);
 	while (sc->sc_in_flight_dcmd != 0) {
 		(void)mtx_sleep(&sc->sc_in_flight_dcmd, &sc->sc_ctl_mtx,
-		    0, "brcmdcd", hz);
+		    0, "bwfmdcd", hz);
 	}
 	mtx_unlock(&sc->sc_ctl_mtx);
 
 post_ctl:
 	/*
 	 * Guard the task drains: transport attach can fail (goto fail)
-	 * before brcm_attach() runs TASK_INIT, in which case the task
+	 * before bwfm_attach() runs TASK_INIT, in which case the task
 	 * structs are zeroed memory and taskqueue_drain would be UB.
 	 * sc_tasks_inited is set at the end of the TASK_INIT sequence
-	 * in brcm_attach.
+	 * in bwfm_attach.
 	 */
 	if (sc->sc_tasks_inited) {
 		taskqueue_drain(taskqueue_thread, &sc->sc_scan_done_task);
@@ -4387,12 +4387,12 @@ post_ctl:
 	}
 
 	if (sc->sc_tasks_inited) {
-		struct brcm_key_op *ko;
+		struct bwfm_key_op *ko;
 
 		taskqueue_drain(taskqueue_thread, &sc->sc_key_task);
 		while ((ko = TAILQ_FIRST(&sc->sc_key_ops)) != NULL) {
 			TAILQ_REMOVE(&sc->sc_key_ops, ko, ko_link);
-			free(ko, M_BRCM);
+			free(ko, M_BWFM);
 		}
 		mtx_destroy(&sc->sc_key_mtx);
 	}

@@ -35,7 +35,7 @@
  * driver code reduces to: implement the ops, call the up-calls
  * when firmware events land.
  *
- * brcm is the only user so far, and the API may still change.
+ * bwfm is the only user so far, and the API may still change.
  */
 
 #ifndef _NET80211_IEEE80211_FULLMAC_H_

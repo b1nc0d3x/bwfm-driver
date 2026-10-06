@@ -3,14 +3,14 @@
  *
  * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
  *
- * Broadcom FullMAC PCIe transport glue for brcm.
+ * Broadcom FullMAC PCIe transport glue for bwfm.
  *
  * Matches the BCM43602 and the other BCM43xx PCIe parts by ID, maps
  * BAR0 (the register window) and BAR2 (chip RAM), walks the backplane
  * cores, downloads the firmware into chip RAM and releases the ARM,
  * then hands the shared-memory handshake and the MSGBUF rings to
- * brcm_pci_msgbuf.c.  The bring-up runs from attach in a kernel thread
- * (hw.brcm_pci.autostart).  Only the BCM43602 has the full bring-up;
+ * bwfm_pci_msgbuf.c.  The bring-up runs from attach in a kernel thread
+ * (hw.bwfm_pci.autostart).  Only the BCM43602 has the full bring-up;
  * the other IDs attach for probing only.
  */
 
@@ -52,33 +52,33 @@
 #include <contrib/dev/acpica/include/acpi.h>
 #include <dev/acpica/acpivar.h>
 
-#include "brcmvar.h"
-#include "brcmreg.h"
-#include "brcm_pci_msgbuf.h"
+#include "bwfmvar.h"
+#include "bwfmreg.h"
+#include "bwfm_pci_msgbuf.h"
 #include "ieee80211_fullmac.h"
 
-#define	BRCM_PCI_DESC	"Broadcom FullMAC PCIe"
+#define	BWFM_PCI_DESC	"Broadcom FullMAC PCIe"
 
 /* Forward declarations for sysctls defined at end-of-file. */
-static int brcm_pci_sysctl_net80211_attach(SYSCTL_HANDLER_ARGS);
-static int brcm_pci_sysctl_net80211_detach(SYSCTL_HANDLER_ARGS);
-static int brcm_pci_sysctl_msgbuf_attach(SYSCTL_HANDLER_ARGS);
-static void brcm_pci_preinit_dcmds(struct brcm_pci_softc *sc);
-static int brcm_pci_sysctl_dump_console(SYSCTL_HANDLER_ARGS);
-static int brcm_pci_sysctl_wlc_up(SYSCTL_HANDLER_ARGS);
-static int brcm_pci_sysctl_delete_flowring(SYSCTL_HANDLER_ARGS);
-static int brcm_pci_sysctl_wlc_down(SYSCTL_HANDLER_ARGS);
-static int brcm_pci_sysctl_mac_addr(SYSCTL_HANDLER_ARGS);
+static int bwfm_pci_sysctl_net80211_attach(SYSCTL_HANDLER_ARGS);
+static int bwfm_pci_sysctl_net80211_detach(SYSCTL_HANDLER_ARGS);
+static int bwfm_pci_sysctl_msgbuf_attach(SYSCTL_HANDLER_ARGS);
+static void bwfm_pci_preinit_dcmds(struct bwfm_pci_softc *sc);
+static int bwfm_pci_sysctl_dump_console(SYSCTL_HANDLER_ARGS);
+static int bwfm_pci_sysctl_wlc_up(SYSCTL_HANDLER_ARGS);
+static int bwfm_pci_sysctl_delete_flowring(SYSCTL_HANDLER_ARGS);
+static int bwfm_pci_sysctl_wlc_down(SYSCTL_HANDLER_ARGS);
+static int bwfm_pci_sysctl_mac_addr(SYSCTL_HANDLER_ARGS);
 
 /*
  * Loader tunables for attach-time behaviour.  Any attach-time chip
  * operation that could wedge the host belongs behind a tunable, so a
  * plain reboot (or "set" at the loader prompt) gets the machine back.
  */
-static int brcm_pci_attach_appu_warm_dflt = 1;
-SYSCTL_NODE(_hw, OID_AUTO, brcm_pci, CTLFLAG_RD, 0, "brcm_pci driver tunables");
-SYSCTL_INT(_hw_brcm_pci, OID_AUTO, attach_appu_warm, CTLFLAG_RDTUN,
-    &brcm_pci_attach_appu_warm_dflt, 0,
+static int bwfm_pci_attach_appu_warm_dflt = 1;
+SYSCTL_NODE(_hw, OID_AUTO, bwfm_pci, CTLFLAG_RD, 0, "bwfm_pci driver tunables");
+SYSCTL_INT(_hw_bwfm_pci, OID_AUTO, attach_appu_warm, CTLFLAG_RDTUN,
+    &bwfm_pci_attach_appu_warm_dflt, 0,
     "Run APPU warm sequence at attach.  Default 1 (safe, proven).  "
     "Set to 0 in loader.conf to disable if it ever regresses.");
 
@@ -87,56 +87,56 @@ SYSCTL_INT(_hw_brcm_pci, OID_AUTO, attach_appu_warm, CTLFLAG_RDTUN,
  * net80211, so the device shows up in net.wlan.devices like any other wifi
  * card and userland only has to create wlan0.  0 leaves it to the
  * bringup/msgbuf_attach/wlc_up/net80211_attach sysctls.  If it goes wrong
- * at boot, "set hw.brcm_pci.autostart=0" at the loader prompt.
+ * at boot, "set hw.bwfm_pci.autostart=0" at the loader prompt.
  */
-static int brcm_pci_autostart_dflt = 1;
-SYSCTL_INT(_hw_brcm_pci, OID_AUTO, autostart, CTLFLAG_RDTUN,
-    &brcm_pci_autostart_dflt, 0,
+static int bwfm_pci_autostart_dflt = 1;
+SYSCTL_INT(_hw_bwfm_pci, OID_AUTO, autostart, CTLFLAG_RDTUN,
+    &bwfm_pci_autostart_dflt, 0,
     "Bring the chip up (firmware, msgbuf, net80211) after attach.  "
     "0 leaves it to the bring-up sysctls.");
 /*
  * There is deliberately no tunable that forces bring-up from attach
  * itself: a wedge there combined with a persistent loader.conf setting
  * would make every boot wedge.  Manual bring-up goes through the runtime
- * sysctl dev.brcm_pci.N.bringup=1, which does not survive a reboot.
+ * sysctl dev.bwfm_pci.N.bringup=1, which does not survive a reboot.
  */
 
 /* Vendor IDs. */
-#define	BRCM_PCI_VENDOR_BROADCOM	0x14e4
+#define	BWFM_PCI_VENDOR_BROADCOM	0x14e4
 
 /*
  * Device IDs.  Names map to the chip family; some IDs are shared
  * across multiple silicon revisions and only the chipid register
  * disambiguates.
  *
- * Linux brcm_hw_ids.h gives BCM4356 0x43ec and BCM4358 0x43e9, not
+ * Linux bwfm_hw_ids.h gives BCM4356 0x43ec and BCM4358 0x43e9, not
  * 0x43a3, and calls 0x4415 BCM43596; both BCM4366 revisions share
  * 0x43c3 (0x43c4/0x43c5 for the 2G/5G parts).  The names below are
  * kept as they are, but the BCM4366C label on 0x4415 does not match.
  */
-#define	BRCM_PCI_DEVICE_BCM4350	0x43a3	/* BCM4350 */
-#define	BRCM_PCI_DEVICE_BCM4360	0x43a0	/* BCM4360 3x3 */
-#define	BRCM_PCI_DEVICE_BCM4360_2	0x43a2	/* BCM4360 2x2 */
-#define	BRCM_PCI_DEVICE_BCM43602	0x43ba	/* BCM43602 */
-#define	BRCM_PCI_DEVICE_BCM4366C	0x4415	/* Linux: BCM43596 */
-#define	BRCM_PCI_DEVICE_BCM4366B	0x43c3	/* BCM4366b */
-#define	BRCM_PCI_DEVICE_BCM4365	0x43ca	/* BCM4365 */
-#define	BRCM_PCI_DEVICE_BCM4364	0x4464	/* BCM4364 */
+#define	BWFM_PCI_DEVICE_BCM4350	0x43a3	/* BCM4350 */
+#define	BWFM_PCI_DEVICE_BCM4360	0x43a0	/* BCM4360 3x3 */
+#define	BWFM_PCI_DEVICE_BCM4360_2	0x43a2	/* BCM4360 2x2 */
+#define	BWFM_PCI_DEVICE_BCM43602	0x43ba	/* BCM43602 */
+#define	BWFM_PCI_DEVICE_BCM4366C	0x4415	/* Linux: BCM43596 */
+#define	BWFM_PCI_DEVICE_BCM4366B	0x43c3	/* BCM4366b */
+#define	BWFM_PCI_DEVICE_BCM4365	0x43ca	/* BCM4365 */
+#define	BWFM_PCI_DEVICE_BCM4364	0x4464	/* BCM4364 */
 
-struct brcm_pci_devmatch {
+struct bwfm_pci_devmatch {
 	uint16_t	devid;
 	const char	*desc;
 };
 
-static const struct brcm_pci_devmatch brcm_pci_devs[] = {
-	{ BRCM_PCI_DEVICE_BCM4350,   "Broadcom BCM4350 802.11ac"   },
-	{ BRCM_PCI_DEVICE_BCM4360,   "Broadcom BCM4360 802.11ac"   },
-	{ BRCM_PCI_DEVICE_BCM4360_2, "Broadcom BCM4360 2x2 802.11ac" },
-	{ BRCM_PCI_DEVICE_BCM43602,  "Broadcom BCM43602 802.11ac"  },
-	{ BRCM_PCI_DEVICE_BCM4366C,  "Broadcom BCM4366c 802.11ac"  },
-	{ BRCM_PCI_DEVICE_BCM4366B,  "Broadcom BCM4366b 802.11ac"  },
-	{ BRCM_PCI_DEVICE_BCM4365,   "Broadcom BCM4365 802.11ac"   },
-	{ BRCM_PCI_DEVICE_BCM4364,   "Broadcom BCM4364 802.11ac"   },
+static const struct bwfm_pci_devmatch bwfm_pci_devs[] = {
+	{ BWFM_PCI_DEVICE_BCM4350,   "Broadcom BCM4350 802.11ac"   },
+	{ BWFM_PCI_DEVICE_BCM4360,   "Broadcom BCM4360 802.11ac"   },
+	{ BWFM_PCI_DEVICE_BCM4360_2, "Broadcom BCM4360 2x2 802.11ac" },
+	{ BWFM_PCI_DEVICE_BCM43602,  "Broadcom BCM43602 802.11ac"  },
+	{ BWFM_PCI_DEVICE_BCM4366C,  "Broadcom BCM4366c 802.11ac"  },
+	{ BWFM_PCI_DEVICE_BCM4366B,  "Broadcom BCM4366b 802.11ac"  },
+	{ BWFM_PCI_DEVICE_BCM4365,   "Broadcom BCM4365 802.11ac"   },
+	{ BWFM_PCI_DEVICE_BCM4364,   "Broadcom BCM4364 802.11ac"   },
 };
 
 /*
@@ -144,7 +144,7 @@ static const struct brcm_pci_devmatch brcm_pci_devs[] = {
  * vary across the Broadcom PCIe family.
  *
  * bringup_supported=true means the full bringup chain in
- * brcm_pci_bringup_sequence() has been implemented + tested for this
+ * bwfm_pci_bringup_sequence() has been implemented + tested for this
  * chip.  false means probe/warmup/diagnostic sysctls work but
  * `bringup=1` will refuse (rather than wedge the host trying to run
  * 43602-specific PMU init on a chip that doesn't have those registers).
@@ -155,7 +155,7 @@ static const struct brcm_pci_devmatch brcm_pci_devs[] = {
  * 0x81a BCMA_CORE_USB20_DEV (memory cores there are INTERNAL_MEM
  * 0x80e and SYS_MEM 0x849), so that ID is unverified.
  */
-struct brcm_pci_chip_info {
+struct bwfm_pci_chip_info {
 	uint16_t	devid;
 	uint32_t	rambase;	/* TCM base for fw upload */
 	uint16_t	mem_core;	/* SOCRAM / BUF_MEM ID */
@@ -164,14 +164,14 @@ struct brcm_pci_chip_info {
 	const char     *notes;
 };
 
-static const struct brcm_pci_chip_info brcm_pci_chip_table[] = {
+static const struct bwfm_pci_chip_info bwfm_pci_chip_table[] = {
 	/*
 	 * BCM43602 - Apple A1398, MacBookPro 11,3 / 11,4 / 11,5 / 12,1.
 	 * The fully-tested target.
 	 */
-	{ .devid		= BRCM_PCI_DEVICE_BCM43602,
+	{ .devid		= BWFM_PCI_DEVICE_BCM43602,
 	  .rambase		= 0x180000,
-	  .mem_core		= 0x80e,	/* BRCM_CORE_SOCRAM */
+	  .mem_core		= 0x80e,	/* BWFM_CORE_SOCRAM */
 	  .fw_name		= "brcmfmac43602_pcie",
 	  .bringup_supported	= true,
 	  .notes		= "43602 - fully supported"
@@ -197,14 +197,14 @@ static const struct brcm_pci_chip_info brcm_pci_chip_table[] = {
 	 * EOPNOTSUPP; the entry stays populated so the diagnostics work
 	 * and 4360-native firmware only needs the flag flipped.
 	 */
-	{ .devid		= BRCM_PCI_DEVICE_BCM4360,
+	{ .devid		= BWFM_PCI_DEVICE_BCM4360,
 	  .rambase		= 0x0,
 	  .mem_core		= 0x81a,	/* "BUF_MEM"; see above */
 	  .fw_name		= "brcmfmac4360_pcie",
 	  .bringup_supported	= false,
 	  .notes		= "4360 - probe only (needs 4360-native fw)"
 	},
-	{ .devid		= BRCM_PCI_DEVICE_BCM4360_2,
+	{ .devid		= BWFM_PCI_DEVICE_BCM4360_2,
 	  .rambase		= 0x0,
 	  .mem_core		= 0x81a,
 	  .fw_name		= "brcmfmac4360_pcie",
@@ -219,15 +219,15 @@ static const struct brcm_pci_chip_info brcm_pci_chip_table[] = {
 	 * these just means filling in the correct rambase + fw + memcore
 	 * and flipping bringup_supported.
 	 */
-	{ BRCM_PCI_DEVICE_BCM4350,   0x0, 0x81a, "brcmfmac4350_pcie", false,
+	{ BWFM_PCI_DEVICE_BCM4350,   0x0, 0x81a, "brcmfmac4350_pcie", false,
 	  "4350 - probe only" },
-	{ BRCM_PCI_DEVICE_BCM4366C,  0x0, 0x81a, "brcmfmac4366c_pcie", false,
+	{ BWFM_PCI_DEVICE_BCM4366C,  0x0, 0x81a, "brcmfmac4366c_pcie", false,
 	  "4366c - probe only" },
-	{ BRCM_PCI_DEVICE_BCM4366B,  0x0, 0x81a, "brcmfmac4366b_pcie", false,
+	{ BWFM_PCI_DEVICE_BCM4366B,  0x0, 0x81a, "brcmfmac4366b_pcie", false,
 	  "4366b - probe only" },
-	{ BRCM_PCI_DEVICE_BCM4365,   0x0, 0x81a, "brcmfmac4365_pcie", false,
+	{ BWFM_PCI_DEVICE_BCM4365,   0x0, 0x81a, "brcmfmac4365_pcie", false,
 	  "4365 - probe only" },
-	{ BRCM_PCI_DEVICE_BCM4364,   0x0, 0x81a, "brcmfmac4364_pcie", false,
+	{ BWFM_PCI_DEVICE_BCM4364,   0x0, 0x81a, "brcmfmac4364_pcie", false,
 	  "4364 - probe only" },
 };
 
@@ -236,13 +236,13 @@ static const struct brcm_pci_chip_info brcm_pci_chip_table[] = {
  * device ID isn't in the table (probe already rejected it, so this
  * only happens with a stale sc->sc_devid — treat as fatal).
  */
-static const struct brcm_pci_chip_info *
-brcm_pci_chip_lookup(uint16_t devid)
+static const struct bwfm_pci_chip_info *
+bwfm_pci_chip_lookup(uint16_t devid)
 {
 	int i;
-	for (i = 0; i < (int)nitems(brcm_pci_chip_table); i++) {
-		if (brcm_pci_chip_table[i].devid == devid)
-			return (&brcm_pci_chip_table[i]);
+	for (i = 0; i < (int)nitems(bwfm_pci_chip_table); i++) {
+		if (bwfm_pci_chip_table[i].devid == devid)
+			return (&bwfm_pci_chip_table[i]);
 	}
 	return (NULL);
 }
@@ -254,8 +254,8 @@ brcm_pci_chip_lookup(uint16_t devid)
  * register access; the RAM window is required for firmware download
  * and MSGBUF ring storage.
  */
-#define	BRCM_PCI_BAR0_RID	PCIR_BAR(0)
-#define	BRCM_PCI_BAR2_RID	PCIR_BAR(2)
+#define	BWFM_PCI_BAR0_RID	PCIR_BAR(0)
+#define	BWFM_PCI_BAR2_RID	PCIR_BAR(2)
 
 /*
  * BAR0 windowing.  The whole 4 KB BAR0 region is a sliding window onto
@@ -268,9 +268,9 @@ brcm_pci_chip_lookup(uint16_t devid)
  * same way, by pointing the window at the PCIe2 core, as Linux
  * brcmf_pcie_select_core() does.
  */
-#define	BRCM_PCI_BAR0_WINDOW		0x80
-#define	BRCM_PCI_BAR0_WINDOW_MASK	0xfffff000	/* top 20 bits */
-#define	BRCM_PCI_BAR0_WINDOW_OFF_MASK	0x00000fff	/* low 12 bits */
+#define	BWFM_PCI_BAR0_WINDOW		0x80
+#define	BWFM_PCI_BAR0_WINDOW_MASK	0xfffff000	/* top 20 bits */
+#define	BWFM_PCI_BAR0_WINDOW_OFF_MASK	0x00000fff	/* low 12 bits */
 
 /*
  * PCI config-space registers of the endpoint (Linux pcie.c
@@ -278,25 +278,25 @@ brcm_pci_chip_lookup(uint16_t devid)
  * pci_read_config_dword).  Config space is served by the root complex,
  * so these are not subject to the BAR0 window.
  */
-#define	BRCM_PCI_PCIE2_LINK_STATUS_CTRL	0xbc
-#define	BRCM_PCI_PCIE2_LINK_UP		0x00000001	/* low bit of link
+#define	BWFM_PCI_PCIE2_LINK_STATUS_CTRL	0xbc
+#define	BWFM_PCI_PCIE2_LINK_UP		0x00000001	/* low bit of link
 							   status word */
 
 /* Backplane core base addresses (AI-style chips, BCM4360 family). */
-#define	BRCM_BACKPLANE_CHIPCOMMON	0x18000000
+#define	BWFM_BACKPLANE_CHIPCOMMON	0x18000000
 
 /* ChipCommon register layout (offsets within the core). */
-#define	BRCM_CC_REG_CHIPID		0x00
-#define	BRCM_CC_REG_EROMPTR		0xfc
-#define	BRCM_CC_CHIPID_ID_MASK		0x0000ffff
-#define	BRCM_CC_CHIPID_REV_SHIFT	16
-#define	BRCM_CC_CHIPID_REV_MASK		0x000f0000
-#define	BRCM_CC_CHIPID_PKG_SHIFT	20
-#define	BRCM_CC_CHIPID_PKG_MASK		0x00f00000
-#define	BRCM_CC_CHIPID_NCORES_SHIFT	24
-#define	BRCM_CC_CHIPID_NCORES_MASK	0x0f000000
-#define	BRCM_CC_CHIPID_TYPE_SHIFT	28
-#define	BRCM_CC_CHIPID_TYPE_MASK	0xf0000000
+#define	BWFM_CC_REG_CHIPID		0x00
+#define	BWFM_CC_REG_EROMPTR		0xfc
+#define	BWFM_CC_CHIPID_ID_MASK		0x0000ffff
+#define	BWFM_CC_CHIPID_REV_SHIFT	16
+#define	BWFM_CC_CHIPID_REV_MASK		0x000f0000
+#define	BWFM_CC_CHIPID_PKG_SHIFT	20
+#define	BWFM_CC_CHIPID_PKG_MASK		0x00f00000
+#define	BWFM_CC_CHIPID_NCORES_SHIFT	24
+#define	BWFM_CC_CHIPID_NCORES_MASK	0x0f000000
+#define	BWFM_CC_CHIPID_TYPE_SHIFT	28
+#define	BWFM_CC_CHIPID_TYPE_MASK	0xf0000000
 
 /*
  * EROM (Enumeration ROM) descriptor layout for AI-style chips.
@@ -310,46 +310,46 @@ brcm_pci_chip_lookup(uint16_t devid)
  * port-count); ADDRESS descriptors give a core's base address.  EOT
  * marks end-of-table.
  */
-#define	BRCM_EROM_DESC_TYPE_MSK		0x0000000fU
-#define	BRCM_EROM_DESC_VALID		0x00000001U
-#define	BRCM_EROM_DESC_COMPONENT	0x00000001U
-#define	BRCM_EROM_DESC_MASTER_PORT	0x00000003U
-#define	BRCM_EROM_DESC_ADDRESS		0x00000005U
-#define	BRCM_EROM_DESC_ADDRSIZE_GT32	0x00000008U
-#define	BRCM_EROM_DESC_EOT		0x0000000fU
-#define	BRCM_EROM_COMP_PARTNUM		0x000fff00U
-#define	BRCM_EROM_COMP_PARTNUM_S	8
-#define	BRCM_EROM_COMP_REVISION		0xff000000U
-#define	BRCM_EROM_COMP_REVISION_S	24
-#define	BRCM_EROM_SLAVE_ADDR_BASE	0xfffff000U
-#define	BRCM_EROM_SLAVE_SIZE_TYPE	0x00000030U
-#define	BRCM_EROM_SLAVE_SIZE_DESC	3
-#define	BRCM_EROM_SLAVE_TYPE_MASK	0x000000c0U
-#define	BRCM_EROM_SLAVE_TYPE_SHIFT	6
-#define	BRCM_EROM_SLAVE_TYPE_SLAVE	0
-#define	BRCM_EROM_SLAVE_TYPE_BRIDGE	1
-#define	BRCM_EROM_SLAVE_TYPE_SWRAP	2
-#define	BRCM_EROM_SLAVE_TYPE_MWRAP	3
+#define	BWFM_EROM_DESC_TYPE_MSK		0x0000000fU
+#define	BWFM_EROM_DESC_VALID		0x00000001U
+#define	BWFM_EROM_DESC_COMPONENT	0x00000001U
+#define	BWFM_EROM_DESC_MASTER_PORT	0x00000003U
+#define	BWFM_EROM_DESC_ADDRESS		0x00000005U
+#define	BWFM_EROM_DESC_ADDRSIZE_GT32	0x00000008U
+#define	BWFM_EROM_DESC_EOT		0x0000000fU
+#define	BWFM_EROM_COMP_PARTNUM		0x000fff00U
+#define	BWFM_EROM_COMP_PARTNUM_S	8
+#define	BWFM_EROM_COMP_REVISION		0xff000000U
+#define	BWFM_EROM_COMP_REVISION_S	24
+#define	BWFM_EROM_SLAVE_ADDR_BASE	0xfffff000U
+#define	BWFM_EROM_SLAVE_SIZE_TYPE	0x00000030U
+#define	BWFM_EROM_SLAVE_SIZE_DESC	3
+#define	BWFM_EROM_SLAVE_TYPE_MASK	0x000000c0U
+#define	BWFM_EROM_SLAVE_TYPE_SHIFT	6
+#define	BWFM_EROM_SLAVE_TYPE_SLAVE	0
+#define	BWFM_EROM_SLAVE_TYPE_BRIDGE	1
+#define	BWFM_EROM_SLAVE_TYPE_SWRAP	2
+#define	BWFM_EROM_SLAVE_TYPE_MWRAP	3
 
 /* BCMA core IDs we'll see on BCM43602. */
-#define	BRCM_CORE_CHIPCOMMON		0x800
-#define	BRCM_CORE_SOCRAM		0x80e
-#define	BRCM_CORE_D11			0x812
-#define	BRCM_CORE_PMU			0x827
-#define	BRCM_CORE_ARM_CM3		0x82a
-#define	BRCM_CORE_PHY_AC		0x83b
-#define	BRCM_CORE_PCIE2			0x83c
-#define	BRCM_CORE_ARM_CR4		0x83e
-#define	BRCM_CORE_GCI			0x840
+#define	BWFM_CORE_CHIPCOMMON		0x800
+#define	BWFM_CORE_SOCRAM		0x80e
+#define	BWFM_CORE_D11			0x812
+#define	BWFM_CORE_PMU			0x827
+#define	BWFM_CORE_ARM_CM3		0x82a
+#define	BWFM_CORE_PHY_AC		0x83b
+#define	BWFM_CORE_PCIE2			0x83c
+#define	BWFM_CORE_ARM_CR4		0x83e
+#define	BWFM_CORE_GCI			0x840
 
 /*
  * Cached core info from EROM walk.  Up to 32 cores is more than any
  * shipping BCM43xx chip has (BCM43602 has ~6); the array doesn't
- * need to grow.  Populated by brcm_pci_walk_cores().
+ * need to grow.  Populated by bwfm_pci_walk_cores().
  */
-#define	BRCM_PCI_MAX_CORES	32
+#define	BWFM_PCI_MAX_CORES	32
 
-struct brcm_pci_core {
+struct bwfm_pci_core {
 	uint16_t	id;
 	uint8_t		rev;
 	uint32_t	base;
@@ -362,23 +362,23 @@ struct brcm_pci_core {
  * four-digit parts read as the hex digits (BCM4366 is 0x4366).  A
  * BCM43602 rev 1 reads 0x1601aa52: chip 0xaa52, rev 1, 6 cores.
  */
-#define	BRCM_CHIP_BCM43602		0xaa52
-#define	BRCM_CHIP_BCM4360		0x4360
-#define	BRCM_CHIP_BCM4350		0x4350
-#define	BRCM_CHIP_BCM4356		0x4356
-#define	BRCM_CHIP_BCM4358		0x4358
-#define	BRCM_CHIP_BCM4365		0x4365
-#define	BRCM_CHIP_BCM4366		0x4366
+#define	BWFM_CHIP_BCM43602		0xaa52
+#define	BWFM_CHIP_BCM4360		0x4360
+#define	BWFM_CHIP_BCM4350		0x4350
+#define	BWFM_CHIP_BCM4356		0x4356
+#define	BWFM_CHIP_BCM4358		0x4358
+#define	BWFM_CHIP_BCM4365		0x4365
+#define	BWFM_CHIP_BCM4366		0x4366
 
 /*
  * Start of BAR0's PCIe2-core fixed-offset region (about 512 bytes at
  * 0x80..0x2ff on BCM43602).  Below it, 0x0..0x7f is the SBTOPCI-windowed
  * region, whose contents change as the window register moves.
  */
-#define	BRCM_PCI_SNAP_BASE	0x80
+#define	BWFM_PCI_SNAP_BASE	0x80
 
-struct brcm_pci_softc {
-	struct brcm_softc	 bus_sc;
+struct bwfm_pci_softc {
+	struct bwfm_softc	 bus_sc;
 	device_t		 sc_dev;
 
 	struct resource		*sc_bar0;
@@ -399,7 +399,7 @@ struct brcm_pci_softc {
 
 	uint16_t		 sc_devid;
 	uint8_t			 sc_revid;
-	const struct brcm_pci_chip_info *sc_chip;	/* per-chip params */
+	const struct bwfm_pci_chip_info *sc_chip;	/* per-chip params */
 
 	/*
 	 * Chip state.  attach() itself makes no BAR0 access: on Apple
@@ -423,24 +423,24 @@ struct brcm_pci_softc {
 	uint32_t		 sc_fw_sharedram;
 	/*
 	 * RAM size in bytes, captured in bring-up step 4 before firmware is
-	 * loaded.  Later users must use this: brcm_pci_ramsize_query()
+	 * loaded.  Later users must use this: bwfm_pci_ramsize_query()
 	 * after firmware boot halts the running CR4.
 	 */
 	uint32_t		 sc_fw_ramsize;
 	/* dump_console read cursor into the fw log ring. */
 	uint32_t		 sc_console_read_idx;
 
-	struct brcm_pci_core	 sc_cores[BRCM_PCI_MAX_CORES];
+	struct bwfm_pci_core	 sc_cores[BWFM_PCI_MAX_CORES];
 	int			 sc_ncores;
 	bool			 sc_bar2_sized;
 
-	struct brcm_pci_msgbuf	 sc_msgbuf;
+	struct bwfm_pci_msgbuf	 sc_msgbuf;
 
 	/*
 	 * Firmware crash auto-recovery.  The DCMD path bumps
 	 * mb->stat_dcmd_timeout_consec on each timeout and resets it on
 	 * any success.  When it hits sc_crash_recover_threshold we
-	 * enqueue sc_crash_recover_task, which runs brcm_pci_cold_reattach
+	 * enqueue sc_crash_recover_task, which runs bwfm_pci_cold_reattach
 	 * from taskqueue_thread.  Threshold 0 (the default) disables it.
 	 * Timeouts are not proof of a crash: firmware that stops answering
 	 * while being taken down, or after a second upload, looks the same,
@@ -453,9 +453,9 @@ struct brcm_pci_softc {
 	 * waiting for the firmware, so a frame with no ring yet is queued
 	 * here and sc_flow_task makes the ring and sends the queue.  Index
 	 * 0 is data (prio 0), 1 is EAPOL (prio 7).  Sleeping in the transmit
-	 * path would panic with "sleeping thread holds brcm_pci0_tx_lock".
+	 * path would panic with "sleeping thread holds bwfm_pci0_tx_lock".
 	 */
-#define	BRCM_PCI_FLOWQ_LEN	64
+#define	BWFM_PCI_FLOWQ_LEN	64
 	struct mtx		 sc_flowq_mtx;
 	struct mbufq		 sc_flowq[2];
 	bool			 sc_flowq_busy[2];
@@ -469,11 +469,11 @@ struct brcm_pci_softc {
 	bool			 sc_crash_recover_pending;
 };
 
-#define	SC_TO_PCI(sc)	__containerof((sc), struct brcm_pci_softc, bus_sc)
+#define	SC_TO_PCI(sc)	__containerof((sc), struct bwfm_pci_softc, bus_sc)
 
 /*
- * Silent-by-default trace print keyed on the shared brcm_softc's sc_debug.
- * Argument is a `struct brcm_pci_softc *` so callers don't have to spell
+ * Silent-by-default trace print keyed on the shared bwfm_softc's sc_debug.
+ * Argument is a `struct bwfm_pci_softc *` so callers don't have to spell
  * out `&sc->bus_sc` at each site.  level==0 fires when sc_debug > 0.
  */
 #define	PDPRINTF(pci_sc, level, ...)	do {				\
@@ -525,27 +525,27 @@ struct brcm_pci_softc {
  *     buffer full, bit 0) becomes 1
  *
  * Races with FreeBSD's acpi_ec driver are possible in principle,
- * but at our attach time (kldload of brcm_pci) no other ACPI
+ * but at our attach time (kldload of bwfm_pci) no other ACPI
  * activity is reasonably in flight against the EC.
  */
-#define	BRCM_EC_DATA	0x62
-#define	BRCM_EC_CMD	0x66
-#define	BRCM_EC_S_OBF	0x01		/* status: output buffer full */
-#define	BRCM_EC_S_IBF	0x02		/* status: input buffer full */
-#define	BRCM_EC_C_RD	0x80		/* command: read EC byte */
-#define	BRCM_EC_C_WR	0x81		/* command: write EC byte */
+#define	BWFM_EC_DATA	0x62
+#define	BWFM_EC_CMD	0x66
+#define	BWFM_EC_S_OBF	0x01		/* status: output buffer full */
+#define	BWFM_EC_S_IBF	0x02		/* status: input buffer full */
+#define	BWFM_EC_C_RD	0x80		/* command: read EC byte */
+#define	BWFM_EC_C_WR	0x81		/* command: write EC byte */
 
-#define	BRCM_EC_APWC_OFFSET	0x03	/* AirPort Power Control byte */
-#define	BRCM_EC_APWC_BIT	0x01	/* bit 0 */
+#define	BWFM_EC_APWC_OFFSET	0x03	/* AirPort Power Control byte */
+#define	BWFM_EC_APWC_BIT	0x01	/* bit 0 */
 
 #if defined(__amd64__) || defined(__i386__)
 static int
-brcm_pci_ec_wait_ibf(void)
+bwfm_pci_ec_wait_ibf(void)
 {
 	int t;
 
 	for (t = 0; t < 10000; t++) {	/* up to 100 ms */
-		if ((inb(BRCM_EC_CMD) & BRCM_EC_S_IBF) == 0)
+		if ((inb(BWFM_EC_CMD) & BWFM_EC_S_IBF) == 0)
 			return (0);
 		DELAY(10);
 	}
@@ -553,12 +553,12 @@ brcm_pci_ec_wait_ibf(void)
 }
 
 static int
-brcm_pci_ec_wait_obf(void)
+bwfm_pci_ec_wait_obf(void)
 {
 	int t;
 
 	for (t = 0; t < 10000; t++) {	/* up to 100 ms */
-		if ((inb(BRCM_EC_CMD) & BRCM_EC_S_OBF) != 0)
+		if ((inb(BWFM_EC_CMD) & BWFM_EC_S_OBF) != 0)
 			return (0);
 		DELAY(10);
 	}
@@ -566,42 +566,42 @@ brcm_pci_ec_wait_obf(void)
 }
 
 static int
-brcm_pci_ec_read_byte(uint8_t off, uint8_t *out)
+bwfm_pci_ec_read_byte(uint8_t off, uint8_t *out)
 {
 	int error;
 
-	if ((error = brcm_pci_ec_wait_ibf()) != 0)
+	if ((error = bwfm_pci_ec_wait_ibf()) != 0)
 		return (error);
-	outb(BRCM_EC_CMD, BRCM_EC_C_RD);
-	if ((error = brcm_pci_ec_wait_ibf()) != 0)
+	outb(BWFM_EC_CMD, BWFM_EC_C_RD);
+	if ((error = bwfm_pci_ec_wait_ibf()) != 0)
 		return (error);
-	outb(BRCM_EC_DATA, off);
-	if ((error = brcm_pci_ec_wait_obf()) != 0)
+	outb(BWFM_EC_DATA, off);
+	if ((error = bwfm_pci_ec_wait_obf()) != 0)
 		return (error);
-	*out = inb(BRCM_EC_DATA);
+	*out = inb(BWFM_EC_DATA);
 	return (0);
 }
 
 static int
-brcm_pci_ec_write_byte(uint8_t off, uint8_t val)
+bwfm_pci_ec_write_byte(uint8_t off, uint8_t val)
 {
 	int error;
 
-	if ((error = brcm_pci_ec_wait_ibf()) != 0)
+	if ((error = bwfm_pci_ec_wait_ibf()) != 0)
 		return (error);
-	outb(BRCM_EC_CMD, BRCM_EC_C_WR);
-	if ((error = brcm_pci_ec_wait_ibf()) != 0)
+	outb(BWFM_EC_CMD, BWFM_EC_C_WR);
+	if ((error = bwfm_pci_ec_wait_ibf()) != 0)
 		return (error);
-	outb(BRCM_EC_DATA, off);
-	if ((error = brcm_pci_ec_wait_ibf()) != 0)
+	outb(BWFM_EC_DATA, off);
+	if ((error = bwfm_pci_ec_wait_ibf()) != 0)
 		return (error);
-	outb(BRCM_EC_DATA, val);
-	return (brcm_pci_ec_wait_ibf());
+	outb(BWFM_EC_DATA, val);
+	return (bwfm_pci_ec_wait_ibf());
 }
 #else  /* non-x86: no PC EC access */
-static int brcm_pci_ec_read_byte(uint8_t off __unused,
+static int bwfm_pci_ec_read_byte(uint8_t off __unused,
     uint8_t *out __unused) { return (ENOTSUP); }
-static int brcm_pci_ec_write_byte(uint8_t off __unused,
+static int bwfm_pci_ec_write_byte(uint8_t off __unused,
     uint8_t val __unused) { return (ENOTSUP); }
 #endif
 
@@ -637,10 +637,10 @@ static int brcm_pci_ec_write_byte(uint8_t off __unused,
  * accepted the program; ARPT._PS0 uses the same read as its "already
  * unlocked" check.
  */
-#define	BRCM_PCI_BD_MR	0x80
-#define	BRCM_PCI_BD_EN	0x88
-#define	BRCM_PCI_BD_IR	0xa0
-#define	BRCM_PCI_BD_DR	0xa4
+#define	BWFM_PCI_BD_MR	0x80
+#define	BWFM_PCI_BD_EN	0x88
+#define	BWFM_PCI_BD_IR	0xa0
+#define	BWFM_PCI_BD_DR	0xa4
 /*
  * The DSDT APPU method reimplemented in C.
  *
@@ -660,16 +660,16 @@ static int brcm_pci_ec_write_byte(uint8_t off __unused,
  * long enough to panic with a spin lock held too long.
  *
  * On success the ChipID (BAR0[0x00]) goes from 0xffffffff (cold) to
- * 0xaa52 (BCM43602 warm); dev.brcm_pci.N.chip_alive=1 checks it.
+ * 0xaa52 (BCM43602 warm); dev.bwfm_pci.N.chip_alive=1 checks it.
  */
-#define BRCM_APPU_PERST_SLEEP_US   250000    /* 250 ms after APWC=1 */
-#define BRCM_APPU_POLL_INTERVAL_US 10000     /* 10 ms per iter */
-#define BRCM_APPU_POLL_ITERS       1000      /* 1000 * 10ms = 10s */
-#define BRCM_APPU_OFF_SLEEP_US     263000    /* 263 ms between retries */
-#define BRCM_APPU_MAX_ATTEMPTS     5
+#define BWFM_APPU_PERST_SLEEP_US   250000    /* 250 ms after APWC=1 */
+#define BWFM_APPU_POLL_INTERVAL_US 10000     /* 10 ms per iter */
+#define BWFM_APPU_POLL_ITERS       1000      /* 1000 * 10ms = 10s */
+#define BWFM_APPU_OFF_SLEEP_US     263000    /* 263 ms between retries */
+#define BWFM_APPU_MAX_ATTEMPTS     5
 
 static int
-brcm_pci_apple_appu_warm(struct brcm_pci_softc *sc)
+bwfm_pci_apple_appu_warm(struct bwfm_pci_softc *sc)
 {
 	device_t dev = sc->sc_dev;
 	uint8_t b;
@@ -677,17 +677,17 @@ brcm_pci_apple_appu_warm(struct brcm_pci_softc *sc)
 	int attempt, iter, error;
 	bool link_up;
 
-	for (attempt = 0; attempt < BRCM_APPU_MAX_ATTEMPTS; attempt++) {
+	for (attempt = 0; attempt < BWFM_APPU_MAX_ATTEMPTS; attempt++) {
 		device_printf(dev, "APPU: attempt %d/%d - writing APWC=1\n",
-		    attempt + 1, BRCM_APPU_MAX_ATTEMPTS);
+		    attempt + 1, BWFM_APPU_MAX_ATTEMPTS);
 
-		error = brcm_pci_ec_read_byte(BRCM_EC_APWC_OFFSET, &b);
+		error = bwfm_pci_ec_read_byte(BWFM_EC_APWC_OFFSET, &b);
 		if (error != 0) {
 			device_printf(dev, "APPU: EC read failed rc=%d\n", error);
 			return (error);
 		}
-		error = brcm_pci_ec_write_byte(BRCM_EC_APWC_OFFSET,
-		    b | BRCM_EC_APWC_BIT);
+		error = bwfm_pci_ec_write_byte(BWFM_EC_APWC_OFFSET,
+		    b | BWFM_EC_APWC_BIT);
 		if (error != 0) {
 			device_printf(dev, "APPU: EC write APWC=1 failed rc=%d\n",
 			    error);
@@ -695,7 +695,7 @@ brcm_pci_apple_appu_warm(struct brcm_pci_softc *sc)
 		}
 
 		/* Step 2: 250ms settle after APWC=1. */
-		DELAY(BRCM_APPU_PERST_SLEEP_US);
+		DELAY(BWFM_APPU_PERST_SLEEP_US);
 
 		/*
 		 * Step 3: poll chip PCI vendor ID for 10s.  When the chip
@@ -705,20 +705,20 @@ brcm_pci_apple_appu_warm(struct brcm_pci_softc *sc)
 		 * complex, not the chip's memory decoder), so this is safe.
 		 */
 		link_up = false;
-		for (iter = 0; iter < BRCM_APPU_POLL_ITERS; iter++) {
+		for (iter = 0; iter < BWFM_APPU_POLL_ITERS; iter++) {
 			vid = pci_read_config(dev, PCIR_VENDOR, 2);
 			if (vid != 0xffff && vid != 0x0000) {
 				link_up = true;
 				break;
 			}
-			DELAY(BRCM_APPU_POLL_INTERVAL_US);
+			DELAY(BWFM_APPU_POLL_INTERVAL_US);
 		}
 
 		if (link_up) {
 			device_printf(dev,
 			    "APPU: link up after %d ms - chip vendor=0x%04x, "
 			    "chip is WARM\n",
-			    (iter + 1) * (BRCM_APPU_POLL_INTERVAL_US / 1000),
+			    (iter + 1) * (BWFM_APPU_POLL_INTERVAL_US / 1000),
 			    vid);
 			return (0);
 		}
@@ -728,17 +728,17 @@ brcm_pci_apple_appu_warm(struct brcm_pci_softc *sc)
 		    attempt + 1);
 
 		/* Step 4: retry - APWC=0, sleep 263ms, loop. */
-		error = brcm_pci_ec_read_byte(BRCM_EC_APWC_OFFSET, &b);
+		error = bwfm_pci_ec_read_byte(BWFM_EC_APWC_OFFSET, &b);
 		if (error == 0) {
-			(void)brcm_pci_ec_write_byte(BRCM_EC_APWC_OFFSET,
-			    b & ~BRCM_EC_APWC_BIT);
+			(void)bwfm_pci_ec_write_byte(BWFM_EC_APWC_OFFSET,
+			    b & ~BWFM_EC_APWC_BIT);
 		}
-		DELAY(BRCM_APPU_OFF_SLEEP_US);
+		DELAY(BWFM_APPU_OFF_SLEEP_US);
 	}
 
 	device_printf(dev,
 	    "APPU: chip failed to come up after %d attempts - stays cold\n",
-	    BRCM_APPU_MAX_ATTEMPTS);
+	    BWFM_APPU_MAX_ATTEMPTS);
 	return (ETIMEDOUT);
 }
 
@@ -754,9 +754,9 @@ brcm_pci_apple_appu_warm(struct brcm_pci_softc *sc)
  * ------------------------------------------------------------------ */
 
 static void
-brcm_pci_set_window(struct brcm_pci_softc *sc, uint32_t addr)
+bwfm_pci_set_window(struct bwfm_pci_softc *sc, uint32_t addr)
 {
-	uint32_t want = addr & BRCM_PCI_BAR0_WINDOW_MASK;
+	uint32_t want = addr & BWFM_PCI_BAR0_WINDOW_MASK;
 
 	/*
 	 * The window register is at PCI config offset 0x80, not BAR0
@@ -764,16 +764,16 @@ brcm_pci_set_window(struct brcm_pci_softc *sc, uint32_t addr)
 	 * window.  The DSDT's WAPS method drives the same register
 	 * through config space.
 	 */
-	pci_write_config(sc->sc_dev, BRCM_PCI_BAR0_WINDOW, want, 4);
-	(void)pci_read_config(sc->sc_dev, BRCM_PCI_BAR0_WINDOW, 4);
+	pci_write_config(sc->sc_dev, BWFM_PCI_BAR0_WINDOW, want, 4);
+	(void)pci_read_config(sc->sc_dev, BWFM_PCI_BAR0_WINDOW, 4);
 }
 
 static uint32_t
-brcm_pci_read_core32(struct brcm_pci_softc *sc, uint32_t backplane_addr)
+bwfm_pci_read_core32(struct bwfm_pci_softc *sc, uint32_t backplane_addr)
 {
-	brcm_pci_set_window(sc, backplane_addr);
+	bwfm_pci_set_window(sc, backplane_addr);
 	return (bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    backplane_addr & BRCM_PCI_BAR0_WINDOW_OFF_MASK));
+	    backplane_addr & BWFM_PCI_BAR0_WINDOW_OFF_MASK));
 }
 
 /*
@@ -783,7 +783,7 @@ brcm_pci_read_core32(struct brcm_pci_softc *sc, uint32_t backplane_addr)
  * macOS AppleBCMWLANBusInterfacePCIe attachPCIeBusGated.
  */
 static bool
-brcm_pci_chip_alive_cfg(struct brcm_pci_softc *sc)
+bwfm_pci_chip_alive_cfg(struct bwfm_pci_softc *sc)
 {
 	device_t dev = sc->sc_dev;
 	uint16_t vid;
@@ -797,9 +797,9 @@ brcm_pci_chip_alive_cfg(struct brcm_pci_softc *sc)
 		return (false);
 	}
 
-	pci_write_config(dev, BRCM_PCI_BAR0_WINDOW,
-	    BRCM_BACKPLANE_CHIPCOMMON, 4);
-	win_readback = pci_read_config(dev, BRCM_PCI_BAR0_WINDOW, 4);
+	pci_write_config(dev, BWFM_PCI_BAR0_WINDOW,
+	    BWFM_BACKPLANE_CHIPCOMMON, 4);
+	win_readback = pci_read_config(dev, BWFM_PCI_BAR0_WINDOW, 4);
 	if (win_readback == 0xffffffffU) {
 		device_printf(dev,
 		    "chip_alive_cfg: cfg BAR0_WIN readback=0xffffffff — "
@@ -807,12 +807,12 @@ brcm_pci_chip_alive_cfg(struct brcm_pci_softc *sc)
 		    "Refusing.\n");
 		return (false);
 	}
-	if (win_readback != BRCM_BACKPLANE_CHIPCOMMON) {
+	if (win_readback != BWFM_BACKPLANE_CHIPCOMMON) {
 		device_printf(dev,
 		    "chip_alive_cfg: cfg BAR0_WIN readback=0x%08x — expected "
 		    "0x%x.  cfg-space write not retained; PCIe fabric "
 		    "unhealthy.  Refusing.\n",
-		    win_readback, BRCM_BACKPLANE_CHIPCOMMON);
+		    win_readback, BWFM_BACKPLANE_CHIPCOMMON);
 		return (false);
 	}
 
@@ -866,34 +866,34 @@ brcm_pci_chip_alive_cfg(struct brcm_pci_softc *sc)
  * ------------------------------------------------------------------ */
 
 static const char *
-brcm_pci_core_name(uint16_t id)
+bwfm_pci_core_name(uint16_t id)
 {
 	switch (id) {
-	case BRCM_CORE_CHIPCOMMON:	return "ChipCommon";
-	case BRCM_CORE_SOCRAM:		return "SOCRAM";
-	case BRCM_CORE_D11:		return "D11/80211";
-	case BRCM_CORE_PMU:		return "PMU";
-	case BRCM_CORE_ARM_CM3:		return "ARM-CM3";
-	case BRCM_CORE_PHY_AC:		return "PHY-AC";
-	case BRCM_CORE_PCIE2:		return "PCIe2";
-	case BRCM_CORE_ARM_CR4:		return "ARM-CR4";
-	case BRCM_CORE_GCI:		return "GCI";
+	case BWFM_CORE_CHIPCOMMON:	return "ChipCommon";
+	case BWFM_CORE_SOCRAM:		return "SOCRAM";
+	case BWFM_CORE_D11:		return "D11/80211";
+	case BWFM_CORE_PMU:		return "PMU";
+	case BWFM_CORE_ARM_CM3:		return "ARM-CM3";
+	case BWFM_CORE_PHY_AC:		return "PHY-AC";
+	case BWFM_CORE_PCIE2:		return "PCIe2";
+	case BWFM_CORE_ARM_CR4:		return "ARM-CR4";
+	case BWFM_CORE_GCI:		return "GCI";
 	default:			return "?";
 	}
 }
 
 static uint32_t
-brcm_pci_erom_next(struct brcm_pci_softc *sc, uint32_t *paddr)
+bwfm_pci_erom_next(struct bwfm_pci_softc *sc, uint32_t *paddr)
 {
 	uint32_t v;
 
-	v = brcm_pci_read_core32(sc, *paddr);
+	v = bwfm_pci_read_core32(sc, *paddr);
 	*paddr += 4;
 	return (v);
 }
 
 static int
-brcm_pci_walk_cores(struct brcm_pci_softc *sc)
+bwfm_pci_walk_cores(struct bwfm_pci_softc *sc)
 {
 	uint32_t eromptr, addr;
 	uint32_t v1, v2, vd;
@@ -909,8 +909,8 @@ brcm_pci_walk_cores(struct brcm_pci_softc *sc)
 		return (ENXIO);
 	}
 
-	eromptr = brcm_pci_read_core32(sc,
-	    BRCM_BACKPLANE_CHIPCOMMON + BRCM_CC_REG_EROMPTR);
+	eromptr = bwfm_pci_read_core32(sc,
+	    BWFM_BACKPLANE_CHIPCOMMON + BWFM_CC_REG_EROMPTR);
 	PDPRINTF(sc, 0,
 	    "core_walk: ChipCommon[0xfc] EROM pointer = 0x%08x\n", eromptr);
 	if (eromptr == 0 || eromptr == 0xffffffffU) {
@@ -923,34 +923,34 @@ brcm_pci_walk_cores(struct brcm_pci_softc *sc)
 	sc->sc_ncores = 0;
 	guard = 0;
 	while (guard++ < 256) {
-		v1 = brcm_pci_erom_next(sc, &addr);
-		type = v1 & BRCM_EROM_DESC_TYPE_MSK;
-		if (type == BRCM_EROM_DESC_EOT) {
+		v1 = bwfm_pci_erom_next(sc, &addr);
+		type = v1 & BWFM_EROM_DESC_TYPE_MSK;
+		if (type == BWFM_EROM_DESC_EOT) {
 			PDPRINTF(sc, 0,
 			    "core_walk: EOT at EROM offset 0x%x\n",
 			    addr - 4 - eromptr);
 			break;
 		}
-		if ((v1 & BRCM_EROM_DESC_VALID) == 0)
+		if ((v1 & BWFM_EROM_DESC_VALID) == 0)
 			continue;
-		if (type != BRCM_EROM_DESC_COMPONENT)
+		if (type != BWFM_EROM_DESC_COMPONENT)
 			continue;
 
-		id = (v1 & BRCM_EROM_COMP_PARTNUM) >>
-		    BRCM_EROM_COMP_PARTNUM_S;
+		id = (v1 & BWFM_EROM_COMP_PARTNUM) >>
+		    BWFM_EROM_COMP_PARTNUM_S;
 
 		/* Second COMPONENT word — required. */
-		v2 = brcm_pci_erom_next(sc, &addr);
-		if ((v2 & BRCM_EROM_DESC_TYPE_MSK) !=
-		    BRCM_EROM_DESC_COMPONENT) {
+		v2 = bwfm_pci_erom_next(sc, &addr);
+		if ((v2 & BWFM_EROM_DESC_TYPE_MSK) !=
+		    BWFM_EROM_DESC_COMPONENT) {
 			device_printf(sc->sc_dev,
 			    "core_walk: malformed component pair "
 			    "(id=0x%03x), second word 0x%08x not "
 			    "COMPONENT — stopping walk\n", id, v2);
 			break;
 		}
-		rev = (v2 & BRCM_EROM_COMP_REVISION) >>
-		    BRCM_EROM_COMP_REVISION_S;
+		rev = (v2 & BWFM_EROM_COMP_REVISION) >>
+		    BWFM_EROM_COMP_REVISION_S;
 
 		/*
 		 * Walk ADDRESS descriptors.  Each carries a slave-type
@@ -968,41 +968,41 @@ brcm_pci_walk_cores(struct brcm_pci_softc *sc)
 			uint32_t v;
 			uint8_t t, stype;
 
-			v = brcm_pci_erom_next(sc, &addr);
-			t = v & BRCM_EROM_DESC_TYPE_MSK;
+			v = bwfm_pci_erom_next(sc, &addr);
+			t = v & BWFM_EROM_DESC_TYPE_MSK;
 
-			if (t == BRCM_EROM_DESC_EOT) {
+			if (t == BWFM_EROM_DESC_EOT) {
 				addr -= 4;
 				goto eot;
 			}
-			if (t == BRCM_EROM_DESC_COMPONENT) {
+			if (t == BWFM_EROM_DESC_COMPONENT) {
 				addr -= 4;
 				break;
 			}
-			if (t == BRCM_EROM_DESC_MASTER_PORT)
+			if (t == BWFM_EROM_DESC_MASTER_PORT)
 				continue;
-			if ((t & ~BRCM_EROM_DESC_ADDRSIZE_GT32) ==
-			    BRCM_EROM_DESC_ADDRESS) {
-				stype = (v & BRCM_EROM_SLAVE_TYPE_MASK) >>
-				    BRCM_EROM_SLAVE_TYPE_SHIFT;
+			if ((t & ~BWFM_EROM_DESC_ADDRSIZE_GT32) ==
+			    BWFM_EROM_DESC_ADDRESS) {
+				stype = (v & BWFM_EROM_SLAVE_TYPE_MASK) >>
+				    BWFM_EROM_SLAVE_TYPE_SHIFT;
 
-				if (stype == BRCM_EROM_SLAVE_TYPE_SLAVE &&
+				if (stype == BWFM_EROM_SLAVE_TYPE_SLAVE &&
 				    base == 0)
-					base = v & BRCM_EROM_SLAVE_ADDR_BASE;
-				else if (stype == BRCM_EROM_SLAVE_TYPE_SWRAP &&
+					base = v & BWFM_EROM_SLAVE_ADDR_BASE;
+				else if (stype == BWFM_EROM_SLAVE_TYPE_SWRAP &&
 				    wrap == 0)
-					wrap = v & BRCM_EROM_SLAVE_ADDR_BASE;
-				else if (stype == BRCM_EROM_SLAVE_TYPE_MWRAP &&
+					wrap = v & BWFM_EROM_SLAVE_ADDR_BASE;
+				else if (stype == BWFM_EROM_SLAVE_TYPE_MWRAP &&
 				    wrap == 0)
-					wrap = v & BRCM_EROM_SLAVE_ADDR_BASE;
+					wrap = v & BWFM_EROM_SLAVE_ADDR_BASE;
 
-				if (t & BRCM_EROM_DESC_ADDRSIZE_GT32)
-					(void)brcm_pci_erom_next(sc, &addr);
-				sztype = (v & BRCM_EROM_SLAVE_SIZE_TYPE) >> 4;
-				if (sztype == BRCM_EROM_SLAVE_SIZE_DESC) {
-					vd = brcm_pci_erom_next(sc, &addr);
-					if (vd & BRCM_EROM_DESC_ADDRSIZE_GT32)
-						(void)brcm_pci_erom_next(sc,
+				if (t & BWFM_EROM_DESC_ADDRSIZE_GT32)
+					(void)bwfm_pci_erom_next(sc, &addr);
+				sztype = (v & BWFM_EROM_SLAVE_SIZE_TYPE) >> 4;
+				if (sztype == BWFM_EROM_SLAVE_SIZE_DESC) {
+					vd = bwfm_pci_erom_next(sc, &addr);
+					if (vd & BWFM_EROM_DESC_ADDRSIZE_GT32)
+						(void)bwfm_pci_erom_next(sc,
 						    &addr);
 				}
 				continue;
@@ -1011,11 +1011,11 @@ brcm_pci_walk_cores(struct brcm_pci_softc *sc)
 			break;
 		}
 
-		if (sc->sc_ncores >= BRCM_PCI_MAX_CORES) {
+		if (sc->sc_ncores >= BWFM_PCI_MAX_CORES) {
 			device_printf(sc->sc_dev,
-			    "core_walk: hit BRCM_PCI_MAX_CORES (%d); "
+			    "core_walk: hit BWFM_PCI_MAX_CORES (%d); "
 			    "dropping further entries\n",
-			    BRCM_PCI_MAX_CORES);
+			    BWFM_PCI_MAX_CORES);
 			continue;
 		}
 		sc->sc_cores[sc->sc_ncores].id   = id;
@@ -1027,7 +1027,7 @@ brcm_pci_walk_cores(struct brcm_pci_softc *sc)
 		PDPRINTF(sc, 0,
 		    "core_walk: %2d. %-12s id=0x%03x rev=%u "
 		    "base=0x%08x wrap=0x%08x\n",
-		    sc->sc_ncores, brcm_pci_core_name(id), id, rev,
+		    sc->sc_ncores, bwfm_pci_core_name(id), id, rev,
 		    base, wrap);
 	}
 eot:
@@ -1044,9 +1044,9 @@ eot:
  * window onto chip-side memory.  The firmware destination within
  * BAR2 is `rambase`, a per-chip constant (NOT the SOCRAM core's
  * backplane address).  On BCM43602 rambase = 0x180000; per-chip
- * table lives in brcm_pci_chip_table[].
+ * table lives in bwfm_pci_chip_table[].
  *
- * The firmware image is wrapped as the kld brcm_pci_fw_43602.  It is
+ * The firmware image is wrapped as the kld bwfm_pci_fw_43602.  It is
  * a raw ARM-CR4 image (no ELF or Mach-O header), about 635 KB and
  * 4-byte aligned, with no relocation table or signature: the loader
  * is expected to know the chip's rambase.  The ARM-CR4 reset vector
@@ -1057,9 +1057,9 @@ eot:
  * and they are logged at upload so dmesg shows which firmware ran.
  * ------------------------------------------------------------------ */
 
-#define	BRCM_PCI_FW_43602	"brcmfmac43602_pcie"
-#define	BRCM_PCI_RAMBASE_43602	0x180000	/* per-chip TCM base */
-#define	BRCM_PCI_FW_VERSTRING_MAX	256
+#define	BWFM_PCI_FW_43602	"brcmfmac43602_pcie"
+#define	BWFM_PCI_RAMBASE_43602	0x180000	/* per-chip TCM base */
+#define	BWFM_PCI_FW_VERSTRING_MAX	256
 
 /*
  * Minimal synthetic NVRAM for the BCM43602 on Apple A1398.
@@ -1088,7 +1088,7 @@ eot:
  *   ccode/regrev         FCC defaults; net80211 sets real cc later
  *   aa2g / aa5g = 3      Both antenna chains live
  */
-static const char brcm_pci_minimal_nvram[] =
+static const char bwfm_pci_minimal_nvram[] =
 	"manfid=0x14e4\0"
 	"prodid=0xaa52\0"
 	"devid=0x43ba\0"
@@ -1112,8 +1112,8 @@ static const char brcm_pci_minimal_nvram[] =
 	"\0\0";	/* double-NUL terminator */
 
 /* ARM-CR4 core register offsets used during enter_download_state. */
-#define	BRCM_ARMCR4_BANKIDX	0x40
-#define	BRCM_ARMCR4_BANKPDA	0x4c
+#define	BWFM_ARMCR4_BANKIDX	0x40
+#define	BWFM_ARMCR4_BANKPDA	0x4c
 
 /*
  * PCIe2 core "internal config" backdoor: CONFIGADDR is the index
@@ -1123,35 +1123,35 @@ static const char brcm_pci_minimal_nvram[] =
  * 0x18003000).  Used to resize the BAR2 aperture so it maps chip
  * TCM; without it a single BAR2 write target-aborts the host.
  */
-#define	BRCM_PCIE2_CONFIGADDR	0x120
-#define	BRCM_PCIE2_CONFIGDATA	0x124
-#define	BRCM_PCIE2_CFG_BAR2RESIZE	0x4e0	/* internal cfg index */
+#define	BWFM_PCIE2_CONFIGADDR	0x120
+#define	BWFM_PCIE2_CONFIGDATA	0x124
+#define	BWFM_PCIE2_CFG_BAR2RESIZE	0x4e0	/* internal cfg index */
 
 /*
  * ChipCommon watchdog register: writing N here triggers a chip-wide
  * reset after N ticks (use 4).
  */
-#define	BRCM_CC_REG_WATCHDOG	0x80
+#define	BWFM_CC_REG_WATCHDOG	0x80
 
 /* ChipCommon PMU register block, relative to the ChipCommon base. */
-#define	BRCM_CC_PMU_CTRL		0x600
-#define	BRCM_CC_PMU_CAP			0x604
-#define	BRCM_CC_PMU_STATUS		0x608
-#define	BRCM_CC_PMU_RES_STATE		0x60c
-#define	BRCM_CC_PMU_RES_PENDING		0x610
-#define	BRCM_CC_PMU_TIMER		0x614
-#define	BRCM_CC_PMU_MIN_RES_MASK	0x618
-#define	BRCM_CC_PMU_MAX_RES_MASK	0x61c
-#define	BRCM_CC_PMU_RES_TABLE_SEL	0x620
-#define	BRCM_CC_PMU_RES_DEP_MASK	0x624
-#define	BRCM_CC_PMU_RES_UPDN_TIMER	0x628
-#define	BRCM_CC_PMU_RES_TIMER		0x62c
-#define	BRCM_CC_PMU_CHIPCONTROL_ADDR	0x650
-#define	BRCM_CC_PMU_CHIPCONTROL_DATA	0x654
-#define	BRCM_CC_PMU_REGCONTROL_ADDR	0x658
-#define	BRCM_CC_PMU_REGCONTROL_DATA	0x65c
-#define	BRCM_CC_PMU_PLLCONTROL_ADDR	0x660
-#define	BRCM_CC_PMU_PLLCONTROL_DATA	0x664
+#define	BWFM_CC_PMU_CTRL		0x600
+#define	BWFM_CC_PMU_CAP			0x604
+#define	BWFM_CC_PMU_STATUS		0x608
+#define	BWFM_CC_PMU_RES_STATE		0x60c
+#define	BWFM_CC_PMU_RES_PENDING		0x610
+#define	BWFM_CC_PMU_TIMER		0x614
+#define	BWFM_CC_PMU_MIN_RES_MASK	0x618
+#define	BWFM_CC_PMU_MAX_RES_MASK	0x61c
+#define	BWFM_CC_PMU_RES_TABLE_SEL	0x620
+#define	BWFM_CC_PMU_RES_DEP_MASK	0x624
+#define	BWFM_CC_PMU_RES_UPDN_TIMER	0x628
+#define	BWFM_CC_PMU_RES_TIMER		0x62c
+#define	BWFM_CC_PMU_CHIPCONTROL_ADDR	0x650
+#define	BWFM_CC_PMU_CHIPCONTROL_DATA	0x654
+#define	BWFM_CC_PMU_REGCONTROL_ADDR	0x658
+#define	BWFM_CC_PMU_REGCONTROL_DATA	0x65c
+#define	BWFM_CC_PMU_PLLCONTROL_ADDR	0x660
+#define	BWFM_CC_PMU_PLLCONTROL_DATA	0x664
 
 /*
  * BCMA core wrapper registers.  Live at <core->wrap> + offset.
@@ -1161,12 +1161,12 @@ static const char brcm_pci_minimal_nvram[] =
  * cores on, so they must be reachable even when the core itself
  * is off.
  */
-#define	BRCM_BCMA_IOCTL		0x408
-#define	BRCM_BCMA_IOCTL_CLK	0x1
-#define	BRCM_BCMA_IOCTL_FGC	0x2
-#define	BRCM_BCMA_RESET_CTL	0x800
-#define	BRCM_BCMA_RESET_CTL_RESET	0x1
-#define	BRCM_ARMCR4_IOCTL_CPUHALT	0x20
+#define	BWFM_BCMA_IOCTL		0x408
+#define	BWFM_BCMA_IOCTL_CLK	0x1
+#define	BWFM_BCMA_IOCTL_FGC	0x2
+#define	BWFM_BCMA_RESET_CTL	0x800
+#define	BWFM_BCMA_RESET_CTL_RESET	0x1
+#define	BWFM_ARMCR4_IOCTL_CPUHALT	0x20
 
 /*
  * D11 (802.11 MAC) core IOCTL bits.  Used by chip_set_passive to put
@@ -1175,18 +1175,18 @@ static const char brcm_pci_minimal_nvram[] =
  * resources in ways that prevent the ARM-CR4 firmware from
  * completing its early init handshake.
  */
-#define	BRCM_D11_IOCTL_PHYCLOCKEN	0x4
-#define	BRCM_D11_IOCTL_PHYRESET		0x8
+#define	BWFM_D11_IOCTL_PHYCLOCKEN	0x4
+#define	BWFM_D11_IOCTL_PHYRESET		0x8
 
 /* ARM-CR4 core registers (offsets within core->base). */
-#define	BRCM_ARMCR4_CAP		0x04
-#define	BRCM_ARMCR4_BANKINFO	0x44	/* paired with BANKIDX at 0x40 */
-#define	BRCM_ARMCR4_TCBANB_MASK	0x0000000fU
-#define	BRCM_ARMCR4_TCBBNB_MASK	0x000000f0U
-#define	BRCM_ARMCR4_TCBBNB_SHIFT	4
-#define	BRCM_ARMCR4_BSZ_MASK	0x0000007fU
-#define	BRCM_ARMCR4_BLK_1K_MASK	0x00000200U
-#define	BRCM_ARMCR4_BSZ_MULT	8192
+#define	BWFM_ARMCR4_CAP		0x04
+#define	BWFM_ARMCR4_BANKINFO	0x44	/* paired with BANKIDX at 0x40 */
+#define	BWFM_ARMCR4_TCBANB_MASK	0x0000000fU
+#define	BWFM_ARMCR4_TCBBNB_MASK	0x000000f0U
+#define	BWFM_ARMCR4_TCBBNB_SHIFT	4
+#define	BWFM_ARMCR4_BSZ_MASK	0x0000007fU
+#define	BWFM_ARMCR4_BLK_1K_MASK	0x00000200U
+#define	BWFM_ARMCR4_BSZ_MULT	8192
 
 /*
  * Take a core out of reset and turn its clock on.  This is the
@@ -1202,7 +1202,7 @@ static const char brcm_pci_minimal_nvram[] =
  * the backplane interconnect is alive.
  */
 static int
-brcm_pci_core_enable(struct brcm_pci_softc *sc, uint16_t coreid,
+bwfm_pci_core_enable(struct bwfm_pci_softc *sc, uint16_t coreid,
     uint32_t postreset)
 {
 	uint32_t wrap = 0;
@@ -1218,19 +1218,19 @@ brcm_pci_core_enable(struct brcm_pci_softc *sc, uint16_t coreid,
 	if (wrap == 0) {
 		device_printf(sc->sc_dev,
 		    "core_enable: %s (0x%03x) has no wrap base\n",
-		    brcm_pci_core_name(coreid), coreid);
+		    bwfm_pci_core_name(coreid), coreid);
 		return (ENOENT);
 	}
 
-	brcm_pci_set_window(sc, wrap);
+	bwfm_pci_set_window(sc, wrap);
 
 	/* Poll RESET_CTL — write 0 until bit 0 clears, up to ~2.5 ms. */
 	count = 0;
 	while (((v = bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_RESET_CTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK)) &
-	    BRCM_BCMA_RESET_CTL_RESET) != 0) {
+	    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK)) &
+	    BWFM_BCMA_RESET_CTL_RESET) != 0) {
 		bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
-		    BRCM_BCMA_RESET_CTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK, 0);
+		    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK, 0);
 		count++;
 		if (count > 50)
 			break;
@@ -1238,17 +1238,17 @@ brcm_pci_core_enable(struct brcm_pci_softc *sc, uint16_t coreid,
 	}
 	PDPRINTF(sc, 0,
 	    "core_enable: %s RESET_CTL = 0x%08x after %d poll(s)\n",
-	    brcm_pci_core_name(coreid), v, count);
+	    bwfm_pci_core_name(coreid), v, count);
 
 	/* Write IOCTL: postreset | CLK. */
 	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_IOCTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK,
-	    postreset | BRCM_BCMA_IOCTL_CLK);
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK,
+	    postreset | BWFM_BCMA_IOCTL_CLK);
 	v = bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_IOCTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK);
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
 	PDPRINTF(sc, 0,
 	    "core_enable: %s IOCTL after write = 0x%08x\n",
-	    brcm_pci_core_name(coreid), v);
+	    bwfm_pci_core_name(coreid), v);
 
 	return (0);
 }
@@ -1272,14 +1272,14 @@ brcm_pci_core_enable(struct brcm_pci_softc *sc, uint16_t coreid,
  * BAR2[rambase + ramsize - 4], which the caller polls.
  */
 static int
-brcm_pci_armcr4_release(struct brcm_pci_softc *sc)
+bwfm_pci_armcr4_release(struct bwfm_pci_softc *sc)
 {
 	uint32_t wrap = 0;
 	uint32_t rstvec, ioctl, reset;
 	int i, count;
 
 	for (i = 0; i < sc->sc_ncores; i++) {
-		if (sc->sc_cores[i].id == BRCM_CORE_ARM_CR4) {
+		if (sc->sc_cores[i].id == BWFM_CORE_ARM_CR4) {
 			wrap = sc->sc_cores[i].wrap;
 			break;
 		}
@@ -1303,7 +1303,7 @@ brcm_pci_armcr4_release(struct brcm_pci_softc *sc)
 	 */
 	{
 	uint32_t rambase = sc->sc_chip ? sc->sc_chip->rambase :
-	    BRCM_PCI_RAMBASE_43602;
+	    BWFM_PCI_RAMBASE_43602;
 	rstvec = bus_space_read_4(sc->sc_bar2_t, sc->sc_bar2_h, rambase);
 	PDPRINTF(sc, 0,
 	    "armcr4_release: firmware[0] (rstvec value) = 0x%08x "
@@ -1335,7 +1335,7 @@ brcm_pci_armcr4_release(struct brcm_pci_softc *sc)
 	PDPRINTF(sc, 0,
 	    "armcr4_release: cfg[0x110] = 0x31c1 (SPROM ctrl retention)\n");
 
-	brcm_pci_set_window(sc, wrap);
+	bwfm_pci_set_window(sc, wrap);
 
 	/*
 	 * Full ai_resetcore(CR4, CPUHALT, 0, 0).  Toggling CPUHALT alone
@@ -1352,47 +1352,47 @@ brcm_pci_armcr4_release(struct brcm_pci_softc *sc)
 
 	/* 1. Halt CPU + gate clock (pre-reset). */
 	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_IOCTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK,
-	    BRCM_ARMCR4_IOCTL_CPUHALT | BRCM_BCMA_IOCTL_FGC |
-	    BRCM_BCMA_IOCTL_CLK);
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK,
+	    BWFM_ARMCR4_IOCTL_CPUHALT | BWFM_BCMA_IOCTL_FGC |
+	    BWFM_BCMA_IOCTL_CLK);
 	(void)bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_IOCTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK);
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
 
 	/* 2. Assert reset. */
 	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_RESET_CTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK,
-	    BRCM_BCMA_RESET_CTL_RESET);
+	    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK,
+	    BWFM_BCMA_RESET_CTL_RESET);
 	(void)bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_RESET_CTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK);
+	    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
 	DELAY(20);
 
 	/* 3. In-reset config; dropping CPUHALT clears it while in reset. */
 	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_IOCTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK,
-	    BRCM_BCMA_IOCTL_FGC | BRCM_BCMA_IOCTL_CLK);
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK,
+	    BWFM_BCMA_IOCTL_FGC | BWFM_BCMA_IOCTL_CLK);
 	(void)bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_IOCTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK);
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
 
 	/* 4. Deassert reset; the CR4 starts executing. */
 	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_RESET_CTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK, 0);
+	    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK, 0);
 	(void)bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_RESET_CTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK);
+	    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
 	DELAY(2);
 
 	/* 5. Postreset: drop FGC so clock runs normally. */
 	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_IOCTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK,
-	    BRCM_BCMA_IOCTL_CLK);
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK,
+	    BWFM_BCMA_IOCTL_CLK);
 	(void)bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_IOCTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK);
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
 	(void)count;
 
 	/* Read final state for the log. */
 	ioctl = bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_IOCTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK);
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
 	reset = bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_RESET_CTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK);
+	    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
 	PDPRINTF(sc, 0,
 	    "armcr4_release: ARM-CR4 running.  IOCTL=0x%08x RESET_CTL=0x%08x "
 	    "rstvec=0x%08x\n", ioctl, reset, rstvec);
@@ -1404,7 +1404,7 @@ brcm_pci_armcr4_release(struct brcm_pci_softc *sc)
  * BANKINFO registers.  Returns 0 on success and fills *ramsize_p.
  */
 static int
-brcm_pci_ramsize_query(struct brcm_pci_softc *sc, uint32_t *ramsize_p)
+bwfm_pci_ramsize_query(struct bwfm_pci_softc *sc, uint32_t *ramsize_p)
 {
 	uint32_t cr4_base = 0;
 	uint32_t cap, info, blksize;
@@ -1413,7 +1413,7 @@ brcm_pci_ramsize_query(struct brcm_pci_softc *sc, uint32_t *ramsize_p)
 	int i, rc;
 
 	for (i = 0; i < sc->sc_ncores; i++) {
-		if (sc->sc_cores[i].id == BRCM_CORE_ARM_CR4) {
+		if (sc->sc_cores[i].id == BWFM_CORE_ARM_CR4) {
 			cr4_base = sc->sc_cores[i].base;
 			break;
 		}
@@ -1422,16 +1422,16 @@ brcm_pci_ramsize_query(struct brcm_pci_softc *sc, uint32_t *ramsize_p)
 		return (ENOENT);
 
 	/* CAP + BANKIDX/BANKINFO reads require ARM-CR4 clock on. */
-	rc = brcm_pci_core_enable(sc, BRCM_CORE_ARM_CR4,
-	    BRCM_ARMCR4_IOCTL_CPUHALT);
+	rc = bwfm_pci_core_enable(sc, BWFM_CORE_ARM_CR4,
+	    BWFM_ARMCR4_IOCTL_CPUHALT);
 	if (rc != 0)
 		return (rc);
 
-	brcm_pci_set_window(sc, cr4_base);
+	bwfm_pci_set_window(sc, cr4_base);
 	cap = bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_ARMCR4_CAP & BRCM_PCI_BAR0_WINDOW_OFF_MASK);
-	nab = cap & BRCM_ARMCR4_TCBANB_MASK;
-	nbb = (cap & BRCM_ARMCR4_TCBBNB_MASK) >> BRCM_ARMCR4_TCBBNB_SHIFT;
+	    BWFM_ARMCR4_CAP & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
+	nab = cap & BWFM_ARMCR4_TCBANB_MASK;
+	nbb = (cap & BWFM_ARMCR4_TCBBNB_MASK) >> BWFM_ARMCR4_TCBBNB_SHIFT;
 	totb = nab + nbb;
 	PDPRINTF(sc, 0,
 	    "ramsize_query: ARM-CR4 CAP=0x%08x A-banks=%u B-banks=%u total=%u\n",
@@ -1439,18 +1439,18 @@ brcm_pci_ramsize_query(struct brcm_pci_softc *sc, uint32_t *ramsize_p)
 
 	for (idx = 0; idx < totb; idx++) {
 		bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
-		    BRCM_ARMCR4_BANKIDX & BRCM_PCI_BAR0_WINDOW_OFF_MASK,
+		    BWFM_ARMCR4_BANKIDX & BWFM_PCI_BAR0_WINDOW_OFF_MASK,
 		    idx);
 		info = bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
-		    BRCM_ARMCR4_BANKINFO & BRCM_PCI_BAR0_WINDOW_OFF_MASK);
-		blksize = (info & BRCM_ARMCR4_BLK_1K_MASK) ?
-		    1024 : BRCM_ARMCR4_BSZ_MULT;
-		memsize += ((info & BRCM_ARMCR4_BSZ_MASK) + 1) * blksize;
+		    BWFM_ARMCR4_BANKINFO & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
+		blksize = (info & BWFM_ARMCR4_BLK_1K_MASK) ?
+		    1024 : BWFM_ARMCR4_BSZ_MULT;
+		memsize += ((info & BWFM_ARMCR4_BSZ_MASK) + 1) * blksize;
 		PDPRINTF(sc, 0,
 		    "ramsize_query:   bank %u INFO=0x%08x blk=%u "
 		    "size=%u running total=%u\n",
 		    idx, info, blksize,
-		    ((info & BRCM_ARMCR4_BSZ_MASK) + 1) * blksize, memsize);
+		    ((info & BWFM_ARMCR4_BSZ_MASK) + 1) * blksize, memsize);
 	}
 	*ramsize_p = memsize;
 	PDPRINTF(sc, 0,
@@ -1479,31 +1479,31 @@ brcm_pci_ramsize_query(struct brcm_pci_softc *sc, uint32_t *ramsize_p)
 /*
  * Random-seed prelude for Apple chips: 256 bytes of random data
  * followed by an 8-byte {length, magic} footer just below the NVRAM.
- * Off by default (dev.brcm_pci_nvram_seed_enable): with it on, the
+ * Off by default (dev.bwfm_pci_nvram_seed_enable): with it on, the
  * BCM43602 firmware never writes sharedram_addr, and the right
  * condition and format for the seed are not known.
  */
-#define	BRCM_PCI_RANDOM_SEED_LENGTH	0x100u
-#define	BRCM_PCI_RANDOM_SEED_MAGIC	0xfeedc0deu
+#define	BWFM_PCI_RANDOM_SEED_LENGTH	0x100u
+#define	BWFM_PCI_RANDOM_SEED_MAGIC	0xfeedc0deu
 
-static int brcm_pci_nvram_seed_enable = 0;
-SYSCTL_INT(_dev, OID_AUTO, brcm_pci_nvram_seed_enable, CTLFLAG_RWTUN,
-    &brcm_pci_nvram_seed_enable, 0,
+static int bwfm_pci_nvram_seed_enable = 0;
+SYSCTL_INT(_dev, OID_AUTO, bwfm_pci_nvram_seed_enable, CTLFLAG_RWTUN,
+    &bwfm_pci_nvram_seed_enable, 0,
     "Emit random-seed prelude in nvram_inject (0=off, 1=on).");
 
 static int
-brcm_pci_nvram_inject(struct brcm_pci_softc *sc)
+bwfm_pci_nvram_inject(struct bwfm_pci_softc *sc)
 {
 	device_t dev = sc->sc_dev;
 	uint32_t ramsize, off, trailer;
 	uint32_t nvram_len, nvram_len_padded;
 	uint32_t seed_footer_off, seed_bytes_off;
-	uint8_t randbuf[BRCM_PCI_RANDOM_SEED_LENGTH];
+	uint8_t randbuf[BWFM_PCI_RANDOM_SEED_LENGTH];
 	size_t i;
 	int error;
-	bool use_seed = (brcm_pci_nvram_seed_enable != 0);
+	bool use_seed = (bwfm_pci_nvram_seed_enable != 0);
 
-	error = brcm_pci_ramsize_query(sc, &ramsize);
+	error = bwfm_pci_ramsize_query(sc, &ramsize);
 	if (error != 0)
 		return (error);
 
@@ -1513,13 +1513,13 @@ brcm_pci_nvram_inject(struct brcm_pci_softc *sc)
 	 * brcmf treats the final \0\0 as the terminator.  Strip the
 	 * compiler's automatic trailing \0 from sizeof to match.
 	 */
-	nvram_len = (uint32_t)(sizeof(brcm_pci_minimal_nvram) - 1);
+	nvram_len = (uint32_t)(sizeof(bwfm_pci_minimal_nvram) - 1);
 	nvram_len_padded = (nvram_len + 3) & ~3U;
 
 	{
 		uint32_t need = nvram_len_padded + 4;
 		if (use_seed)
-			need += 8 + BRCM_PCI_RANDOM_SEED_LENGTH;
+			need += 8 + BWFM_PCI_RANDOM_SEED_LENGTH;
 		if (need > ramsize) {
 			device_printf(dev,
 			    "nvram_inject: needed %u > ramsize %u\n",
@@ -1530,10 +1530,10 @@ brcm_pci_nvram_inject(struct brcm_pci_softc *sc)
 
 	{
 	uint32_t rambase = sc->sc_chip ? sc->sc_chip->rambase :
-	    BRCM_PCI_RAMBASE_43602;
+	    BWFM_PCI_RAMBASE_43602;
 	off = rambase + ramsize - nvram_len_padded - 4;
 	seed_footer_off = off - 8;
-	seed_bytes_off = seed_footer_off - BRCM_PCI_RANDOM_SEED_LENGTH;
+	seed_bytes_off = seed_footer_off - BWFM_PCI_RANDOM_SEED_LENGTH;
 
 	if (use_seed) {
 		PDPRINTF(sc, 0,
@@ -1553,7 +1553,7 @@ brcm_pci_nvram_inject(struct brcm_pci_softc *sc)
 	/* Byte-by-byte write of the NVRAM body. */
 	for (i = 0; i < nvram_len; i++) {
 		bus_space_write_1(sc->sc_bar2_t, sc->sc_bar2_h, off + i,
-		    (uint8_t)brcm_pci_minimal_nvram[i]);
+		    (uint8_t)bwfm_pci_minimal_nvram[i]);
 	}
 	/* Zero-pad the tail to 4-byte alignment. */
 	for (i = nvram_len; i < nvram_len_padded; i++) {
@@ -1575,10 +1575,10 @@ brcm_pci_nvram_inject(struct brcm_pci_softc *sc)
 		}
 		bus_space_write_4(sc->sc_bar2_t, sc->sc_bar2_h,
 		    seed_footer_off + 0,
-		    htole32(BRCM_PCI_RANDOM_SEED_LENGTH));
+		    htole32(BWFM_PCI_RANDOM_SEED_LENGTH));
 		bus_space_write_4(sc->sc_bar2_t, sc->sc_bar2_h,
 		    seed_footer_off + 4,
-		    htole32(BRCM_PCI_RANDOM_SEED_MAGIC));
+		    htole32(BWFM_PCI_RANDOM_SEED_MAGIC));
 	}
 
 	/*
@@ -1593,7 +1593,7 @@ brcm_pci_nvram_inject(struct brcm_pci_softc *sc)
 		uint16_t inv = (uint16_t)~dwords;
 
 		uint32_t rambase = sc->sc_chip ? sc->sc_chip->rambase :
-		    BRCM_PCI_RAMBASE_43602;
+		    BWFM_PCI_RAMBASE_43602;
 		trailer = ((uint32_t)inv << 16) | dwords;
 		bus_space_write_4(sc->sc_bar2_t, sc->sc_bar2_h,
 		    rambase + ramsize - 4, trailer);
@@ -1615,13 +1615,13 @@ brcm_pci_nvram_inject(struct brcm_pci_softc *sc)
  *   3. poll RESET_CTL writing 0 until clear
  *   4. final IOCTL = CLK only
  *
- * brcm_pci_bringup_sequence calls it as step 5, before
+ * bwfm_pci_bringup_sequence calls it as step 5, before
  * load_firmware, and skips the post-upload step 7.  That differs
  * from Linux, which runs this same resetcore on 43602 after the
  * upload, in brcmf_pcie_exit_download_state.
  */
 static int
-brcm_pci_exit_download_state(struct brcm_pci_softc *sc)
+bwfm_pci_exit_download_state(struct bwfm_pci_softc *sc)
 {
 	uint32_t wrap = 0;
 	uint32_t v;
@@ -1631,7 +1631,7 @@ brcm_pci_exit_download_state(struct brcm_pci_softc *sc)
 		return (ENXIO);
 
 	for (i = 0; i < sc->sc_ncores; i++) {
-		if (sc->sc_cores[i].id == BRCM_CORE_SOCRAM) {
+		if (sc->sc_cores[i].id == BWFM_CORE_SOCRAM) {
 			wrap = sc->sc_cores[i].wrap;
 			break;
 		}
@@ -1642,26 +1642,26 @@ brcm_pci_exit_download_state(struct brcm_pci_softc *sc)
 		return (ENOENT);
 	}
 
-	brcm_pci_set_window(sc, wrap);
+	bwfm_pci_set_window(sc, wrap);
 
 	/* 1. Pre-reset IOCTL = 0 | FGC | CLK. */
 	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_IOCTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK,
-	    BRCM_BCMA_IOCTL_FGC | BRCM_BCMA_IOCTL_CLK);
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK,
+	    BWFM_BCMA_IOCTL_FGC | BWFM_BCMA_IOCTL_CLK);
 	(void)bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_IOCTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK);
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
 
 	/* 2. Put in reset. */
 	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_RESET_CTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK,
-	    BRCM_BCMA_RESET_CTL_RESET);
+	    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK,
+	    BWFM_BCMA_RESET_CTL_RESET);
 	DELAY(20);
 
 	/* 3. Spin until RESET_CTL reads back as 1. */
 	count = 0;
 	while ((bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_RESET_CTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK) &
-	    BRCM_BCMA_RESET_CTL_RESET) == 0) {
+	    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK) &
+	    BWFM_BCMA_RESET_CTL_RESET) == 0) {
 		if (++count > 300)
 			break;
 		DELAY(10);
@@ -1669,18 +1669,18 @@ brcm_pci_exit_download_state(struct brcm_pci_softc *sc)
 
 	/* 4. In-reset configure: IOCTL = FGC|CLK (reset field is 0). */
 	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_IOCTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK,
-	    BRCM_BCMA_IOCTL_FGC | BRCM_BCMA_IOCTL_CLK);
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK,
+	    BWFM_BCMA_IOCTL_FGC | BWFM_BCMA_IOCTL_CLK);
 	(void)bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_IOCTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK);
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
 
 	/* 5. Release reset — poll writing 0. */
 	count = 0;
 	while ((bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_RESET_CTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK) &
-	    BRCM_BCMA_RESET_CTL_RESET) != 0) {
+	    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK) &
+	    BWFM_BCMA_RESET_CTL_RESET) != 0) {
 		bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
-		    BRCM_BCMA_RESET_CTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK, 0);
+		    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK, 0);
 		if (++count > 50)
 			break;
 		DELAY(50);
@@ -1688,10 +1688,10 @@ brcm_pci_exit_download_state(struct brcm_pci_softc *sc)
 
 	/* 6. Postreset: IOCTL = CLK only. */
 	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_IOCTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK,
-	    BRCM_BCMA_IOCTL_CLK);
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK,
+	    BWFM_BCMA_IOCTL_CLK);
 	v = bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_BCMA_IOCTL & BRCM_PCI_BAR0_WINDOW_OFF_MASK);
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
 
 	PDPRINTF(sc, 0,
 	    "exit_download_state: SOCRAM resetcore complete (IOCTL=0x%08x)\n",
@@ -1780,17 +1780,17 @@ static const uint8_t bcm43602_res_pciewar[192] = {
 };
 
 static inline uint32_t
-brcm_pci_pmu_read(struct brcm_pci_softc *sc, uint32_t off)
+bwfm_pci_pmu_read(struct bwfm_pci_softc *sc, uint32_t off)
 {
 	return (bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    off & BRCM_PCI_BAR0_WINDOW_OFF_MASK));
+	    off & BWFM_PCI_BAR0_WINDOW_OFF_MASK));
 }
 
 static inline void
-brcm_pci_pmu_write(struct brcm_pci_softc *sc, uint32_t off, uint32_t val)
+bwfm_pci_pmu_write(struct bwfm_pci_softc *sc, uint32_t off, uint32_t val)
 {
 	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    off & BRCM_PCI_BAR0_WINDOW_OFF_MASK, val);
+	    off & BWFM_PCI_BAR0_WINDOW_OFF_MASK, val);
 }
 
 /*
@@ -1802,7 +1802,7 @@ brcm_pci_pmu_write(struct brcm_pci_softc *sc, uint32_t off, uint32_t val)
  *   3 = SET   (replace deps)
  */
 static void
-brcm_pci_pmu_dep_apply(struct brcm_pci_softc *sc, const char *tag,
+bwfm_pci_pmu_dep_apply(struct bwfm_pci_softc *sc, const char *tag,
     int idx, uint32_t res_mask, uint32_t action, uint32_t dep_mask)
 {
 	uint32_t cur, new;
@@ -1816,15 +1816,15 @@ brcm_pci_pmu_dep_apply(struct brcm_pci_softc *sc, const char *tag,
 	for (bit = 0; bit < 32; bit++) {
 		if ((res_mask & (1u << bit)) == 0)
 			continue;
-		brcm_pci_pmu_write(sc, BRCM_CC_PMU_RES_TABLE_SEL, bit);
-		cur = brcm_pci_pmu_read(sc, BRCM_CC_PMU_RES_DEP_MASK);
+		bwfm_pci_pmu_write(sc, BWFM_CC_PMU_RES_TABLE_SEL, bit);
+		cur = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_RES_DEP_MASK);
 		switch (action) {
 		case 1:  new = cur | dep_mask; break;
 		case 2:  new = cur & ~dep_mask; break;
 		case 3:  new = dep_mask; break;
 		default: new = cur; break;
 		}
-		brcm_pci_pmu_write(sc, BRCM_CC_PMU_RES_DEP_MASK, new);
+		bwfm_pci_pmu_write(sc, BWFM_CC_PMU_RES_DEP_MASK, new);
 		PDPRINTF(sc, 0,
 		    "pmu_init: %s[%d] res %2d: DEP 0x%08x -> 0x%08x\n",
 		    tag, idx, bit, cur, new);
@@ -1838,7 +1838,7 @@ brcm_pci_pmu_dep_apply(struct brcm_pci_softc *sc, const char *tag,
  * what the firmware's PA init assumes.
  */
 static int
-brcm_pci_pmu_init_43602(struct brcm_pci_softc *sc)
+bwfm_pci_pmu_init_43602(struct bwfm_pci_softc *sc)
 {
 	uint32_t cc_base = 0;
 	uint32_t reg, val, res_mask, action, dep_mask, updn;
@@ -1847,7 +1847,7 @@ brcm_pci_pmu_init_43602(struct brcm_pci_softc *sc)
 	int i;
 
 	for (i = 0; i < sc->sc_ncores; i++) {
-		if (sc->sc_cores[i].id == BRCM_CORE_CHIPCOMMON) {
+		if (sc->sc_cores[i].id == BWFM_CORE_CHIPCOMMON) {
 			cc_base = sc->sc_cores[i].base;
 			break;
 		}
@@ -1860,14 +1860,14 @@ brcm_pci_pmu_init_43602(struct brcm_pci_softc *sc)
 	if (!sc->sc_chip_alive)
 		return (ENXIO);
 
-	brcm_pci_set_window(sc, cc_base);
+	bwfm_pci_set_window(sc, cc_base);
 
-	reg = brcm_pci_pmu_read(sc, BRCM_CC_PMU_CAP);
+	reg = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_CAP);
 	PDPRINTF(sc, 0,
 	    "pmu_init: pmucap=0x%08x pmurev=%u num_res=%u\n",
 	    reg, reg & 0xff, (reg >> 8) & 0xff);
-	reg = brcm_pci_pmu_read(sc, BRCM_CC_PMU_MIN_RES_MASK);
-	val = brcm_pci_pmu_read(sc, BRCM_CC_PMU_MAX_RES_MASK);
+	reg = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_MIN_RES_MASK);
+	val = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_MAX_RES_MASK);
 	PDPRINTF(sc, 0,
 	    "pmu_init: min_res_mask=0x%08x max_res_mask=0x%08x (before)\n",
 	    reg, val);
@@ -1882,8 +1882,8 @@ brcm_pci_pmu_init_43602(struct brcm_pci_softc *sc)
 		PDPRINTF(sc, 0,
 		    "pmu_init: updown[%d] res %u updn=0x%08x\n",
 		    i, resnum, updn);
-		brcm_pci_pmu_write(sc, BRCM_CC_PMU_RES_TABLE_SEL, resnum);
-		brcm_pci_pmu_write(sc, BRCM_CC_PMU_RES_UPDN_TIMER, updn);
+		bwfm_pci_pmu_write(sc, BWFM_CC_PMU_RES_TABLE_SEL, resnum);
+		bwfm_pci_pmu_write(sc, BWFM_CC_PMU_RES_UPDN_TIMER, updn);
 	}
 
 	/* res_depend: 4 entries × 24 B. */
@@ -1892,7 +1892,7 @@ brcm_pci_pmu_init_43602(struct brcm_pci_softc *sc)
 		res_mask = e[0] | (e[1] << 8) | (e[2] << 16) | (e[3] << 24);
 		action   = e[4] | (e[5] << 8) | (e[6] << 16) | (e[7] << 24);
 		dep_mask = e[8] | (e[9] << 8) | (e[10] << 16) | (e[11] << 24);
-		brcm_pci_pmu_dep_apply(sc, "depend", i, res_mask, action,
+		bwfm_pci_pmu_dep_apply(sc, "depend", i, res_mask, action,
 		    dep_mask);
 	}
 
@@ -1902,18 +1902,18 @@ brcm_pci_pmu_init_43602(struct brcm_pci_softc *sc)
 		res_mask = e[0] | (e[1] << 8) | (e[2] << 16) | (e[3] << 24);
 		action   = e[4] | (e[5] << 8) | (e[6] << 16) | (e[7] << 24);
 		dep_mask = e[8] | (e[9] << 8) | (e[10] << 16) | (e[11] << 24);
-		brcm_pci_pmu_dep_apply(sc, "pciewar", i, res_mask, action,
+		bwfm_pci_pmu_dep_apply(sc, "pciewar", i, res_mask, action,
 		    dep_mask);
 	}
 
 	DELAY(1000);
 
-	reg = brcm_pci_pmu_read(sc, BRCM_CC_PMU_MIN_RES_MASK);
-	val = brcm_pci_pmu_read(sc, BRCM_CC_PMU_MAX_RES_MASK);
+	reg = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_MIN_RES_MASK);
+	val = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_MAX_RES_MASK);
 	PDPRINTF(sc, 0,
 	    "pmu_init: min_res_mask=0x%08x max_res_mask=0x%08x (after)\n",
 	    reg, val);
-	reg = brcm_pci_pmu_read(sc, BRCM_CC_PMU_RES_STATE);
+	reg = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_RES_STATE);
 	PDPRINTF(sc, 0,
 	    "pmu_init: res_state=0x%08x (after)\n", reg);
 
@@ -1936,7 +1936,7 @@ brcm_pci_pmu_init_43602(struct brcm_pci_softc *sc)
  * 8 pciewar entries).
  */
 static int
-brcm_pci_pmu_init_4360(struct brcm_pci_softc *sc)
+bwfm_pci_pmu_init_4360(struct bwfm_pci_softc *sc)
 {
 	uint32_t cc_base = 0;
 	uint32_t reg, val;
@@ -1944,7 +1944,7 @@ brcm_pci_pmu_init_4360(struct brcm_pci_softc *sc)
 	int i;
 
 	for (i = 0; i < sc->sc_ncores; i++) {
-		if (sc->sc_cores[i].id == BRCM_CORE_CHIPCOMMON) {
+		if (sc->sc_cores[i].id == BWFM_CORE_CHIPCOMMON) {
 			cc_base = sc->sc_cores[i].base;
 			break;
 		}
@@ -1957,14 +1957,14 @@ brcm_pci_pmu_init_4360(struct brcm_pci_softc *sc)
 	if (!sc->sc_chip_alive)
 		return (ENXIO);
 
-	brcm_pci_set_window(sc, cc_base);
+	bwfm_pci_set_window(sc, cc_base);
 
 	uint32_t max_res, min_res;
 
-	reg = brcm_pci_pmu_read(sc, BRCM_CC_PMU_CAP);
-	min_res = brcm_pci_pmu_read(sc, BRCM_CC_PMU_MIN_RES_MASK);
-	max_res = brcm_pci_pmu_read(sc, BRCM_CC_PMU_MAX_RES_MASK);
-	val = brcm_pci_pmu_read(sc, BRCM_CC_PMU_RES_STATE);
+	reg = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_CAP);
+	min_res = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_MIN_RES_MASK);
+	max_res = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_MAX_RES_MASK);
+	val = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_RES_STATE);
 	PDPRINTF(sc, 0,
 	    "pmu_init_4360: CAP=0x%08x MIN_RES=0x%08x MAX_RES=0x%08x "
 	    "STATE=0x%08x (chiprev=%u)\n",
@@ -1979,8 +1979,8 @@ brcm_pci_pmu_init_4360(struct brcm_pci_softc *sc)
 	 */
 #define PMU_MAYBE_UPDN(resnum, updn) do {				\
 	if (max_res & (1u << (resnum))) {				\
-		brcm_pci_pmu_write(sc, BRCM_CC_PMU_RES_TABLE_SEL, (resnum)); \
-		brcm_pci_pmu_write(sc, BRCM_CC_PMU_RES_UPDN_TIMER, (updn)); \
+		bwfm_pci_pmu_write(sc, BWFM_CC_PMU_RES_TABLE_SEL, (resnum)); \
+		bwfm_pci_pmu_write(sc, BWFM_CC_PMU_RES_UPDN_TIMER, (updn)); \
 		PDPRINTF(sc, 0,						\
 		    "pmu_init_4360: updown res %u = 0x%08x\n",		\
 		    (resnum), (updn));					\
@@ -1993,8 +1993,8 @@ brcm_pci_pmu_init_4360(struct brcm_pci_softc *sc)
 
 #define PMU_MAYBE_DEP(resnum, dep) do {					\
 	if (max_res & (1u << (resnum))) {				\
-		brcm_pci_pmu_write(sc, BRCM_CC_PMU_RES_TABLE_SEL, (resnum)); \
-		brcm_pci_pmu_write(sc, BRCM_CC_PMU_RES_DEP_MASK, (dep));	\
+		bwfm_pci_pmu_write(sc, BWFM_CC_PMU_RES_TABLE_SEL, (resnum)); \
+		bwfm_pci_pmu_write(sc, BWFM_CC_PMU_RES_DEP_MASK, (dep));	\
 		PDPRINTF(sc, 0,						\
 		    "pmu_init_4360: dep res %u = 0x%08x\n",		\
 		    (resnum), (dep));					\
@@ -2018,9 +2018,9 @@ brcm_pci_pmu_init_4360(struct brcm_pci_softc *sc)
 
 	DELAY(1000);
 
-	min_res = brcm_pci_pmu_read(sc, BRCM_CC_PMU_MIN_RES_MASK);
-	max_res = brcm_pci_pmu_read(sc, BRCM_CC_PMU_MAX_RES_MASK);
-	val = brcm_pci_pmu_read(sc, BRCM_CC_PMU_RES_STATE);
+	min_res = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_MIN_RES_MASK);
+	max_res = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_MAX_RES_MASK);
+	val = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_RES_STATE);
 	PDPRINTF(sc, 0,
 	    "pmu_init_4360: MIN_RES=0x%08x MAX_RES=0x%08x STATE=0x%08x (after)\n",
 	    min_res, max_res, val);
@@ -2043,7 +2043,7 @@ brcm_pci_pmu_init_4360(struct brcm_pci_softc *sc)
  * A dummy read of ADDR barriers the index write.
  */
 static int
-brcm_pci_pll_init_43602(struct brcm_pci_softc *sc)
+bwfm_pci_pll_init_43602(struct bwfm_pci_softc *sc)
 {
 	static const struct { uint32_t idx; uint32_t val; } pll_writes[] = {
 		{ 2, 0x00000c31 },   /* PLL_CNTRL_ADDR2 */
@@ -2053,7 +2053,7 @@ brcm_pci_pll_init_43602(struct brcm_pci_softc *sc)
 	int i;
 
 	for (i = 0; i < sc->sc_ncores; i++) {
-		if (sc->sc_cores[i].id == BRCM_CORE_CHIPCOMMON) {
+		if (sc->sc_cores[i].id == BWFM_CORE_CHIPCOMMON) {
 			cc_base = sc->sc_cores[i].base;
 			break;
 		}
@@ -2066,19 +2066,19 @@ brcm_pci_pll_init_43602(struct brcm_pci_softc *sc)
 	if (!sc->sc_chip_alive)
 		return (ENXIO);
 
-	brcm_pci_set_window(sc, cc_base);
+	bwfm_pci_set_window(sc, cc_base);
 
 	for (i = 0; i < (int)nitems(pll_writes); i++) {
-		brcm_pci_pmu_write(sc, BRCM_CC_PMU_PLLCONTROL_ADDR,
+		bwfm_pci_pmu_write(sc, BWFM_CC_PMU_PLLCONTROL_ADDR,
 		    pll_writes[i].idx);
-		(void)brcm_pci_pmu_read(sc, BRCM_CC_PMU_PLLCONTROL_ADDR);
-		brcm_pci_pmu_write(sc, BRCM_CC_PMU_PLLCONTROL_DATA,
+		(void)bwfm_pci_pmu_read(sc, BWFM_CC_PMU_PLLCONTROL_ADDR);
+		bwfm_pci_pmu_write(sc, BWFM_CC_PMU_PLLCONTROL_DATA,
 		    pll_writes[i].val);
 		/* Read back for logging: re-select, then read data. */
-		brcm_pci_pmu_write(sc, BRCM_CC_PMU_PLLCONTROL_ADDR,
+		bwfm_pci_pmu_write(sc, BWFM_CC_PMU_PLLCONTROL_ADDR,
 		    pll_writes[i].idx);
-		(void)brcm_pci_pmu_read(sc, BRCM_CC_PMU_PLLCONTROL_ADDR);
-		readback = brcm_pci_pmu_read(sc, BRCM_CC_PMU_PLLCONTROL_DATA);
+		(void)bwfm_pci_pmu_read(sc, BWFM_CC_PMU_PLLCONTROL_ADDR);
+		readback = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_PLLCONTROL_DATA);
 		PDPRINTF(sc, 0,
 		    "pll_init: PLLCONTROL[%u] wrote 0x%08x, readback 0x%08x\n",
 		    pll_writes[i].idx, pll_writes[i].val, readback);
@@ -2092,13 +2092,13 @@ brcm_pci_pll_init_43602(struct brcm_pci_softc *sc)
 	 * its previous programming.
 	 */
 	{
-		uint32_t pmu_ctl = brcm_pci_pmu_read(sc, BRCM_CC_PMU_CTRL);
+		uint32_t pmu_ctl = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_CTRL);
 		PDPRINTF(sc, 0,
 		    "pll_init: PMU_CTL before = 0x%08x\n", pmu_ctl);
-		brcm_pci_pmu_write(sc, BRCM_CC_PMU_CTRL, pmu_ctl | 0x400);
-		(void)brcm_pci_pmu_read(sc, BRCM_CC_PMU_CTRL);
+		bwfm_pci_pmu_write(sc, BWFM_CC_PMU_CTRL, pmu_ctl | 0x400);
+		(void)bwfm_pci_pmu_read(sc, BWFM_CC_PMU_CTRL);
 		DELAY(100);
-		readback = brcm_pci_pmu_read(sc, BRCM_CC_PMU_CTRL);
+		readback = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_CTRL);
 		PDPRINTF(sc, 0,
 		    "pll_init: PMU_CTL after |= 0x400 = 0x%08x (self-clears)\n",
 		    readback);
@@ -2125,7 +2125,7 @@ brcm_pci_pll_init_43602(struct brcm_pci_softc *sc)
  *     reverts to its post-reset default and needs to be re-sized.
  */
 static int
-brcm_pci_chip_reset(struct brcm_pci_softc *sc)
+bwfm_pci_chip_reset(struct bwfm_pci_softc *sc)
 {
 	device_t dev = sc->sc_dev;
 	int pcie_cap;
@@ -2144,11 +2144,11 @@ brcm_pci_chip_reset(struct brcm_pci_softc *sc)
 	 * below is posted so it cannot wedge, but a later BAR0 read can if
 	 * the backplane clock is off.
 	 */
-	if (!brcm_pci_chip_alive_cfg(sc))
+	if (!bwfm_pci_chip_alive_cfg(sc))
 		return (ENXIO);
 
 	for (i = 0; i < sc->sc_ncores; i++) {
-		if (sc->sc_cores[i].id == BRCM_CORE_CHIPCOMMON) {
+		if (sc->sc_cores[i].id == BWFM_CORE_CHIPCOMMON) {
 			cc_base = sc->sc_cores[i].base;
 			break;
 		}
@@ -2156,11 +2156,11 @@ brcm_pci_chip_reset(struct brcm_pci_softc *sc)
 	/*
 	 * Before core_walk has run (chip_reset needs cc_base, core_walk
 	 * needs the warm chip chip_reset provides), fall back to
-	 * BRCM_BACKPLANE_CHIPCOMMON (0x18000000), where every BCM43xx PCIe
+	 * BWFM_BACKPLANE_CHIPCOMMON (0x18000000), where every BCM43xx PCIe
 	 * part places ChipCommon.
 	 */
 	if (cc_base == 0)
-		cc_base = BRCM_BACKPLANE_CHIPCOMMON;
+		cc_base = BWFM_BACKPLANE_CHIPCOMMON;
 
 	if (cc_base == 0) {
 		device_printf(dev,
@@ -2181,10 +2181,10 @@ brcm_pci_chip_reset(struct brcm_pci_softc *sc)
 	/* Watchdog: fire in 4 ticks. */
 	PDPRINTF(sc, 0,
 	    "chip_reset: writing 4 to ChipCommon.watchdog @0x%08x\n",
-	    cc_base + BRCM_CC_REG_WATCHDOG);
-	brcm_pci_set_window(sc, cc_base);
+	    cc_base + BWFM_CC_REG_WATCHDOG);
+	bwfm_pci_set_window(sc, cc_base);
 	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_CC_REG_WATCHDOG & BRCM_PCI_BAR0_WINDOW_OFF_MASK, 4);
+	    BWFM_CC_REG_WATCHDOG & BWFM_PCI_BAR0_WINDOW_OFF_MASK, 4);
 
 	/* Let the chip reset + come back. */
 	DELAY(100000);	/* 100 ms */
@@ -2201,10 +2201,10 @@ brcm_pci_chip_reset(struct brcm_pci_softc *sc)
 	return (0);
 }
 
-/* Defined later, called from brcm_pci_bringup_sequence(). */
-static int brcm_pci_enter_download_state(struct brcm_pci_softc *sc);
-static int brcm_pci_enter_download_state_generic(struct brcm_pci_softc *sc);
-static int brcm_pci_load_firmware(struct brcm_pci_softc *sc);
+/* Defined later, called from bwfm_pci_bringup_sequence(). */
+static int bwfm_pci_enter_download_state(struct bwfm_pci_softc *sc);
+static int bwfm_pci_enter_download_state_generic(struct bwfm_pci_softc *sc);
+static int bwfm_pci_load_firmware(struct bwfm_pci_softc *sc);
 
 /*
  * Poll TCM[ramsize - 4] for the FW-ready sentinel.  Firmware writes
@@ -2215,12 +2215,12 @@ static int brcm_pci_load_firmware(struct brcm_pci_softc *sc);
  * ETIMEDOUT if the sentinel stays 0 after `timeout_ms`.
  */
 static int
-brcm_pci_wait_fw_ready(struct brcm_pci_softc *sc, uint32_t ramsize,
+bwfm_pci_wait_fw_ready(struct bwfm_pci_softc *sc, uint32_t ramsize,
     int timeout_ms)
 {
 	uint32_t sharedram_addr;
 	uint32_t rambase = sc->sc_chip ? sc->sc_chip->rambase :
-	    BRCM_PCI_RAMBASE_43602;
+	    BWFM_PCI_RAMBASE_43602;
 	int i, iters = timeout_ms / 50;
 
 	for (i = 0; i < iters; i++) {
@@ -2254,7 +2254,7 @@ brcm_pci_wait_fw_ready(struct brcm_pci_softc *sc, uint32_t ramsize,
 /*
  * Chip bring-up, run by the autostart thread or by
  *
- *     sysctl dev.brcm_pci.0.bringup=1
+ *     sysctl dev.bwfm_pci.0.bringup=1
  *
  * With debug output on, each step logs "STARTING" and "DONE", so if a
  * step wedges the machine the last STARTING line names it.
@@ -2273,7 +2273,7 @@ brcm_pci_wait_fw_ready(struct brcm_pci_softc *sc, uint32_t ramsize,
  *  10. wait_fw_ready, polling the ramsize-4 sentinel (5s)
  */
 static int
-brcm_pci_bringup_sequence(struct brcm_pci_softc *sc)
+bwfm_pci_bringup_sequence(struct bwfm_pci_softc *sc)
 {
 	device_t dev = sc->sc_dev;
 	uint32_t ramsize = 0;
@@ -2283,13 +2283,13 @@ brcm_pci_bringup_sequence(struct brcm_pci_softc *sc)
 	 * Per-chip gate.  Bring-up is implemented only for the BCM43602;
 	 * running the 43602-specific PMU init, PLL init and SOCRAM bank
 	 * power-up on other chip families wedges the backplane, so refuse
-	 * early.  The brcm_pci_chip_table comments say what each chip
+	 * early.  The bwfm_pci_chip_table comments say what each chip
 	 * needs before bringup_supported can be set.
 	 */
 	if (sc->sc_chip == NULL || !sc->sc_chip->bringup_supported) {
 		device_printf(dev,
 		    "bringup: refusing - chip devid 0x%04x %s.  "
-		    "See brcm_pci_chip_table in if_brcm_pci.c for what to "
+		    "See bwfm_pci_chip_table in if_bwfm_pci.c for what to "
 		    "implement to enable this chip.\n",
 		    sc->sc_devid,
 		    sc->sc_chip ? sc->sc_chip->notes : "unknown");
@@ -2319,7 +2319,7 @@ brcm_pci_bringup_sequence(struct brcm_pci_softc *sc)
 	 * while config space is served by the root complex and always
 	 * returns.
 	 */
-	if (!brcm_pci_chip_alive_cfg(sc)) {
+	if (!bwfm_pci_chip_alive_cfg(sc)) {
 		device_printf(dev,
 		    "bringup: refusing - PCIe cfg-space says chip is absent "
 		    "or link is down.\n");
@@ -2348,32 +2348,32 @@ brcm_pci_bringup_sequence(struct brcm_pci_softc *sc)
 		    "non-deterministic on bare metal)\n");
 	} else {
 		BRINGUP_STEP(1, "chip_reset (watchdog + ASPM cycle)",
-		    brcm_pci_chip_reset(sc));
+		    bwfm_pci_chip_reset(sc));
 	}
-	BRINGUP_STEP(2, "core_walk (EROM)", brcm_pci_walk_cores(sc));
+	BRINGUP_STEP(2, "core_walk (EROM)", bwfm_pci_walk_cores(sc));
 	/* pcie2cfg_restore is only needed after chip_reset, also skipped. */
 	PDPRINTF(sc, 0, "bringup: step 3 pcie2cfg_restore SKIPPED\n");
 
-	if (sc->sc_devid == BRCM_PCI_DEVICE_BCM43602) {
+	if (sc->sc_devid == BWFM_PCI_DEVICE_BCM43602) {
 		/*
 		 * PMU init: Apple's resource-dependency and up/down timer
 		 * tables for the BCM43602.  Must happen before firmware
 		 * upload; the firmware's PA init assumes it.
 		 */
 		BRINGUP_STEP(4, "pmu_init_43602 (Apple PMU tables)",
-		    brcm_pci_pmu_init_43602(sc));
+		    bwfm_pci_pmu_init_43602(sc));
 		/* Apple's board-specific PLL calibration constants. */
 		BRINGUP_STEP(4, "pll_init_43602 (Apple PLL calibration)",
-		    brcm_pci_pll_init_43602(sc));
-	} else if (sc->sc_devid == BRCM_PCI_DEVICE_BCM4360 ||
-	    sc->sc_devid == BRCM_PCI_DEVICE_BCM4360_2) {
+		    bwfm_pci_pll_init_43602(sc));
+	} else if (sc->sc_devid == BWFM_PCI_DEVICE_BCM4360 ||
+	    sc->sc_devid == BWFM_PCI_DEVICE_BCM4360_2) {
 		/*
 		 * BCM4360 has its own PMU init (from Apple's older
 		 * AirPortBrcm4360.kext): one res_updown entry and two
 		 * pciewar dep_mask writes.
 		 */
 		BRINGUP_STEP(4, "pmu_init_4360 (Apple 4360 PMU)",
-		    brcm_pci_pmu_init_4360(sc));
+		    bwfm_pci_pmu_init_4360(sc));
 		PDPRINTF(sc, 0,
 		    "bringup: step 4 pll_init SKIPPED (4360 uses chip "
 		    "defaults per Apple decomp)\n");
@@ -2387,20 +2387,20 @@ brcm_pci_bringup_sequence(struct brcm_pci_softc *sc)
 		    "(no chip-specific tables ported)\n");
 	}
 
-	BRINGUP_STEP(4, "ramsize_query", brcm_pci_ramsize_query(sc, &ramsize));
+	BRINGUP_STEP(4, "ramsize_query", bwfm_pci_ramsize_query(sc, &ramsize));
 	sc->sc_fw_ramsize = ramsize;
 	PDPRINTF(sc, 0, "bringup: TCM ramsize=0x%x (cached)\n", ramsize);
 
-	if (sc->sc_devid == BRCM_PCI_DEVICE_BCM43602) {
+	if (sc->sc_devid == BWFM_PCI_DEVICE_BCM43602) {
 		BRINGUP_STEP(5, "enter_download_state (BANKIDX 5,7 zero)",
-		    brcm_pci_enter_download_state(sc));
+		    bwfm_pci_enter_download_state(sc));
 		/*
 		 * SOCRAM sysmemReset before firmware upload: Apple's
 		 * loadChipImage runs the SYSMEM wrapper reset cycle here,
 		 * not after the copy.
 		 */
 		BRINGUP_STEP(5, "sysmem_reset_pre (SOCRAM resetcore)",
-		    brcm_pci_exit_download_state(sc));
+		    bwfm_pci_exit_download_state(sc));
 	} else {
 		/*
 		 * Generic download-state entry: enable the chip's memory
@@ -2409,10 +2409,10 @@ brcm_pci_bringup_sequence(struct brcm_pci_softc *sc)
 		 * specific.
 		 */
 		BRINGUP_STEP(5, "enter_download_state_generic",
-		    brcm_pci_enter_download_state_generic(sc));
+		    bwfm_pci_enter_download_state_generic(sc));
 	}
 
-	BRINGUP_STEP(6, "load_firmware", brcm_pci_load_firmware(sc));
+	BRINGUP_STEP(6, "load_firmware", bwfm_pci_load_firmware(sc));
 	/*
 	 * Step 7 exit_download_state is omitted: SOCRAM RESET_CTL=1 after
 	 * the upload can wipe TCM on some 43602 silicon revisions.
@@ -2424,13 +2424,13 @@ brcm_pci_bringup_sequence(struct brcm_pci_softc *sc)
 	 */
 	PDPRINTF(sc, 0, "bringup: step 7 exit_download_state SKIPPED "
 	    "(post-fw SOCRAM reset destroys TCM contents)\n");
-	BRINGUP_STEP(8, "nvram_inject", brcm_pci_nvram_inject(sc));
+	BRINGUP_STEP(8, "nvram_inject", bwfm_pci_nvram_inject(sc));
 	/* cold_reattach turns bus mastering off; the firmware needs it. */
 	pci_enable_busmaster(dev);
 	BRINGUP_STEP(9, "armcr4_release (CPUHALT off)",
-	    brcm_pci_armcr4_release(sc));
+	    bwfm_pci_armcr4_release(sc));
 	BRINGUP_STEP(10, "wait_fw_ready (poll TCM[ramsize-4])",
-	    brcm_pci_wait_fw_ready(sc, ramsize, 5000));
+	    bwfm_pci_wait_fw_ready(sc, ramsize, 5000));
 
 #undef BRINGUP_STEP
 
@@ -2441,16 +2441,16 @@ brcm_pci_bringup_sequence(struct brcm_pci_softc *sc)
 fail:
 	device_printf(dev,
 	    "bringup: FAILED rc=%d.  Chip may be in partial state; "
-	    "use dev.brcm_pci.%d.err_dump=1 to inspect.\n",
+	    "use dev.bwfm_pci.%d.err_dump=1 to inspect.\n",
 	    rc, device_get_unit(dev));
 	sc->sc_chip_alive = false;
 	return (rc);
 }
 
 static int
-brcm_pci_sysctl_bringup(SYSCTL_HANDLER_ARGS)
+bwfm_pci_sysctl_bringup(SYSCTL_HANDLER_ARGS)
 {
-	struct brcm_pci_softc *sc = arg1;
+	struct bwfm_pci_softc *sc = arg1;
 	int trig = 0, error;
 
 	error = sysctl_handle_int(oidp, &trig, 0, req);
@@ -2465,13 +2465,13 @@ brcm_pci_sysctl_bringup(SYSCTL_HANDLER_ARGS)
 		    "bringup: firmware already running; not uploading again\n");
 		return (EALREADY);
 	}
-	return (brcm_pci_bringup_sequence(sc));
+	return (bwfm_pci_bringup_sequence(sc));
 }
 
 static int
-brcm_pci_sysctl_chip_alive(SYSCTL_HANDLER_ARGS)
+bwfm_pci_sysctl_chip_alive(SYSCTL_HANDLER_ARGS)
 {
-	struct brcm_pci_softc *sc = arg1;
+	struct bwfm_pci_softc *sc = arg1;
 	int trig = 0, error;
 
 	error = sysctl_handle_int(oidp, &trig, 0, req);
@@ -2479,7 +2479,7 @@ brcm_pci_sysctl_chip_alive(SYSCTL_HANDLER_ARGS)
 		return (error);
 	if (trig == 0)
 		return (0);
-	return (brcm_pci_chip_alive_cfg(sc) ? 0 : ENXIO);
+	return (bwfm_pci_chip_alive_cfg(sc) ? 0 : ENXIO);
 }
 
 /*
@@ -2493,13 +2493,13 @@ brcm_pci_sysctl_chip_alive(SYSCTL_HANDLER_ARGS)
  * disables PDA gating.
  */
 static int
-brcm_pci_enter_download_state(struct brcm_pci_softc *sc)
+bwfm_pci_enter_download_state(struct bwfm_pci_softc *sc)
 {
 	uint32_t cr4_base = 0;
 	int i, rc;
 
 	for (i = 0; i < sc->sc_ncores; i++) {
-		if (sc->sc_cores[i].id == BRCM_CORE_ARM_CR4) {
+		if (sc->sc_cores[i].id == BWFM_CORE_ARM_CR4) {
 			cr4_base = sc->sc_cores[i].base;
 			break;
 		}
@@ -2516,14 +2516,14 @@ brcm_pci_enter_download_state(struct brcm_pci_softc *sc)
 	 * or the backplane routes the transactions nowhere.  SOCRAM for
 	 * the TCM writes; ARM-CR4 halted so BANKIDX/BANKPDA are reachable.
 	 */
-	rc = brcm_pci_core_enable(sc, BRCM_CORE_SOCRAM, 0);
+	rc = bwfm_pci_core_enable(sc, BWFM_CORE_SOCRAM, 0);
 	if (rc != 0) {
 		device_printf(sc->sc_dev,
 		    "enter_download: SOCRAM core_enable failed rc=%d\n", rc);
 		return (rc);
 	}
-	rc = brcm_pci_core_enable(sc, BRCM_CORE_ARM_CR4,
-	    BRCM_ARMCR4_IOCTL_CPUHALT);
+	rc = bwfm_pci_core_enable(sc, BWFM_CORE_ARM_CR4,
+	    BWFM_ARMCR4_IOCTL_CPUHALT);
 	if (rc != 0) {
 		device_printf(sc->sc_dev,
 		    "enter_download: ARM-CR4 core_enable(halted) failed rc=%d\n",
@@ -2532,17 +2532,17 @@ brcm_pci_enter_download_state(struct brcm_pci_softc *sc)
 	}
 
 	/* Bank 5: clear PDA. */
-	brcm_pci_set_window(sc, cr4_base);
+	bwfm_pci_set_window(sc, cr4_base);
 	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_ARMCR4_BANKIDX & BRCM_PCI_BAR0_WINDOW_OFF_MASK, 5);
+	    BWFM_ARMCR4_BANKIDX & BWFM_PCI_BAR0_WINDOW_OFF_MASK, 5);
 	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_ARMCR4_BANKPDA & BRCM_PCI_BAR0_WINDOW_OFF_MASK, 0);
+	    BWFM_ARMCR4_BANKPDA & BWFM_PCI_BAR0_WINDOW_OFF_MASK, 0);
 
 	/* Bank 7: clear PDA. */
 	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_ARMCR4_BANKIDX & BRCM_PCI_BAR0_WINDOW_OFF_MASK, 7);
+	    BWFM_ARMCR4_BANKIDX & BWFM_PCI_BAR0_WINDOW_OFF_MASK, 7);
 	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
-	    BRCM_ARMCR4_BANKPDA & BRCM_PCI_BAR0_WINDOW_OFF_MASK, 0);
+	    BWFM_ARMCR4_BANKPDA & BWFM_PCI_BAR0_WINDOW_OFF_MASK, 0);
 
 	PDPRINTF(sc, 0,
 	    "enter_download: SOCRAM+ARM-CR4 clocks on; banks 5,7 powered up "
@@ -2560,7 +2560,7 @@ brcm_pci_enter_download_state(struct brcm_pci_softc *sc)
  * Uses sc->sc_chip->mem_core for the memory core ID.
  */
 static int
-brcm_pci_enter_download_state_generic(struct brcm_pci_softc *sc)
+bwfm_pci_enter_download_state_generic(struct bwfm_pci_softc *sc)
 {
 	int rc;
 
@@ -2570,15 +2570,15 @@ brcm_pci_enter_download_state_generic(struct brcm_pci_softc *sc)
 		return (ENXIO);
 	}
 
-	rc = brcm_pci_core_enable(sc, sc->sc_chip->mem_core, 0);
+	rc = bwfm_pci_core_enable(sc, sc->sc_chip->mem_core, 0);
 	if (rc != 0) {
 		device_printf(sc->sc_dev,
 		    "enter_download_generic: mem_core 0x%03x enable "
 		    "failed rc=%d\n", sc->sc_chip->mem_core, rc);
 		return (rc);
 	}
-	rc = brcm_pci_core_enable(sc, BRCM_CORE_ARM_CR4,
-	    BRCM_ARMCR4_IOCTL_CPUHALT);
+	rc = bwfm_pci_core_enable(sc, BWFM_CORE_ARM_CR4,
+	    BWFM_ARMCR4_IOCTL_CPUHALT);
 	if (rc != 0) {
 		device_printf(sc->sc_dev,
 		    "enter_download_generic: ARM-CR4 halted enable "
@@ -2592,7 +2592,7 @@ brcm_pci_enter_download_state_generic(struct brcm_pci_softc *sc)
 }
 
 static int
-brcm_pci_load_firmware(struct brcm_pci_softc *sc)
+bwfm_pci_load_firmware(struct bwfm_pci_softc *sc)
 {
 	const struct firmware *fw;
 	const uint32_t *src;
@@ -2601,7 +2601,7 @@ brcm_pci_load_firmware(struct brcm_pci_softc *sc)
 	int mismatches;
 	uint32_t dst_off;
 	bus_size_t bar2_size;
-	char verstr[BRCM_PCI_FW_VERSTRING_MAX];
+	char verstr[BWFM_PCI_FW_VERSTRING_MAX];
 	const uint8_t *p;
 	size_t vs_off, vs_len;
 
@@ -2618,7 +2618,7 @@ brcm_pci_load_firmware(struct brcm_pci_softc *sc)
 
 	{
 		const char *fwname = (sc->sc_chip && sc->sc_chip->fw_name) ?
-		    sc->sc_chip->fw_name : BRCM_PCI_FW_43602;
+		    sc->sc_chip->fw_name : BWFM_PCI_FW_43602;
 		/*
 		 * Keep the image from the first upload until detach, so a
 		 * later re-upload never goes back to firmware(9), which may
@@ -2630,7 +2630,7 @@ brcm_pci_load_firmware(struct brcm_pci_softc *sc)
 		if (fw == NULL) {
 			device_printf(sc->sc_dev,
 			    "load_fw: firmware_get(\"%s\") failed; "
-			    "kldload the corresponding brcm_pci_fw_* module\n",
+			    "kldload the corresponding bwfm_pci_fw_* module\n",
 			    fwname);
 			return (ENOENT);
 		}
@@ -2643,7 +2643,7 @@ brcm_pci_load_firmware(struct brcm_pci_softc *sc)
 	 */
 
 	bar2_size = rman_get_size(sc->sc_bar2);
-	dst_off = sc->sc_chip ? sc->sc_chip->rambase : BRCM_PCI_RAMBASE_43602;
+	dst_off = sc->sc_chip ? sc->sc_chip->rambase : BWFM_PCI_RAMBASE_43602;
 	PDPRINTF(sc, 0,
 	    "load_fw: BAR2=%ju bytes, rambase=0x%x, fw datasize=%zu\n",
 	    (uintmax_t)bar2_size, dst_off, fw->datasize);
@@ -2665,10 +2665,10 @@ brcm_pci_load_firmware(struct brcm_pci_softc *sc)
 	 * sets IOCTL).
 	 */
 	{
-		int (*enter_fn)(struct brcm_pci_softc *) =
-		    (sc->sc_devid == BRCM_PCI_DEVICE_BCM43602) ?
-		    brcm_pci_enter_download_state :
-		    brcm_pci_enter_download_state_generic;
+		int (*enter_fn)(struct bwfm_pci_softc *) =
+		    (sc->sc_devid == BWFM_PCI_DEVICE_BCM43602) ?
+		    bwfm_pci_enter_download_state :
+		    bwfm_pci_enter_download_state_generic;
 		if (enter_fn(sc) != 0)
 			return (EIO);
 	}
@@ -2782,7 +2782,7 @@ brcm_pci_load_firmware(struct brcm_pci_softc *sc)
  * It does not warm a cold chip.
  */
 static int
-brcm_pci_apple_dstate_cycle(struct brcm_pci_softc *sc)
+bwfm_pci_apple_dstate_cycle(struct bwfm_pci_softc *sc)
 {
 	int pm_cap;
 	uint16_t pmcsr;
@@ -2839,7 +2839,7 @@ brcm_pci_apple_dstate_cycle(struct brcm_pci_softc *sc)
  * naturally without needing userland to re-create the interface.
  */
 static int
-brcm_pci_cold_reattach(struct brcm_pci_softc *sc)
+bwfm_pci_cold_reattach(struct bwfm_pci_softc *sc)
 {
 	device_t dev = sc->sc_dev;
 	int rc;
@@ -2855,21 +2855,21 @@ brcm_pci_cold_reattach(struct brcm_pci_softc *sc)
 	 * once the ARM is halted and the new image is in place.
 	 */
 	pci_disable_busmaster(dev);
-	brcm_pci_msgbuf_detach(sc);
+	bwfm_pci_msgbuf_detach(sc);
 	sc->bus_sc.sc_wlc_up = false;
 	sc->sc_chip_alive = false;
 	sc->sc_fw_running = false;
 
-	rc = brcm_pci_apple_appu_warm(sc);
+	rc = bwfm_pci_apple_appu_warm(sc);
 	if (rc != 0) {
 		device_printf(dev,
 		    "cold_reattach: APPU warm failed rc=%d\n", rc);
 		return (rc);
 	}
 
-	(void)brcm_pci_apple_dstate_cycle(sc);
+	(void)bwfm_pci_apple_dstate_cycle(sc);
 
-	if (!brcm_pci_chip_alive_cfg(sc)) {
+	if (!bwfm_pci_chip_alive_cfg(sc)) {
 		device_printf(dev,
 		    "cold_reattach: chip still absent from cfg-space "
 		    "after APPU + dstate_cycle\n");
@@ -2877,24 +2877,24 @@ brcm_pci_cold_reattach(struct brcm_pci_softc *sc)
 	}
 	sc->sc_chip_alive = true;
 
-	pci_write_config(dev, BRCM_PCI_BAR0_WINDOW, 0x18000000, 4);
-	(void)pci_read_config(dev, BRCM_PCI_BAR0_WINDOW, 4);
+	pci_write_config(dev, BWFM_PCI_BAR0_WINDOW, 0x18000000, 4);
+	(void)pci_read_config(dev, BWFM_PCI_BAR0_WINDOW, 4);
 
-	rc = brcm_pci_bringup_sequence(sc);
+	rc = bwfm_pci_bringup_sequence(sc);
 	if (rc != 0) {
 		device_printf(dev,
 		    "cold_reattach: bringup_sequence rc=%d\n", rc);
 		return (rc);
 	}
 
-	rc = brcm_pci_msgbuf_attach(sc);
+	rc = bwfm_pci_msgbuf_attach(sc);
 	if (rc != 0) {
 		device_printf(dev,
 		    "cold_reattach: msgbuf_attach rc=%d\n", rc);
 		return (rc);
 	}
 
-	rc = brcm_pci_msgbuf_dcmd_set_int(sc, BRCM_C_UP, 0);
+	rc = bwfm_pci_msgbuf_dcmd_set_int(sc, BWFM_C_UP, 0);
 	if (rc != 0) {
 		device_printf(dev,
 		    "cold_reattach: WLC_UP rc=%d\n", rc);
@@ -2902,7 +2902,7 @@ brcm_pci_cold_reattach(struct brcm_pci_softc *sc)
 	}
 	sc->bus_sc.sc_wlc_up = true;
 
-	brcm_pci_preinit_dcmds(sc);
+	bwfm_pci_preinit_dcmds(sc);
 
 	/*
 	 * Chip is fully back but net80211's VAP still believes it's in
@@ -2930,7 +2930,7 @@ brcm_pci_cold_reattach(struct brcm_pci_softc *sc)
  * subsequent burst re-arms.
  */
 void
-brcm_pci_maybe_queue_crash_recover(struct brcm_pci_softc *sc)
+bwfm_pci_maybe_queue_crash_recover(struct bwfm_pci_softc *sc)
 {
 	uint32_t thresh = sc->sc_crash_recover_threshold;
 	uint32_t consec = sc->sc_msgbuf.stat_dcmd_timeout_consec;
@@ -2954,15 +2954,15 @@ brcm_pci_maybe_queue_crash_recover(struct brcm_pci_softc *sc)
  * flipped back to false so a subsequent crash burst re-arms.
  */
 static void
-brcm_pci_crash_recover_task(void *ctx, int pending __unused)
+bwfm_pci_crash_recover_task(void *ctx, int pending __unused)
 {
-	struct brcm_pci_softc *sc = ctx;
+	struct bwfm_pci_softc *sc = ctx;
 	int rc;
 
 	device_printf(sc->sc_dev,
 	    "crash_recover_task: running cold_reattach (event #%u)\n",
 	    sc->sc_crash_recover_events);
-	rc = brcm_pci_cold_reattach(sc);
+	rc = bwfm_pci_cold_reattach(sc);
 	device_printf(sc->sc_dev,
 	    "crash_recover_task: cold_reattach rc=%d\n", rc);
 	sc->sc_crash_recover_pending = false;
@@ -2972,13 +2972,13 @@ brcm_pci_crash_recover_task(void *ctx, int pending __unused)
  * Diagnostic: manually trigger the crash-recover task without waiting
  * for real DCMD timeouts.  Sets the pending flag and enqueues the task;
  * task body then calls cold_reattach.  Same effect as
- * `sysctl dev.brcm_pci.N.cold_reattach=1` but exercises the async
+ * `sysctl dev.bwfm_pci.N.cold_reattach=1` but exercises the async
  * taskqueue path that a real fw crash would take.
  */
 static int
-brcm_pci_sysctl_crash_probe(SYSCTL_HANDLER_ARGS)
+bwfm_pci_sysctl_crash_probe(SYSCTL_HANDLER_ARGS)
 {
-	struct brcm_pci_softc *sc = arg1;
+	struct bwfm_pci_softc *sc = arg1;
 	int trig = 0, error;
 
 	error = sysctl_handle_int(oidp, &trig, 0, req);
@@ -3006,15 +3006,15 @@ brcm_pci_sysctl_crash_probe(SYSCTL_HANDLER_ARGS)
  * resume path without a physical suspend cycle.
  */
 static int
-brcm_pci_sysctl_cold_reattach(SYSCTL_HANDLER_ARGS)
+bwfm_pci_sysctl_cold_reattach(SYSCTL_HANDLER_ARGS)
 {
-	struct brcm_pci_softc *sc = arg1;
+	struct bwfm_pci_softc *sc = arg1;
 	int trig = 0, error;
 
 	error = sysctl_handle_int(oidp, &trig, 0, req);
 	if (error != 0 || req->newptr == NULL || trig == 0)
 		return (error);
-	return (brcm_pci_cold_reattach(sc));
+	return (bwfm_pci_cold_reattach(sc));
 }
 
 /*
@@ -3025,32 +3025,32 @@ brcm_pci_sysctl_cold_reattach(SYSCTL_HANDLER_ARGS)
  * chip stays associated across the round trip.
  */
 static int
-brcm_pci_sysctl_d3_probe(SYSCTL_HANDLER_ARGS)
+bwfm_pci_sysctl_d3_probe(SYSCTL_HANDLER_ARGS)
 {
-	struct brcm_pci_softc *sc = arg1;
+	struct bwfm_pci_softc *sc = arg1;
 	int trig = 0, error, rc_send, rc_ack;
 
 	error = sysctl_handle_int(oidp, &trig, 0, req);
 	if (error != 0 || req->newptr == NULL || trig == 0)
 		return (error);
 
-	rc_send = brcm_pci_msgbuf_send_mb_data(sc, BRCM_H2D_HOST_D3_INFORM);
+	rc_send = bwfm_pci_msgbuf_send_mb_data(sc, BWFM_H2D_HOST_D3_INFORM);
 	if (rc_send == 0) {
-		rc_ack = brcm_pci_msgbuf_wait_mb_ack(sc,
-		    BRCM_D2H_DEV_D3_ACK, 2000);
+		rc_ack = bwfm_pci_msgbuf_wait_mb_ack(sc,
+		    BWFM_D2H_DEV_D3_ACK, 2000);
 		device_printf(sc->sc_dev,
 		    "d3_probe: D3_INFORM sent, D3_ACK rc=%d\n", rc_ack);
 	} else {
 		device_printf(sc->sc_dev,
 		    "d3_probe: D3_INFORM send rc=%d\n", rc_send);
 	}
-	(void)brcm_pci_msgbuf_send_mb_data(sc, BRCM_H2D_HOST_D0_INFORM);
+	(void)bwfm_pci_msgbuf_send_mb_data(sc, BWFM_H2D_HOST_D0_INFORM);
 	device_printf(sc->sc_dev, "d3_probe: D0_INFORM sent\n");
 	return (0);
 }
 
 static void
-brcm_pci_attach_sysctls(struct brcm_pci_softc *sc)
+bwfm_pci_attach_sysctls(struct bwfm_pci_softc *sc)
 {
 	struct sysctl_ctx_list *ctx = device_get_sysctl_ctx(sc->sc_dev);
 	struct sysctl_oid *tree = device_get_sysctl_tree(sc->sc_dev);
@@ -3062,7 +3062,7 @@ brcm_pci_attach_sysctls(struct brcm_pci_softc *sc)
 	    "2=proto trace, 3=data-path, 4=register poke).");
 	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "chip_alive",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_pci_sysctl_chip_alive, "I",
+	    bwfm_pci_sysctl_chip_alive, "I",
 	    "Write 1 to probe PCIe cfg-space aliveness (VID + BAR0_WINDOW "
 	    "readback).  Returns 0 if cfg responds, ENXIO if link is down. "
 	    "This is safe on any chip state because cfg-space is served by "
@@ -3075,7 +3075,7 @@ brcm_pci_attach_sysctls(struct brcm_pci_softc *sc)
 	    "while it is set.");
 	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "bringup",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_pci_sysctl_bringup, "I",
+	    bwfm_pci_sysctl_bringup, "I",
 	    "Write 1 to run full bring-up sequence: chip_reset "
 	    "-> core_walk -> ramsize_query -> enter_download_state -> "
 	    "load_firmware -> nvram_inject -> armcr4_release -> "
@@ -3085,51 +3085,51 @@ brcm_pci_attach_sysctls(struct brcm_pci_softc *sc)
 	    "is safe -- backplane clock may still be off after APPU.");
 	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "msgbuf_attach",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_pci_sysctl_msgbuf_attach, "I",
+	    bwfm_pci_sysctl_msgbuf_attach, "I",
 	    "Write 1 to read fw shared struct, allocate 5 common rings + "
 	    "scratch buffers via bus_dma, and publish DMA addresses to "
 	    "fw.  Requires armcr4_release to have fired first.");
 	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "delete_flowring",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_pci_sysctl_delete_flowring, "I",
+	    bwfm_pci_sysctl_delete_flowring, "I",
 	    "Write local flowid (>=0) to send FLOW_RING_DELETE + wait "
 	    "up to 2 s for CMPLT.  Marks the slot CLOSED on success.  "
 	    "Used to verify the delete protocol standalone.");
 	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "wlc_up",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_pci_sysctl_wlc_up, "I",
+	    bwfm_pci_sysctl_wlc_up, "I",
 	    "Write 1 to send WLC_UP DCMD (2), bringing chip WLAN up.");
 	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "wlc_down",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_pci_sysctl_wlc_down, "I",
+	    bwfm_pci_sysctl_wlc_down, "I",
 	    "Write 1 to send WLC_DOWN DCMD (3).");
 	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "net80211_attach",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_pci_sysctl_net80211_attach, "I",
+	    bwfm_pci_sysctl_net80211_attach, "I",
 	    "Write 1 to attach the ieee80211com and expose the driver as "
 	    "wlan0 via net80211.  Requires fw running + msgbuf_attach done.");
 	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "net80211_detach",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_pci_sysctl_net80211_detach, "I",
+	    bwfm_pci_sysctl_net80211_detach, "I",
 	    "Write 1 to detach the ieee80211com (undo net80211_attach).");
 	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "dump_console",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_pci_sysctl_dump_console, "I",
+	    bwfm_pci_sysctl_dump_console, "I",
 	    "Write 1 to drain the fw runtime console and print any new "
 	    "lines to dmesg (fw: ...).  Requires msgbuf_attach first.");
 	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "mac_addr",
 	    CTLTYPE_STRING | CTLFLAG_RD, sc, 0,
-	    brcm_pci_sysctl_mac_addr, "A",
+	    bwfm_pci_sysctl_mac_addr, "A",
 	    "Read chip's cur_etheraddr via GET_VAR (262).");
 	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "d3_probe",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_pci_sysctl_d3_probe, "I",
+	    bwfm_pci_sysctl_d3_probe, "I",
 	    "Fire mbdata H2D_HOST_D3_INFORM + wait 2s for D2H_DEV_D3_ACK "
 	    "+ H2D_HOST_D0_INFORM, without touching WLC/net80211/PCIe bus.  "
 	    "Diagnostic for the fw side of item #4 (D3 suspend/resume).");
 	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "cold_reattach",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_pci_sysctl_cold_reattach, "I",
+	    bwfm_pci_sysctl_cold_reattach, "I",
 	    "Write 1 to force the ACPI-S3 cold-resume path: msgbuf_detach, "
 	    "APPU warm, dstate cycle, full bringup (fw reupload), msgbuf "
 	    "reattach, WLC_UP, preinit.  Chip drops current association "
@@ -3147,7 +3147,7 @@ brcm_pci_attach_sysctls(struct brcm_pci_softc *sc)
 	    "queued since attach (item #13).");
 	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "crash_probe",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    brcm_pci_sysctl_crash_probe, "I",
+	    bwfm_pci_sysctl_crash_probe, "I",
 	    "Write 1 to inject a fake crash event and exercise the "
 	    "async crash_recover task queue.  Behaviour equivalent to "
 	    "cold_reattach but goes through taskqueue_thread the same "
@@ -3158,28 +3158,28 @@ brcm_pci_attach_sysctls(struct brcm_pci_softc *sc)
  * Newbus glue
  * ------------------------------------------------------------------ */
 
-static const struct brcm_pci_devmatch *
-brcm_pci_lookup(device_t dev)
+static const struct bwfm_pci_devmatch *
+bwfm_pci_lookup(device_t dev)
 {
-	const struct brcm_pci_devmatch *m;
+	const struct bwfm_pci_devmatch *m;
 	uint16_t vendor, devid;
 
 	vendor = pci_get_vendor(dev);
-	if (vendor != BRCM_PCI_VENDOR_BROADCOM)
+	if (vendor != BWFM_PCI_VENDOR_BROADCOM)
 		return (NULL);
 	devid = pci_get_device(dev);
-	for (m = brcm_pci_devs; m->desc != NULL; m++)
+	for (m = bwfm_pci_devs; m->desc != NULL; m++)
 		if (m->devid == devid)
 			return (m);
 	return (NULL);
 }
 
 static int
-brcm_pci_probe(device_t dev)
+bwfm_pci_probe(device_t dev)
 {
-	const struct brcm_pci_devmatch *m;
+	const struct bwfm_pci_devmatch *m;
 
-	m = brcm_pci_lookup(dev);
+	m = bwfm_pci_lookup(dev);
 	if (m == NULL)
 		return (ENXIO);
 	device_set_desc(dev, m->desc);
@@ -3187,11 +3187,11 @@ brcm_pci_probe(device_t dev)
 }
 
 static int
-brcm_pci_alloc_bars(struct brcm_pci_softc *sc)
+bwfm_pci_alloc_bars(struct bwfm_pci_softc *sc)
 {
 	int rid;
 
-	rid = BRCM_PCI_BAR0_RID;
+	rid = BWFM_PCI_BAR0_RID;
 	sc->sc_bar0 = bus_alloc_resource_any(sc->sc_dev, SYS_RES_MEMORY,
 	    &rid, RF_ACTIVE);
 	if (sc->sc_bar0 == NULL) {
@@ -3201,7 +3201,7 @@ brcm_pci_alloc_bars(struct brcm_pci_softc *sc)
 	sc->sc_bar0_t = rman_get_bustag(sc->sc_bar0);
 	sc->sc_bar0_h = rman_get_bushandle(sc->sc_bar0);
 
-	rid = BRCM_PCI_BAR2_RID;
+	rid = BWFM_PCI_BAR2_RID;
 	sc->sc_bar2 = bus_alloc_resource_any(sc->sc_dev, SYS_RES_MEMORY,
 	    &rid, RF_ACTIVE);
 	if (sc->sc_bar2 == NULL) {
@@ -3217,22 +3217,22 @@ brcm_pci_alloc_bars(struct brcm_pci_softc *sc)
 }
 
 static void
-brcm_pci_free_bars(struct brcm_pci_softc *sc)
+bwfm_pci_free_bars(struct bwfm_pci_softc *sc)
 {
 	if (sc->sc_bar2 != NULL) {
 		bus_release_resource(sc->sc_dev, SYS_RES_MEMORY,
-		    BRCM_PCI_BAR2_RID, sc->sc_bar2);
+		    BWFM_PCI_BAR2_RID, sc->sc_bar2);
 		sc->sc_bar2 = NULL;
 	}
 	if (sc->sc_bar0 != NULL) {
 		bus_release_resource(sc->sc_dev, SYS_RES_MEMORY,
-		    BRCM_PCI_BAR0_RID, sc->sc_bar0);
+		    BWFM_PCI_BAR0_RID, sc->sc_bar0);
 		sc->sc_bar0 = NULL;
 	}
 }
 
 static int
-brcm_pci_alloc_irq(struct brcm_pci_softc *sc)
+bwfm_pci_alloc_irq(struct bwfm_pci_softc *sc)
 {
 	int count;
 
@@ -3261,7 +3261,7 @@ brcm_pci_alloc_irq(struct brcm_pci_softc *sc)
 }
 
 static void
-brcm_pci_free_irq(struct brcm_pci_softc *sc)
+bwfm_pci_free_irq(struct bwfm_pci_softc *sc)
 {
 	if (sc->sc_irq_handle != NULL) {
 		bus_teardown_intr(sc->sc_dev, sc->sc_irq, sc->sc_irq_handle);
@@ -3279,13 +3279,13 @@ brcm_pci_free_irq(struct brcm_pci_softc *sc)
 }
 
 /* -----------------------------------------------------------------
- * Bus ops for brcm.c integration.  brcm.c (the FullMAC core shared
+ * Bus ops for bwfm.c integration.  bwfm.c (the FullMAC core shared
  * with the SDIO and USB transports) calls these wrappers; PCIe uses
  * msgbuf DCMDs instead of BCDC, so txctl/rxctl are BCDC-only and
  * return ENXIO.  txdata goes out through the msgbuf flow rings.
  * ----------------------------------------------------------------- */
 static int
-brcm_pci_bs_txctl(struct brcm_softc *bsc __unused, const void *buf __unused,
+bwfm_pci_bs_txctl(struct bwfm_softc *bsc __unused, const void *buf __unused,
     size_t len __unused)
 {
 	/* BCDC-specific control path.  Msgbuf uses DCMD ring instead. */
@@ -3293,7 +3293,7 @@ brcm_pci_bs_txctl(struct brcm_softc *bsc __unused, const void *buf __unused,
 }
 
 static int
-brcm_pci_bs_rxctl(struct brcm_softc *bsc __unused, void *buf __unused,
+bwfm_pci_bs_rxctl(struct bwfm_softc *bsc __unused, void *buf __unused,
     size_t *lenp __unused, int timeout_ms __unused)
 {
 	return (ENXIO);
@@ -3313,7 +3313,7 @@ brcm_pci_bs_rxctl(struct brcm_softc *bsc __unused, void *buf __unused,
  * caller drops it); or an errno if the mbuf could not be made contiguous.
  */
 static int
-brcm_pci_deencap_80211(struct mbuf **mp)
+bwfm_pci_deencap_80211(struct mbuf **mp)
 {
 	struct mbuf *m = *mp;
 	struct ieee80211_frame *wh;
@@ -3377,9 +3377,9 @@ brcm_pci_deencap_80211(struct mbuf **mp)
  * ring cannot be made, its queue is dropped.
  */
 static void
-brcm_pci_flow_task(void *arg, int pending __unused)
+bwfm_pci_flow_task(void *arg, int pending __unused)
 {
-	struct brcm_pci_softc *sc = arg;
+	struct bwfm_pci_softc *sc = arg;
 	uint8_t sa[6], da[6];
 	uint16_t flowid;
 	struct mbuf *m;
@@ -3398,9 +3398,9 @@ brcm_pci_flow_task(void *arg, int pending __unused)
 		mtx_unlock(&sc->sc_flowq_mtx);
 
 		error = 0;
-		flowid = brcm_pci_msgbuf_flowring_lookup(sc, da, prio);
+		flowid = bwfm_pci_msgbuf_flowring_lookup(sc, da, prio);
 		if (flowid == (uint16_t)-1)
-			error = brcm_pci_msgbuf_flowring_create(sc, sa, da, prio,
+			error = bwfm_pci_msgbuf_flowring_create(sc, sa, da, prio,
 			    0, &flowid);
 		if (error != 0)
 			device_printf(sc->sc_dev, "flow ring for prio %u: %d; "
@@ -3414,16 +3414,16 @@ brcm_pci_flow_task(void *arg, int pending __unused)
 			}
 			mtx_unlock(&sc->sc_flowq_mtx);
 			if (error != 0 ||
-			    brcm_pci_msgbuf_txmbuf(sc, flowid, m, 0) != 0)
+			    bwfm_pci_msgbuf_txmbuf(sc, flowid, m, 0) != 0)
 				m_freem(m);
 		}
 	}
 }
 
 static int
-brcm_pci_bs_txdata(struct brcm_softc *bsc, struct mbuf *m)
+bwfm_pci_bs_txdata(struct bwfm_softc *bsc, struct mbuf *m)
 {
-	struct brcm_pci_softc *sc = SC_TO_PCI(bsc);
+	struct bwfm_pci_softc *sc = SC_TO_PCI(bsc);
 	uint8_t da[6], sa[6];
 	uint16_t flowid;
 	uint8_t prio, ifidx;
@@ -3434,7 +3434,7 @@ brcm_pci_bs_txdata(struct brcm_softc *bsc, struct mbuf *m)
 
 	/* Convert net80211's 802.11-encapsulated frame back to 802.3. */
 	{
-		int dr = brcm_pci_deencap_80211(&m);
+		int dr = bwfm_pci_deencap_80211(&m);
 		if (dr != 0) {
 			if (m != NULL)
 				m_freem(m);
@@ -3489,7 +3489,7 @@ brcm_pci_bs_txdata(struct brcm_softc *bsc, struct mbuf *m)
 
 	/*
 	 * EAPOL (ethertype 0x888e) must ride a dedicated flowring at
-	 * prio 7 (voice / TID 7).  Rationale: after brcm_set_key installs
+	 * prio 7 (voice / TID 7).  Rationale: after bwfm_set_key installs
 	 * the PTK, the chip starts encrypting outbound frames on the peer's
 	 * data flowring.  M4 (or any EAPOL retransmit) that arrives on the
 	 * same flowring gets AES-encrypted; the AP can't validate the MIC
@@ -3516,7 +3516,7 @@ brcm_pci_bs_txdata(struct brcm_softc *bsc, struct mbuf *m)
 
 		mtx_lock(&sc->sc_flowq_mtx);
 		flowid = sc->sc_flowq_busy[q] ? (uint16_t)-1 :
-		    brcm_pci_msgbuf_flowring_lookup(sc, da, prio);
+		    bwfm_pci_msgbuf_flowring_lookup(sc, da, prio);
 		if (flowid == (uint16_t)-1) {
 			/* No ring yet, or one is being made: queue. */
 			if (mbufq_enqueue(&sc->sc_flowq[q], m) != 0) {
@@ -3538,26 +3538,26 @@ brcm_pci_bs_txdata(struct brcm_softc *bsc, struct mbuf *m)
 		}
 		mtx_unlock(&sc->sc_flowq_mtx);
 	}
-	error = brcm_pci_msgbuf_txmbuf(sc, flowid, m, ifidx);
+	error = bwfm_pci_msgbuf_txmbuf(sc, flowid, m, ifidx);
 	if (error != 0)
 		m_freem(m);
 	return (error);
 }
 
 static void
-brcm_pci_bs_stop(struct brcm_softc *bsc __unused)
+bwfm_pci_bs_stop(struct bwfm_softc *bsc __unused)
 {
 }
 
 static int
-brcm_pci_bs_dcmd_get(struct brcm_softc *bsc, uint32_t cmd, void *buf,
+bwfm_pci_bs_dcmd_get(struct bwfm_softc *bsc, uint32_t cmd, void *buf,
     size_t *lenp)
 {
-	struct brcm_pci_softc *sc = SC_TO_PCI(bsc);
+	struct bwfm_pci_softc *sc = SC_TO_PCI(bsc);
 	int32_t fwerr = 0;
 	int error;
 
-	error = brcm_pci_msgbuf_dcmd(sc, cmd, false, buf, *lenp,
+	error = bwfm_pci_msgbuf_dcmd(sc, cmd, false, buf, *lenp,
 	    buf, lenp, &fwerr);
 	if (error == 0 && fwerr != 0)
 		error = EIO;
@@ -3565,15 +3565,15 @@ brcm_pci_bs_dcmd_get(struct brcm_softc *bsc, uint32_t cmd, void *buf,
 }
 
 static int
-brcm_pci_bs_dcmd_set(struct brcm_softc *bsc, uint32_t cmd, const void *buf,
+bwfm_pci_bs_dcmd_set(struct bwfm_softc *bsc, uint32_t cmd, const void *buf,
     size_t len)
 {
-	struct brcm_pci_softc *sc = SC_TO_PCI(bsc);
+	struct bwfm_pci_softc *sc = SC_TO_PCI(bsc);
 	size_t rlen = 0;
 	int32_t fwerr = 0;
 	int error;
 
-	error = brcm_pci_msgbuf_dcmd(sc, cmd, true, buf, len,
+	error = bwfm_pci_msgbuf_dcmd(sc, cmd, true, buf, len,
 	    NULL, &rlen, &fwerr);
 	if (error == 0 && fwerr != 0)
 		error = EIO;
@@ -3581,61 +3581,61 @@ brcm_pci_bs_dcmd_set(struct brcm_softc *bsc, uint32_t cmd, const void *buf,
 }
 
 static int
-brcm_pci_bs_iovar_get(struct brcm_softc *bsc, const char *name, void *buf,
+bwfm_pci_bs_iovar_get(struct bwfm_softc *bsc, const char *name, void *buf,
     size_t *lenp)
 {
-	struct brcm_pci_softc *sc = SC_TO_PCI(bsc);
+	struct bwfm_pci_softc *sc = SC_TO_PCI(bsc);
 
-	return (brcm_pci_msgbuf_dcmd_get_var(sc, name, buf, lenp));
+	return (bwfm_pci_msgbuf_dcmd_get_var(sc, name, buf, lenp));
 }
 
 static int
-brcm_pci_bs_iovar_set(struct brcm_softc *bsc, const char *name,
+bwfm_pci_bs_iovar_set(struct bwfm_softc *bsc, const char *name,
     const void *buf, size_t len)
 {
-	struct brcm_pci_softc *sc = SC_TO_PCI(bsc);
+	struct bwfm_pci_softc *sc = SC_TO_PCI(bsc);
 
-	return (brcm_pci_msgbuf_dcmd_set_var(sc, name, buf, len));
+	return (bwfm_pci_msgbuf_dcmd_set_var(sc, name, buf, len));
 }
 
 static void
-brcm_pci_bs_flowring_purge(struct brcm_softc *bsc)
+bwfm_pci_bs_flowring_purge(struct bwfm_softc *bsc)
 {
-	brcm_pci_msgbuf_flowring_delete_all(SC_TO_PCI(bsc));
+	bwfm_pci_msgbuf_flowring_delete_all(SC_TO_PCI(bsc));
 }
 
 static int
-brcm_pci_bs_wait_eapol_drain(struct brcm_softc *bsc, int timeout_ms)
+bwfm_pci_bs_wait_eapol_drain(struct bwfm_softc *bsc, int timeout_ms)
 {
-	return (brcm_pci_msgbuf_wait_eapol_drain(SC_TO_PCI(bsc), timeout_ms));
+	return (bwfm_pci_msgbuf_wait_eapol_drain(SC_TO_PCI(bsc), timeout_ms));
 }
 
-static const struct brcm_bus_ops brcm_pci_bus_ops = {
-	.bs_txctl	= brcm_pci_bs_txctl,
-	.bs_rxctl	= brcm_pci_bs_rxctl,
-	.bs_txdata	= brcm_pci_bs_txdata,
-	.bs_stop	= brcm_pci_bs_stop,
-	.bs_dcmd_get	= brcm_pci_bs_dcmd_get,
-	.bs_dcmd_set	= brcm_pci_bs_dcmd_set,
-	.bs_iovar_get	= brcm_pci_bs_iovar_get,
-	.bs_iovar_set	= brcm_pci_bs_iovar_set,
-	.bs_flowring_purge = brcm_pci_bs_flowring_purge,
-	.bs_wait_eapol_drain = brcm_pci_bs_wait_eapol_drain,
+static const struct bwfm_bus_ops bwfm_pci_bus_ops = {
+	.bs_txctl	= bwfm_pci_bs_txctl,
+	.bs_rxctl	= bwfm_pci_bs_rxctl,
+	.bs_txdata	= bwfm_pci_bs_txdata,
+	.bs_stop	= bwfm_pci_bs_stop,
+	.bs_dcmd_get	= bwfm_pci_bs_dcmd_get,
+	.bs_dcmd_set	= bwfm_pci_bs_dcmd_set,
+	.bs_iovar_get	= bwfm_pci_bs_iovar_get,
+	.bs_iovar_set	= bwfm_pci_bs_iovar_set,
+	.bs_flowring_purge = bwfm_pci_bs_flowring_purge,
+	.bs_wait_eapol_drain = bwfm_pci_bs_wait_eapol_drain,
 	/* No bs_pump_rx: the msgbuf ISR delivers asynchronously. */
 };
 
-static void	brcm_pci_autostart(void *);
+static void	bwfm_pci_autostart(void *);
 
 static int
-brcm_pci_attach(device_t dev)
+bwfm_pci_attach(device_t dev)
 {
-	struct brcm_pci_softc *sc = device_get_softc(dev);
+	struct bwfm_pci_softc *sc = device_get_softc(dev);
 	int error;
 
 	sc->sc_dev = dev;
 	sc->sc_devid = pci_get_device(dev);
 	sc->sc_revid = pci_get_revid(dev);
-	sc->sc_chip = brcm_pci_chip_lookup(sc->sc_devid);
+	sc->sc_chip = bwfm_pci_chip_lookup(sc->sc_devid);
 	if (sc->sc_chip == NULL) {
 		device_printf(dev,
 		    "attach: no chip-info entry for devid 0x%04x — "
@@ -3649,15 +3649,15 @@ brcm_pci_attach(device_t dev)
 	}
 
 	/*
-	 * Prepare the shared brcm_softc so brcm_attach() can run later,
-	 * once the firmware is running and msgbuf is up.  brcm.c expects
+	 * Prepare the shared bwfm_softc so bwfm_attach() can run later,
+	 * once the firmware is running and msgbuf is up.  bwfm.c expects
 	 * the transport to initialise these mutexes; they survive attach
-	 * failures and are used by any ctlrx thread brcm.c starts.
+	 * failures and are used by any ctlrx thread bwfm.c starts.
 	 */
 	sc->bus_sc.sc_dev = dev;
-	sc->bus_sc.sc_bus_ops = &brcm_pci_bus_ops;
+	sc->bus_sc.sc_bus_ops = &bwfm_pci_bus_ops;
 	mtx_init(&sc->bus_sc.sc_mtx, device_get_nameunit(dev), NULL, MTX_DEF);
-	mtx_init(&sc->bus_sc.sc_ctl_mtx, "brcm_pci ctl", NULL, MTX_DEF);
+	mtx_init(&sc->bus_sc.sc_ctl_mtx, "bwfm_pci ctl", NULL, MTX_DEF);
 	TAILQ_INIT(&sc->bus_sc.sc_ctl_pending);
 
 	/*
@@ -3708,10 +3708,10 @@ brcm_pci_attach(device_t dev)
 		    (cmd & PCIM_CMD_PORTEN)      ? 1 : 0);
 	}
 
-	error = brcm_pci_alloc_bars(sc);
+	error = bwfm_pci_alloc_bars(sc);
 	if (error != 0)
 		goto fail;
-	error = brcm_pci_alloc_irq(sc);
+	error = bwfm_pci_alloc_irq(sc);
 	if (error != 0)
 		goto fail;
 
@@ -3733,7 +3733,7 @@ brcm_pci_attach(device_t dev)
 		device_printf(dev,
 		    "PCI %04x:%04x rev=0x%02x bar0=%#jx/%ju bar2=%#jx/%ju "
 		    "irq=%s(%d)\n",
-		    BRCM_PCI_VENDOR_BROADCOM, sc->sc_devid, sc->sc_revid,
+		    BWFM_PCI_VENDOR_BROADCOM, sc->sc_devid, sc->sc_revid,
 		    (uintmax_t)rman_get_start(sc->sc_bar0),
 		    (uintmax_t)rman_get_size(sc->sc_bar0),
 		    sc->sc_bar2 != NULL ?
@@ -3753,21 +3753,21 @@ brcm_pci_attach(device_t dev)
 	 * Everything chip-side waits until the warm sequence below has
 	 * run; the rest of the bring-up then happens in the autostart
 	 * thread started at the end of attach (or by the bring-up sysctls,
-	 * with hw.brcm_pci.autostart=0), so kldload always finishes
+	 * with hw.bwfm_pci.autostart=0), so kldload always finishes
 	 * cleanly.
 	 */
-	brcm_pci_attach_sysctls(sc);
+	bwfm_pci_attach_sysctls(sc);
 
 	/*
 	 * Firmware crash-recovery task.  Off by default (threshold 0); see
 	 * sc_crash_recover_threshold.
 	 */
 	TASK_INIT(&sc->sc_crash_recover_task, 0,
-	    brcm_pci_crash_recover_task, sc);
-	mtx_init(&sc->sc_flowq_mtx, "brcm_pci flowq", NULL, MTX_DEF);
-	mbufq_init(&sc->sc_flowq[0], BRCM_PCI_FLOWQ_LEN);
-	mbufq_init(&sc->sc_flowq[1], BRCM_PCI_FLOWQ_LEN);
-	TASK_INIT(&sc->sc_flow_task, 0, brcm_pci_flow_task, sc);
+	    bwfm_pci_crash_recover_task, sc);
+	mtx_init(&sc->sc_flowq_mtx, "bwfm_pci flowq", NULL, MTX_DEF);
+	mbufq_init(&sc->sc_flowq[0], BWFM_PCI_FLOWQ_LEN);
+	mbufq_init(&sc->sc_flowq[1], BWFM_PCI_FLOWQ_LEN);
+	TASK_INIT(&sc->sc_flow_task, 0, bwfm_pci_flow_task, sc);
 	sc->sc_crash_recover_threshold = 0;
 
 	/*
@@ -3786,15 +3786,15 @@ brcm_pci_attach(device_t dev)
 	 * cycle).
 	 */
 	{
-		int do_appu = brcm_pci_attach_appu_warm_dflt;
+		int do_appu = bwfm_pci_attach_appu_warm_dflt;
 		int rc;
 
 		if (!do_appu) {
 			device_printf(dev,
-			    "attach: hw.brcm_pci.attach_appu_warm=0 - "
+			    "attach: hw.bwfm_pci.attach_appu_warm=0 - "
 			    "skipping APPU (opt-out).\n");
 		} else {
-			rc = brcm_pci_apple_appu_warm(sc);
+			rc = bwfm_pci_apple_appu_warm(sc);
 			if (rc != 0) {
 				device_printf(dev,
 				    "attach: APPU warm failed rc=%d - chip "
@@ -3807,7 +3807,7 @@ brcm_pci_attach(device_t dev)
 		}
 
 		/* Then dstate_cycle and chip_probe, both config space only. */
-		rc = brcm_pci_apple_dstate_cycle(sc);
+		rc = bwfm_pci_apple_dstate_cycle(sc);
 		if (rc != 0) {
 			device_printf(dev,
 			    "attach: dstate_cycle failed rc=%d - continuing "
@@ -3834,7 +3834,7 @@ brcm_pci_attach(device_t dev)
 		PDPRINTF(sc, 0,
 		    "attach: warm sequence complete (APPU + dstate_cycle + "
 		    "chip_probe).  Fire final bringup manually with "
-		    "dev.brcm_pci.%d.bringup=1 — runtime sysctl is per-"
+		    "dev.bwfm_pci.%d.bringup=1 — runtime sysctl is per-"
 		    "session so a wedge doesn't persist.\n",
 		    device_get_unit(dev));
 	}
@@ -3850,21 +3850,21 @@ brcm_pci_attach(device_t dev)
 	 * The config-space write is safe even with BAR0 cold, since config
 	 * space is served by the root complex, not the chip.
 	 */
-	pci_write_config(dev, BRCM_PCI_BAR0_WINDOW, 0x18000000, 4);
-	(void)pci_read_config(dev, BRCM_PCI_BAR0_WINDOW, 4);
+	pci_write_config(dev, BWFM_PCI_BAR0_WINDOW, 0x18000000, 4);
+	(void)pci_read_config(dev, BWFM_PCI_BAR0_WINDOW, 4);
 	device_printf(dev,
 	    "attach: BAR0_WIN1 (cfg 0x%02x) = 0x18000000 (CHIPCOMMON)\n",
-	    BRCM_PCI_BAR0_WINDOW);
+	    BWFM_PCI_BAR0_WINDOW);
 
 attach_done:
 
 	sc->bus_sc.sc_dev = dev;
-	sc->bus_sc.sc_bus_ops = &brcm_pci_bus_ops;
+	sc->bus_sc.sc_bus_ops = &bwfm_pci_bus_ops;
 
-	if (brcm_pci_autostart_dflt && sc->sc_chip_alive &&
+	if (bwfm_pci_autostart_dflt && sc->sc_chip_alive &&
 	    sc->sc_chip != NULL && sc->sc_chip->bringup_supported) {
 		sc->sc_autostart_running = true;
-		if (kthread_add(brcm_pci_autostart, sc, NULL, NULL, 0, 0,
+		if (kthread_add(bwfm_pci_autostart, sc, NULL, NULL, 0, 0,
 		    "%s start", device_get_nameunit(dev)) != 0) {
 			sc->sc_autostart_running = false;
 			device_printf(dev, "attach: could not start the "
@@ -3874,29 +3874,29 @@ attach_done:
 	return (0);
 
 fail:
-	brcm_pci_free_irq(sc);
-	brcm_pci_free_bars(sc);
+	bwfm_pci_free_irq(sc);
+	bwfm_pci_free_bars(sc);
 	pci_disable_busmaster(dev);
 	return (error);
 }
 
 static int
-brcm_pci_detach(device_t dev)
+bwfm_pci_detach(device_t dev)
 {
-	struct brcm_pci_softc *sc = device_get_softc(dev);
-	struct brcm_softc *bsc = &sc->bus_sc;
+	struct bwfm_pci_softc *sc = device_get_softc(dev);
+	struct bwfm_softc *bsc = &sc->bus_sc;
 
 	/*
 	 * Refuse detach while net80211 still holds callbacks into our module
 	 * text.  Mirrors SDIO/USB transports: `ifconfig wlan0 destroy` must
-	 * happen first, then `sysctl dev.brcm_pci.N.net80211_detach=1`, only
-	 * then `kldunload brcm_pci` (or `devctl detach`).  Without this the
+	 * happen first, then `sysctl dev.bwfm_pci.N.net80211_detach=1`, only
+	 * then `kldunload bwfm_pci` (or `devctl detach`).  Without this the
 	 * next iv_op after our text vanishes panics the box.
 	 */
 	if (bsc->sc_ic_attached) {
 		device_printf(dev,
 		    "detach refused: net80211 still attached "
-		    "(sysctl dev.brcm_pci.%d.net80211_detach=1 first, "
+		    "(sysctl dev.bwfm_pci.%d.net80211_detach=1 first, "
 		    "after `ifconfig wlan0 destroy`)\n", device_get_unit(dev));
 		return (EBUSY);
 	}
@@ -3912,9 +3912,9 @@ brcm_pci_detach(device_t dev)
 	 *   3. msgbuf_detach — masks chip interrupt, unbinds ISR, drains
 	 *      event task, reclaims RX/TX/event/flow DMA rings + mbufs,
 	 *      destroys msgbuf-internal mutexes/cv/sx.
-	 *   4. Drain the brcm.c taskqueue tasks (scan_done, link, assoc,
+	 *   4. Drain the bwfm.c taskqueue tasks (scan_done, link, assoc,
 	 *      disassoc, post_assoc) and our flow task.  They fire from the
-	 *      msgbuf ISR path via brcm_handle_event, and the ISR is now
+	 *      msgbuf ISR path via bwfm_handle_event, and the ISR is now
 	 *      unbound.  Drain unconditionally: the task structs live in
 	 *      the zeroed softc, so draining one never initialised or
 	 *      never queued is a no-op.
@@ -3929,7 +3929,7 @@ brcm_pci_detach(device_t dev)
 
 	bsc->sc_dying = true;
 	if (mtx_initialized(&bsc->sc_ctl_mtx)) {
-		struct brcm_ctl_req *r;
+		struct bwfm_ctl_req *r;
 
 		mtx_lock(&bsc->sc_ctl_mtx);
 		TAILQ_FOREACH(r, &bsc->sc_ctl_pending, link)
@@ -3942,12 +3942,12 @@ brcm_pci_detach(device_t dev)
 		 */
 		while (bsc->sc_in_flight_dcmd != 0)
 			(void)mtx_sleep(&bsc->sc_in_flight_dcmd,
-			    &bsc->sc_ctl_mtx, 0, "brcmdcd", hz);
+			    &bsc->sc_ctl_mtx, 0, "bwfmdcd", hz);
 		mtx_unlock(&bsc->sc_ctl_mtx);
 	}
 	/* Let a bring-up in progress stop at its next step. */
 	while (sc->sc_autostart_running)
-		(void)tsleep(&sc->sc_autostart_running, 0, "brcmast", hz / 10);
+		(void)tsleep(&sc->sc_autostart_running, 0, "bwfmast", hz / 10);
 
 	/*
 	 * Best-effort chip quiesce: WLC_DOWN before killing the ISR so fw
@@ -3958,10 +3958,10 @@ brcm_pci_detach(device_t dev)
 	 * be halted, and by this point the alternative is limping past.
 	 *
 	 * Note: sc_wlc_up mirrors fw pub->up state (set in
-	 * brcm_pci_sysctl_wlc_up + brcm.c's various post-WLC_UP paths).
+	 * bwfm_pci_sysctl_wlc_up + bwfm.c's various post-WLC_UP paths).
 	 */
 	if (bsc->sc_wlc_up) {
-		(void)brcm_pci_msgbuf_dcmd_set_int(sc, BRCM_C_DOWN, 0);
+		(void)bwfm_pci_msgbuf_dcmd_set_int(sc, BWFM_C_DOWN, 0);
 		bsc->sc_wlc_up = false;
 	}
 
@@ -3970,13 +3970,13 @@ brcm_pci_detach(device_t dev)
 	 * msgbuf_attach was never fired (mb->attached is false in a
 	 * freshly zeroed softc; detach short-circuits).
 	 */
-	brcm_pci_msgbuf_detach(sc);
+	bwfm_pci_msgbuf_detach(sc);
 
 	/*
-	 * Drain brcm.c's task queue callbacks.  brcm_detach (called by
+	 * Drain bwfm.c's task queue callbacks.  bwfm_detach (called by
 	 * the user via net80211_detach sysctl before us) tore down the
 	 * ieee80211com but did NOT drain these tasks — that's our job on
-	 * the transport side (mirrors USB's brcm_usb_teardown).  ISR is
+	 * the transport side (mirrors USB's bwfm_usb_teardown).  ISR is
 	 * unbound at this point (msgbuf_detach did it), so no new
 	 * enqueues can happen from the interrupt path.
 	 */
@@ -3992,8 +3992,8 @@ brcm_pci_detach(device_t dev)
 		mtx_destroy(&sc->sc_flowq_mtx);
 	}
 
-	brcm_pci_free_irq(sc);
-	brcm_pci_free_bars(sc);
+	bwfm_pci_free_irq(sc);
+	bwfm_pci_free_bars(sc);
 
 	if (sc->sc_fw != NULL) {
 		firmware_put(sc->sc_fw, FIRMWARE_UNLOAD);
@@ -4001,9 +4001,9 @@ brcm_pci_detach(device_t dev)
 	}
 
 	/*
-	 * Destroy the transport-owned mutexes last.  brcm.c documents
+	 * Destroy the transport-owned mutexes last.  bwfm.c documents
 	 * that these are the transport's responsibility (see the comment
-	 * on brcm_softc.sc_mtx / sc_ctl_mtx).  All in-flight sleepers
+	 * on bwfm_softc.sc_mtx / sc_ctl_mtx).  All in-flight sleepers
 	 * bailed in step 1; no other codepath can touch these now.
 	 */
 	if (mtx_initialized(&bsc->sc_ctl_mtx))
@@ -4017,53 +4017,53 @@ brcm_pci_detach(device_t dev)
 }
 
 /* ------------------------------------------------------------------
- * MSGBUF accessors — bridge functions consumed by brcm_pci_msgbuf.c.
- * Kept here so that file needs no visibility into brcm_pci_softc.
+ * MSGBUF accessors — bridge functions consumed by bwfm_pci_msgbuf.c.
+ * Kept here so that file needs no visibility into bwfm_pci_softc.
  * ------------------------------------------------------------------ */
 uint32_t
-brcm_pci_msgbuf_pcie2_base(struct brcm_pci_softc *sc)
+bwfm_pci_msgbuf_pcie2_base(struct bwfm_pci_softc *sc)
 {
 	int i;
 
 	for (i = 0; i < sc->sc_ncores; i++)
-		if (sc->sc_cores[i].id == BRCM_CORE_PCIE2)
+		if (sc->sc_cores[i].id == BWFM_CORE_PCIE2)
 			return (sc->sc_cores[i].base);
 	return (0);
 }
 
 void
-brcm_pci_msgbuf_set_window(struct brcm_pci_softc *sc, uint32_t addr)
+bwfm_pci_msgbuf_set_window(struct bwfm_pci_softc *sc, uint32_t addr)
 {
-	brcm_pci_set_window(sc, addr);
+	bwfm_pci_set_window(sc, addr);
 }
 
 struct resource *
-brcm_pci_msgbuf_bar0(struct brcm_pci_softc *sc)		{ return (sc->sc_bar0); }
+bwfm_pci_msgbuf_bar0(struct bwfm_pci_softc *sc)		{ return (sc->sc_bar0); }
 struct resource *
-brcm_pci_msgbuf_bar2(struct brcm_pci_softc *sc)		{ return (sc->sc_bar2); }
+bwfm_pci_msgbuf_bar2(struct bwfm_pci_softc *sc)		{ return (sc->sc_bar2); }
 bus_space_tag_t
-brcm_pci_msgbuf_bar0_tag(struct brcm_pci_softc *sc)	{ return (sc->sc_bar0_t); }
+bwfm_pci_msgbuf_bar0_tag(struct bwfm_pci_softc *sc)	{ return (sc->sc_bar0_t); }
 bus_space_handle_t
-brcm_pci_msgbuf_bar0_handle(struct brcm_pci_softc *sc)	{ return (sc->sc_bar0_h); }
+bwfm_pci_msgbuf_bar0_handle(struct bwfm_pci_softc *sc)	{ return (sc->sc_bar0_h); }
 bus_space_tag_t
-brcm_pci_msgbuf_bar2_tag(struct brcm_pci_softc *sc)	{ return (sc->sc_bar2_t); }
+bwfm_pci_msgbuf_bar2_tag(struct bwfm_pci_softc *sc)	{ return (sc->sc_bar2_t); }
 bus_space_handle_t
-brcm_pci_msgbuf_bar2_handle(struct brcm_pci_softc *sc)	{ return (sc->sc_bar2_h); }
+bwfm_pci_msgbuf_bar2_handle(struct bwfm_pci_softc *sc)	{ return (sc->sc_bar2_h); }
 device_t
-brcm_pci_msgbuf_dev(struct brcm_pci_softc *sc)		{ return (sc->sc_dev); }
+bwfm_pci_msgbuf_dev(struct bwfm_pci_softc *sc)		{ return (sc->sc_dev); }
 int
-brcm_pci_msgbuf_debug(struct brcm_pci_softc *sc)	{ return (sc->bus_sc.sc_debug); }
+bwfm_pci_msgbuf_debug(struct bwfm_pci_softc *sc)	{ return (sc->bus_sc.sc_debug); }
 uint32_t
-brcm_pci_msgbuf_rambase(struct brcm_pci_softc *sc __unused)
+bwfm_pci_msgbuf_rambase(struct bwfm_pci_softc *sc __unused)
 {
-	return (BRCM_PCI_RAMBASE_43602);
+	return (BWFM_PCI_RAMBASE_43602);
 }
 uint32_t
-brcm_pci_msgbuf_ramsize(struct brcm_pci_softc *sc)
+bwfm_pci_msgbuf_ramsize(struct bwfm_pci_softc *sc)
 {
 	/*
-	 * Return the cached value.  brcm_pci_ramsize_query halts the
-	 * ARM CR4 (BRCM_ARMCR4_IOCTL_CPUHALT) to read the TCM BANKINFO;
+	 * Return the cached value.  bwfm_pci_ramsize_query halts the
+	 * ARM CR4 (BWFM_ARMCR4_IOCTL_CPUHALT) to read the TCM BANKINFO;
 	 * after bring-up that would kill the running firmware and hang
 	 * the host on the next TCM access.
 	 */
@@ -4072,18 +4072,18 @@ brcm_pci_msgbuf_ramsize(struct brcm_pci_softc *sc)
 	/* Before bring-up has cached it. */
 	{
 		uint32_t sz = 0;
-		(void)brcm_pci_ramsize_query(sc, &sz);
+		(void)bwfm_pci_ramsize_query(sc, &sz);
 		return (sz);
 	}
 }
-struct brcm_pci_msgbuf *
-brcm_pci_msgbuf_state(struct brcm_pci_softc *sc)
+struct bwfm_pci_msgbuf *
+bwfm_pci_msgbuf_state(struct bwfm_pci_softc *sc)
 {
 	return (&sc->sc_msgbuf);
 }
 
 int
-brcm_pci_msgbuf_bind_intr(struct brcm_pci_softc *sc,
+bwfm_pci_msgbuf_bind_intr(struct bwfm_pci_softc *sc,
     driver_filter_t *filter, driver_intr_t *thread, void *arg)
 {
 	int error;
@@ -4104,21 +4104,21 @@ brcm_pci_msgbuf_bind_intr(struct brcm_pci_softc *sc,
 }
 
 void
-brcm_pci_msgbuf_event_up(struct brcm_pci_softc *sc, const uint8_t *payload,
+bwfm_pci_msgbuf_event_up(struct bwfm_pci_softc *sc, const uint8_t *payload,
     size_t len)
 {
 	if (!sc->bus_sc.sc_ic_attached)
 		return;
 	/*
 	 * Msgbuf event buffer layout: 14 B Ethernet header + 10 B
-	 * brcm_ethhdr + 48 B brcm_event_msg + data.  brcm_handle_event
+	 * bwfm_ethhdr + 48 B bwfm_event_msg + data.  bwfm_handle_event
 	 * expects `evpos` = offset of the event_msg = 24.
 	 */
-	brcm_handle_event(&sc->bus_sc, payload, len, 24);
+	bwfm_handle_event(&sc->bus_sc, payload, len, 24);
 }
 
 void
-brcm_pci_msgbuf_rx_up(struct brcm_pci_softc *sc, struct mbuf *m, int rssi_dbm)
+bwfm_pci_msgbuf_rx_up(struct bwfm_pci_softc *sc, struct mbuf *m, int rssi_dbm)
 {
 	if (!sc->bus_sc.sc_ic_attached || m == NULL) {
 		if (m != NULL)
@@ -4126,7 +4126,7 @@ brcm_pci_msgbuf_rx_up(struct brcm_pci_softc *sc, struct mbuf *m, int rssi_dbm)
 		return;
 	}
 	(void)rssi_dbm;
-#ifdef BRCM_PCI_PROBE_ONLY
+#ifdef BWFM_PCI_PROBE_ONLY
 	m_freem(m);
 #else
 	{
@@ -4174,7 +4174,7 @@ brcm_pci_msgbuf_rx_up(struct brcm_pci_softc *sc, struct mbuf *m, int rssi_dbm)
 }
 
 void
-brcm_pci_msgbuf_unbind_intr(struct brcm_pci_softc *sc)
+bwfm_pci_msgbuf_unbind_intr(struct bwfm_pci_softc *sc)
 {
 	if (sc->sc_irq_handle == NULL)
 		return;
@@ -4184,9 +4184,9 @@ brcm_pci_msgbuf_unbind_intr(struct brcm_pci_softc *sc)
 
 /* Sysctl: fire msgbuf_attach on a fw-live chip. */
 static int
-brcm_pci_sysctl_msgbuf_attach(SYSCTL_HANDLER_ARGS)
+bwfm_pci_sysctl_msgbuf_attach(SYSCTL_HANDLER_ARGS)
 {
-	struct brcm_pci_softc *sc = arg1;
+	struct bwfm_pci_softc *sc = arg1;
 	int trig = 0, error;
 
 	error = sysctl_handle_int(oidp, &trig, 0, req);
@@ -4194,7 +4194,7 @@ brcm_pci_sysctl_msgbuf_attach(SYSCTL_HANDLER_ARGS)
 		return (error);
 	if (sc->sc_autostart_running)
 		return (EBUSY);
-	return (brcm_pci_msgbuf_attach(sc));
+	return (bwfm_pci_msgbuf_attach(sc));
 }
 
 /*
@@ -4210,10 +4210,10 @@ brcm_pci_sysctl_msgbuf_attach(SYSCTL_HANDLER_ARGS)
  * previous one.
  */
 static int
-brcm_pci_sysctl_dump_console(SYSCTL_HANDLER_ARGS)
+bwfm_pci_sysctl_dump_console(SYSCTL_HANDLER_ARGS)
 {
-	struct brcm_pci_softc *sc = arg1;
-	struct brcm_pci_msgbuf *mb = brcm_pci_msgbuf_state(sc);
+	struct bwfm_pci_softc *sc = arg1;
+	struct bwfm_pci_msgbuf *mb = bwfm_pci_msgbuf_state(sc);
 	uint32_t base, buf_addr, bufsize, write_idx;
 	uint32_t idx, count;
 	int trig = 0, error;
@@ -4283,12 +4283,12 @@ brcm_pci_sysctl_dump_console(SYSCTL_HANDLER_ARGS)
 }
 
 /* WLC_GET_VAR */
-#define	BRCM_DCMD_GET_VAR	262
+#define	BWFM_DCMD_GET_VAR	262
 /* Sysctl: write 1 to send WLC_UP. */
 static int
-brcm_pci_sysctl_wlc_up(SYSCTL_HANDLER_ARGS)
+bwfm_pci_sysctl_wlc_up(SYSCTL_HANDLER_ARGS)
 {
-	struct brcm_pci_softc *sc = arg1;
+	struct bwfm_pci_softc *sc = arg1;
 	int trig = 0, error;
 
 	error = sysctl_handle_int(oidp, &trig, 0, req);
@@ -4296,7 +4296,7 @@ brcm_pci_sysctl_wlc_up(SYSCTL_HANDLER_ARGS)
 		return (error);
 	if (sc->sc_autostart_running)
 		return (EBUSY);
-	error = brcm_pci_msgbuf_dcmd_set_int(sc, BRCM_C_UP, 0);
+	error = bwfm_pci_msgbuf_dcmd_set_int(sc, BWFM_C_UP, 0);
 	device_printf(sc->sc_dev, "wlc_up: %s (err=%d)\n",
 	    error == 0 ? "ok" : "fail", error);
 	if (error == 0)
@@ -4310,15 +4310,15 @@ brcm_pci_sysctl_wlc_up(SYSCTL_HANDLER_ARGS)
  * own rather than during a live association.
  */
 static int
-brcm_pci_sysctl_delete_flowring(SYSCTL_HANDLER_ARGS)
+bwfm_pci_sysctl_delete_flowring(SYSCTL_HANDLER_ARGS)
 {
-	struct brcm_pci_softc *sc = arg1;
+	struct bwfm_pci_softc *sc = arg1;
 	int flowid = -1, error;
 
 	error = sysctl_handle_int(oidp, &flowid, 0, req);
 	if (error != 0 || req->newptr == NULL || flowid < 0)
 		return (error);
-	error = brcm_pci_msgbuf_flowring_delete(sc, (uint16_t)flowid);
+	error = bwfm_pci_msgbuf_flowring_delete(sc, (uint16_t)flowid);
 	device_printf(sc->sc_dev,
 	    "delete_flowring: local_id=%d rc=%d\n", flowid, error);
 	return (0);
@@ -4326,15 +4326,15 @@ brcm_pci_sysctl_delete_flowring(SYSCTL_HANDLER_ARGS)
 
 /* Sysctl: write 1 to send WLC_DOWN. */
 static int
-brcm_pci_sysctl_wlc_down(SYSCTL_HANDLER_ARGS)
+bwfm_pci_sysctl_wlc_down(SYSCTL_HANDLER_ARGS)
 {
-	struct brcm_pci_softc *sc = arg1;
+	struct bwfm_pci_softc *sc = arg1;
 	int trig = 0, error;
 
 	error = sysctl_handle_int(oidp, &trig, 0, req);
 	if (error != 0 || req->newptr == NULL || trig == 0)
 		return (error);
-	error = brcm_pci_msgbuf_dcmd_set_int(sc, BRCM_C_DOWN, 0);
+	error = bwfm_pci_msgbuf_dcmd_set_int(sc, BWFM_C_DOWN, 0);
 	device_printf(sc->sc_dev, "wlc_down: %s (err=%d)\n",
 	    error == 0 ? "ok" : "fail", error);
 	return (0);
@@ -4342,15 +4342,15 @@ brcm_pci_sysctl_wlc_down(SYSCTL_HANDLER_ARGS)
 
 /* Sysctl: read the cur_etheraddr iovar and format it as a MAC string. */
 static int
-brcm_pci_sysctl_mac_addr(SYSCTL_HANDLER_ARGS)
+bwfm_pci_sysctl_mac_addr(SYSCTL_HANDLER_ARGS)
 {
-	struct brcm_pci_softc *sc = arg1;
+	struct bwfm_pci_softc *sc = arg1;
 	uint8_t mac[6] = { 0 };
 	char buf[32];
 	size_t rlen = sizeof(mac);
 	int error;
 
-	error = brcm_pci_msgbuf_dcmd_get_var(sc, "cur_etheraddr",
+	error = bwfm_pci_msgbuf_dcmd_get_var(sc, "cur_etheraddr",
 	    mac, &rlen);
 	if (error != 0 || rlen != sizeof(mac))
 		snprintf(buf, sizeof(buf), "(err=%d rlen=%zu)", error, rlen);
@@ -4363,23 +4363,23 @@ brcm_pci_sysctl_mac_addr(SYSCTL_HANDLER_ARGS)
 
 /* Firmware setup run before net80211 attach and after a cold reattach. */
 static void
-brcm_pci_preinit_dcmds(struct brcm_pci_softc *sc)
+bwfm_pci_preinit_dcmds(struct bwfm_pci_softc *sc)
 {
-	uint8_t evmask[BRCM_EVENT_MASK_LEN];
+	uint8_t evmask[BWFM_EVENT_MASK_LEN];
 	uint8_t buf[128];
 	size_t rlen;
 	uint32_t v;
 	int error;
 
 	/* GET revinfo (informational). */
-	error = brcm_pci_msgbuf_dcmd_get_int(sc, BRCM_C_GET_REVINFO, &v);
+	error = bwfm_pci_msgbuf_dcmd_get_int(sc, BWFM_C_GET_REVINFO, &v);
 	device_printf(sc->sc_dev,
 	    "preinit: GET revinfo=0x%08x (err=%d)\n", v, error);
 
 	/* GET ver (informational). */
 	memset(buf, 0, sizeof(buf));
 	rlen = sizeof(buf);
-	error = brcm_pci_msgbuf_dcmd_get_var(sc, "ver", buf, &rlen);
+	error = bwfm_pci_msgbuf_dcmd_get_var(sc, "ver", buf, &rlen);
 	if (error == 0 && rlen > 0) {
 		buf[sizeof(buf) - 1] = 0;
 		device_printf(sc->sc_dev,
@@ -4388,7 +4388,7 @@ brcm_pci_preinit_dcmds(struct brcm_pci_softc *sc)
 
 	/* SET mpc=1. */
 	v = htole32(1);
-	error = brcm_pci_msgbuf_dcmd_set_var(sc, "mpc", &v, sizeof(v));
+	error = bwfm_pci_msgbuf_dcmd_set_var(sc, "mpc", &v, sizeof(v));
 	device_printf(sc->sc_dev,
 	    "preinit: SET mpc=1 (err=%d)\n", error);
 
@@ -4400,57 +4400,57 @@ brcm_pci_preinit_dcmds(struct brcm_pci_softc *sc)
 	 */
 	memset(evmask, 0, sizeof(evmask));
 	rlen = sizeof(evmask);
-	error = brcm_pci_msgbuf_dcmd_get_var(sc, "event_msgs", evmask,
+	error = bwfm_pci_msgbuf_dcmd_get_var(sc, "event_msgs", evmask,
 	    &rlen);
 	device_printf(sc->sc_dev,
 	    "preinit: GET event_msgs (err=%d)\n", error);
 #define	SETBIT(m, b)	((m)[(b) / 8] |= 1u << ((b) % 8))
-	SETBIT(evmask, BRCM_E_IF);
-	SETBIT(evmask, BRCM_E_TYPE_ESCAN_RESULT);
-	SETBIT(evmask, BRCM_E_TYPE_LINK);
-	SETBIT(evmask, BRCM_E_TYPE_AUTH);
-	SETBIT(evmask, BRCM_E_TYPE_ASSOC);
-	SETBIT(evmask, BRCM_E_TYPE_DISASSOC);
-	SETBIT(evmask, BRCM_E_DEAUTH);
-	SETBIT(evmask, BRCM_E_TYPE_SET_SSID);
-	SETBIT(evmask, BRCM_E_TYPE_JOIN);
-	SETBIT(evmask, BRCM_E_EAPOL_MSG);
+	SETBIT(evmask, BWFM_E_IF);
+	SETBIT(evmask, BWFM_E_TYPE_ESCAN_RESULT);
+	SETBIT(evmask, BWFM_E_TYPE_LINK);
+	SETBIT(evmask, BWFM_E_TYPE_AUTH);
+	SETBIT(evmask, BWFM_E_TYPE_ASSOC);
+	SETBIT(evmask, BWFM_E_TYPE_DISASSOC);
+	SETBIT(evmask, BWFM_E_DEAUTH);
+	SETBIT(evmask, BWFM_E_TYPE_SET_SSID);
+	SETBIT(evmask, BWFM_E_TYPE_JOIN);
+	SETBIT(evmask, BWFM_E_EAPOL_MSG);
 #undef	SETBIT
-	error = brcm_pci_msgbuf_dcmd_set_var(sc, "event_msgs", evmask,
+	error = bwfm_pci_msgbuf_dcmd_set_var(sc, "event_msgs", evmask,
 	    sizeof(evmask));
 	device_printf(sc->sc_dev,
 	    "preinit: SET event_msgs (err=%d)\n", error);
 
 	/* SET SCAN_CHANNEL_TIME=40. */
-	error = brcm_pci_msgbuf_dcmd_set_int(sc,
-	    BRCM_C_SET_SCAN_CHANNEL_TIME, 40);
+	error = bwfm_pci_msgbuf_dcmd_set_int(sc,
+	    BWFM_C_SET_SCAN_CHANNEL_TIME, 40);
 	device_printf(sc->sc_dev,
 	    "preinit: SET SCAN_CHANNEL_TIME=40 (err=%d)\n", error);
 
 	/* SET SCAN_UNASSOC_TIME=40. */
-	error = brcm_pci_msgbuf_dcmd_set_int(sc,
-	    BRCM_C_SET_SCAN_UNASSOC_TIME, 40);
+	error = bwfm_pci_msgbuf_dcmd_set_int(sc,
+	    BWFM_C_SET_SCAN_UNASSOC_TIME, 40);
 	device_printf(sc->sc_dev,
 	    "preinit: SET SCAN_UNASSOC_TIME=40 (err=%d)\n", error);
 
 	/* SET txbf=1 (best-effort). */
 	v = htole32(1);
-	error = brcm_pci_msgbuf_dcmd_set_var(sc, "txbf", &v, sizeof(v));
+	error = bwfm_pci_msgbuf_dcmd_set_var(sc, "txbf", &v, sizeof(v));
 	device_printf(sc->sc_dev,
 	    "preinit: SET txbf=1 (err=%d)\n", error);
 }
 
 /*
  * Bring up the net80211 attachment.  Reads the chip's MAC via
- * GET_VAR("cur_etheraddr"), populates the shared brcm_softc, runs
- * the preinit DCMD chain, and calls brcm_attach() to expose the
+ * GET_VAR("cur_etheraddr"), populates the shared bwfm_softc, runs
+ * the preinit DCMD chain, and calls bwfm_attach() to expose the
  * driver as wlan0.  Idempotent — subsequent writes with sc_ic
  * already attached return 0 without side effects.
  */
 static int
-brcm_pci_net80211_attach(struct brcm_pci_softc *sc)
+bwfm_pci_net80211_attach(struct bwfm_pci_softc *sc)
 {
-	struct brcm_softc *bsc = &sc->bus_sc;
+	struct bwfm_softc *bsc = &sc->bus_sc;
 	uint8_t mac[6] = { 0 };
 	size_t rlen = sizeof(mac);
 	int error;
@@ -4460,7 +4460,7 @@ brcm_pci_net80211_attach(struct brcm_pci_softc *sc)
 		    "net80211_attach: already attached\n");
 		return (0);
 	}
-	error = brcm_pci_msgbuf_dcmd_get_var(sc, "cur_etheraddr", mac, &rlen);
+	error = bwfm_pci_msgbuf_dcmd_get_var(sc, "cur_etheraddr", mac, &rlen);
 	if (error != 0 || rlen != sizeof(mac)) {
 		device_printf(sc->sc_dev,
 		    "net80211_attach: cur_etheraddr get failed (err=%d "
@@ -4478,25 +4478,25 @@ brcm_pci_net80211_attach(struct brcm_pci_softc *sc)
 	 * configured by the time any scan or join request can arrive
 	 * from userland.
 	 */
-	brcm_pci_preinit_dcmds(sc);
+	bwfm_pci_preinit_dcmds(sc);
 
-	error = brcm_attach(bsc);
+	error = bwfm_attach(bsc);
 	if (error != 0) {
 		device_printf(sc->sc_dev,
-		    "net80211_attach: brcm_attach failed %d\n", error);
+		    "net80211_attach: bwfm_attach failed %d\n", error);
 		return (error);
 	}
 	/*
 	 * Leave sup_wpa unset at attach — the join dispatch chooses the
-	 * mode later.  brcm_join_wpa2 sets sup_wpa=1 (fw supplicant, PSK
+	 * mode later.  bwfm_join_wpa2 sets sup_wpa=1 (fw supplicant, PSK
 	 * offload, Linux brcmfmac parity — needed for the fw to actually
-	 * encrypt post-4-way data with the correct PTK); brcm_join_wpa2_
+	 * encrypt post-4-way data with the correct PTK); bwfm_join_wpa2_
 	 * host_eapol sets sup_wpa=0 (userspace wpa_supplicant runs 4-way,
 	 * wsec_key installs the PTK we derived).  Forcing sup_wpa=0 here
 	 * would break the firmware-supplicant mode: the chip would not
 	 * transmit data, since the wsec_key path is not running.
 	 */
-	brcm_sysctl_attach(bsc);
+	bwfm_sysctl_attach(bsc);
 	device_printf(sc->sc_dev,
 	    "net80211_attach: OK — create wlan0 with "
 	    "`ifconfig wlan0 create wlandev %s`\n",
@@ -4505,9 +4505,9 @@ brcm_pci_net80211_attach(struct brcm_pci_softc *sc)
 }
 
 static int
-brcm_pci_sysctl_net80211_attach(SYSCTL_HANDLER_ARGS)
+bwfm_pci_sysctl_net80211_attach(SYSCTL_HANDLER_ARGS)
 {
-	struct brcm_pci_softc *sc = arg1;
+	struct bwfm_pci_softc *sc = arg1;
 	int trig = 0, error;
 
 	error = sysctl_handle_int(oidp, &trig, 0, req);
@@ -4515,7 +4515,7 @@ brcm_pci_sysctl_net80211_attach(SYSCTL_HANDLER_ARGS)
 		return (error);
 	if (sc->sc_autostart_running)
 		return (EBUSY);
-	return (brcm_pci_net80211_attach(sc));
+	return (bwfm_pci_net80211_attach(sc));
 }
 
 /*
@@ -4525,34 +4525,34 @@ brcm_pci_sysctl_net80211_attach(SYSCTL_HANDLER_ARGS)
  * detaching.
  */
 static void
-brcm_pci_autostart(void *arg)
+bwfm_pci_autostart(void *arg)
 {
-	struct brcm_pci_softc *sc = arg;
-	struct brcm_softc *bsc = &sc->bus_sc;
+	struct bwfm_pci_softc *sc = arg;
+	struct bwfm_softc *bsc = &sc->bus_sc;
 	const char *step = "firmware";
 	int error = 0;
 
 	device_printf(sc->sc_dev, "autostart: bringing the chip up\n");
 	if (!sc->sc_fw_running &&
-	    (error = brcm_pci_bringup_sequence(sc)) != 0)
+	    (error = bwfm_pci_bringup_sequence(sc)) != 0)
 		goto out;
 	if (bsc->sc_dying)
 		goto out;
 	step = "msgbuf";
-	if ((error = brcm_pci_msgbuf_attach(sc)) != 0)
+	if ((error = bwfm_pci_msgbuf_attach(sc)) != 0)
 		goto out;
-	pause("brcmup", 2 * hz);
+	pause("bwfmup", 2 * hz);
 	if (bsc->sc_dying)
 		goto out;
 	step = "WLC_UP";
-	if ((error = brcm_pci_msgbuf_dcmd_set_int(sc, BRCM_C_UP, 0)) != 0)
+	if ((error = bwfm_pci_msgbuf_dcmd_set_int(sc, BWFM_C_UP, 0)) != 0)
 		goto out;
 	bsc->sc_wlc_up = true;
-	pause("brcmup", hz);
+	pause("bwfmup", hz);
 	if (bsc->sc_dying)
 		goto out;
 	step = "net80211";
-	error = brcm_pci_net80211_attach(sc);
+	error = bwfm_pci_net80211_attach(sc);
 out:
 	if (bsc->sc_dying)
 		device_printf(sc->sc_dev, "autostart: stopped at %s for "
@@ -4570,10 +4570,10 @@ out:
 
 /* Sysctl: detach net80211 (undo net80211_attach). */
 static int
-brcm_pci_sysctl_net80211_detach(SYSCTL_HANDLER_ARGS)
+bwfm_pci_sysctl_net80211_detach(SYSCTL_HANDLER_ARGS)
 {
-	struct brcm_pci_softc *sc = arg1;
-	struct brcm_softc *bsc = &sc->bus_sc;
+	struct bwfm_pci_softc *sc = arg1;
+	struct bwfm_softc *bsc = &sc->bus_sc;
 	int trig = 0, error;
 
 	error = sysctl_handle_int(oidp, &trig, 0, req);
@@ -4585,16 +4585,16 @@ brcm_pci_sysctl_net80211_detach(SYSCTL_HANDLER_ARGS)
 		    "net80211_detach: not attached\n");
 		return (0);
 	}
-	brcm_detach(bsc);
+	bwfm_detach(bsc);
 	device_printf(sc->sc_dev, "net80211_detach: OK\n");
 	return (0);
 }
 
 /*
  * ACPI S3 / D3 suspend/resume.  Refused by default (opt in with
- * hw.brcm_pci.pm_supported=1).  Warm resume works when the platform
+ * hw.bwfm_pci.pm_supported=1).  Warm resume works when the platform
  * keeps aux power to the chip; after a cold resume (chip power off)
- * resume falls back to brcm_pci_cold_reattach, and if that fails the
+ * resume falls back to bwfm_pci_cold_reattach, and if that fails the
  * module has to be reloaded.
  *
  *   - Suspend: brings VAPs to INIT, sends WLC_DOWN, then the mbdata
@@ -4606,24 +4606,24 @@ brcm_pci_sysctl_net80211_detach(SYSCTL_HANDLER_ARGS)
  *     warm and net80211 is usable again; otherwise the chip is
  *     treated as cold and rebuilt.
  */
-static int brcm_pci_pm_supported = 0;
-SYSCTL_INT(_hw_brcm_pci, OID_AUTO, pm_supported, CTLFLAG_RDTUN,
-    &brcm_pci_pm_supported, 0,
+static int bwfm_pci_pm_supported = 0;
+SYSCTL_INT(_hw_bwfm_pci, OID_AUTO, pm_supported, CTLFLAG_RDTUN,
+    &bwfm_pci_pm_supported, 0,
     "Allow S3/D3 suspend/resume attempts.  Default 0 = refuse suspend "
     "(safe).  Set to 1 in loader.conf for best-effort warm-resume; "
     "cold resume still requires kldunload+kldload.");
 
 static int
-brcm_pci_suspend(device_t dev)
+bwfm_pci_suspend(device_t dev)
 {
-	struct brcm_pci_softc *sc = device_get_softc(dev);
-	struct brcm_softc *bsc = &sc->bus_sc;
+	struct bwfm_pci_softc *sc = device_get_softc(dev);
+	struct bwfm_softc *bsc = &sc->bus_sc;
 	struct ieee80211vap *vap;
 	uint32_t v;
 
-	if (!brcm_pci_pm_supported) {
+	if (!bwfm_pci_pm_supported) {
 		device_printf(dev,
-		    "suspend refused (hw.brcm_pci.pm_supported=0); "
+		    "suspend refused (hw.bwfm_pci.pm_supported=0); "
 		    "set to 1 in loader.conf to opt into best-effort PM\n");
 		return (EOPNOTSUPP);
 	}
@@ -4640,7 +4640,7 @@ brcm_pci_suspend(device_t dev)
 	}
 	if (bsc->sc_wlc_up) {
 		v = htole32(0);
-		(void)brcm_dcmd_set(bsc, BRCM_C_DOWN, &v, sizeof(v));
+		(void)bwfm_dcmd_set(bsc, BWFM_C_DOWN, &v, sizeof(v));
 		bsc->sc_wlc_up = false;
 	}
 
@@ -4652,11 +4652,11 @@ brcm_pci_suspend(device_t dev)
 	 * whatever state the chip is left in.
 	 */
 	{
-		int rc = brcm_pci_msgbuf_send_mb_data(sc,
-		    BRCM_H2D_HOST_D3_INFORM);
+		int rc = bwfm_pci_msgbuf_send_mb_data(sc,
+		    BWFM_H2D_HOST_D3_INFORM);
 		if (rc == 0) {
-			rc = brcm_pci_msgbuf_wait_mb_ack(sc,
-			    BRCM_D2H_DEV_D3_ACK, 2000);
+			rc = bwfm_pci_msgbuf_wait_mb_ack(sc,
+			    BWFM_D2H_DEV_D3_ACK, 2000);
 			device_printf(dev,
 			    "suspend: D3_INFORM sent, D3_ACK rc=%d\n", rc);
 		} else {
@@ -4670,13 +4670,13 @@ brcm_pci_suspend(device_t dev)
 }
 
 static int
-brcm_pci_resume(device_t dev)
+bwfm_pci_resume(device_t dev)
 {
-	struct brcm_pci_softc *sc = device_get_softc(dev);
-	struct brcm_softc *bsc = &sc->bus_sc;
+	struct bwfm_pci_softc *sc = device_get_softc(dev);
+	struct bwfm_softc *bsc = &sc->bus_sc;
 	uint32_t v;
 
-	if (!brcm_pci_pm_supported)
+	if (!bwfm_pci_pm_supported)
 		return (0);
 
 	/*
@@ -4686,7 +4686,7 @@ brcm_pci_resume(device_t dev)
 	 * way it acks D3.  If the D3 side never reached the firmware the
 	 * message is meaningless but harmless.
 	 */
-	(void)brcm_pci_msgbuf_send_mb_data(sc, BRCM_H2D_HOST_D0_INFORM);
+	(void)bwfm_pci_msgbuf_send_mb_data(sc, BWFM_H2D_HOST_D0_INFORM);
 
 	/*
 	 * Warm resume: if config space still reads the chip's vendor ID
@@ -4695,9 +4695,9 @@ brcm_pci_resume(device_t dev)
 	 * served by the root complex, so the probe is safe even on a cold
 	 * chip; it just returns 0xffff and we take the cold path.
 	 */
-	if (brcm_pci_chip_alive_cfg(sc)) {
+	if (bwfm_pci_chip_alive_cfg(sc)) {
 		v = htole32(1);
-		if (brcm_dcmd_set(bsc, BRCM_C_UP, &v, sizeof(v)) == 0) {
+		if (bwfm_dcmd_set(bsc, BWFM_C_UP, &v, sizeof(v)) == 0) {
 			bsc->sc_wlc_up = true;
 			device_printf(dev,
 			    "resume: warm ok (chip retained)\n");
@@ -4712,10 +4712,10 @@ brcm_pci_resume(device_t dev)
 
 	/*
 	 * Cold resume: the firmware is gone, so rebuild everything (see
-	 * brcm_pci_cold_reattach).  net80211 stays attached and the VAP
+	 * bwfm_pci_cold_reattach).  net80211 stays attached and the VAP
 	 * re-associates once the firmware is up.
 	 */
-	if (brcm_pci_cold_reattach(sc) != 0) {
+	if (bwfm_pci_cold_reattach(sc) != 0) {
 		device_printf(dev,
 		    "resume: cold reattach failed — kldunload+kldload "
 		    "to recover\n");
@@ -4723,24 +4723,24 @@ brcm_pci_resume(device_t dev)
 	return (0);
 }
 
-static device_method_t brcm_pci_methods[] = {
-	DEVMETHOD(device_probe,		brcm_pci_probe),
-	DEVMETHOD(device_attach,	brcm_pci_attach),
-	DEVMETHOD(device_detach,	brcm_pci_detach),
-	DEVMETHOD(device_suspend,	brcm_pci_suspend),
-	DEVMETHOD(device_resume,	brcm_pci_resume),
+static device_method_t bwfm_pci_methods[] = {
+	DEVMETHOD(device_probe,		bwfm_pci_probe),
+	DEVMETHOD(device_attach,	bwfm_pci_attach),
+	DEVMETHOD(device_detach,	bwfm_pci_detach),
+	DEVMETHOD(device_suspend,	bwfm_pci_suspend),
+	DEVMETHOD(device_resume,	bwfm_pci_resume),
 	DEVMETHOD_END
 };
 
-static driver_t brcm_pci_driver = {
-	"brcm_pci",
-	brcm_pci_methods,
-	sizeof(struct brcm_pci_softc)
+static driver_t bwfm_pci_driver = {
+	"bwfm_pci",
+	bwfm_pci_methods,
+	sizeof(struct bwfm_pci_softc)
 };
 
-DRIVER_MODULE(brcm_pci, pci, brcm_pci_driver, NULL, NULL);
-MODULE_DEPEND(brcm_pci, pci, 1, 1, 1);
-#ifndef BRCM_PCI_PROBE_ONLY
-MODULE_DEPEND(brcm_pci, wlan, 1, 1, 1);
+DRIVER_MODULE(bwfm_pci, pci, bwfm_pci_driver, NULL, NULL);
+MODULE_DEPEND(bwfm_pci, pci, 1, 1, 1);
+#ifndef BWFM_PCI_PROBE_ONLY
+MODULE_DEPEND(bwfm_pci, wlan, 1, 1, 1);
 #endif
-MODULE_VERSION(brcm_pci, 1);
+MODULE_VERSION(bwfm_pci, 1);
