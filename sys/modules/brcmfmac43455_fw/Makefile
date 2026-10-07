@@ -3,14 +3,18 @@
 # Wraps three blobs into one kld so bwfm_sdio can get them through
 # firmware(9) without needing the root file system at attach time:
 #
-#   brcmfmac43455-sdio.bin       Cortex-R4 firmware, 7.45.18 (r538002)
+#   brcmfmac43455-sdio.bin       Cortex-R4 firmware, 7.45.265 (28bca26 CY)
 #   brcmfmac43455-sdio.txt       NVRAM (board, antenna, coex)
 #   brcmfmac43455-sdio.clm_blob  country-locale module
 #
 # Sources:
-#   .bin       linux-firmware brcm/brcmfmac43455-sdio.bin as shipped in
-#              its 2019 and 2020 releases (Broadcom's build, before the
-#              Cypress one replaced it).  Licence: LICENCE.broadcom_bcm43xx.
+#   .bin       RPi-Distro firmware-nonfree (bookworm)
+#              cypress/cyfmac43455-sdio-standard.bin, Cypress 7.45.265
+#              built Aug 29 2023.  Licence: LICENCE.cypress.  It replaces
+#              Broadcom's 7.45.18 from linux-firmware, whose transmitter
+#              wedged on a Pi 4 within a minute of association: frames
+#              queued but the MAC sent almost none, the A-MPDU watchdog
+#              reset it over and over, and unicast traffic stopped.
 #   .txt       RPi-Distro firmware-nonfree brcm/brcmfmac43455-sdio.txt.
 #              Licence: LICENCE.broadcom_bcm43xx.
 #   .clm_blob  RPi-Distro firmware-nonfree (bullseye)

@@ -13,7 +13,7 @@ SRCS=	if_bwfm_sdio.c \
 	bwfm_sdpcm.c \
 	bwfm.c \
 	ieee80211_fullmac.c \
-	bus_if.h device_if.h \
+	bus_if.h device_if.h mmcbr_if.h mmcbus_if.h \
 	opt_wlan.h
 
 CFLAGS+=	-I${SRCTOP}/sys/dev/bwfm \

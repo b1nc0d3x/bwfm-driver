@@ -186,8 +186,15 @@ struct bwfm_chip_info {
 #define	BWFM_C_SET_ROAM_DELTA		57	/* {dBm, band} */
 #define	BWFM_C_GET_PM			85
 #define	BWFM_C_SET_PM			86	/* PM_OFF/MAX/FAST */
+#define	BWFM_C_GET_RSSI			127	/* {int32 dBm, ea[6]} */
+#define	BWFM_C_GET_PHY_NOISE		135	/* int32 dBm */
+#define	BWFM_C_GET_BANDLIST		140	/* {count, band...} */
 #define	BWFM_C_GET_REVINFO		98
+#define	BWFM_C_SET_BCNPRD		76	/* beacon interval, TU */
+#define	BWFM_C_SET_DTIMPRD		78	/* DTIM period, beacons */
+#define	BWFM_C_SET_AP			118	/* 1 = access point */
 #define	BWFM_C_SET_SCB_AUTHORIZE	121	/* 6-byte MAC payload */
+#define	BWFM_C_SCB_DEAUTHENTICATE_FOR_REASON 201 /* scb_val: reason, MAC */
 #define	BWFM_C_GET_BSS_INFO		136
 #define	BWFM_C_SET_SCAN_CHANNEL_TIME	185
 #define	BWFM_C_SET_SCAN_UNASSOC_TIME	187
@@ -317,9 +324,14 @@ struct bwfm_event_msg {
 #define	BWFM_E_TYPE_SET_SSID		0
 #define	BWFM_E_TYPE_JOIN		1
 #define	BWFM_E_TYPE_AUTH		3
+#define	BWFM_E_AUTH_IND			4	/* AP: station authenticated */
 #define	BWFM_E_DEAUTH			5
+#define	BWFM_E_DEAUTH_IND		6	/* AP: station deauthenticated */
 #define	BWFM_E_TYPE_ASSOC		7
+#define	BWFM_E_ASSOC_IND		8	/* AP: station associated */
+#define	BWFM_E_REASSOC_IND		10	/* AP: station reassociated */
 #define	BWFM_E_TYPE_DISASSOC		11
+#define	BWFM_E_DISASSOC_IND		12	/* AP: station disassociated */
 #define	BWFM_E_TYPE_LINK		16
 #define	BWFM_E_EAPOL_MSG		25
 #define	BWFM_E_IF			54
@@ -402,6 +414,7 @@ struct bwfm_wsec_key {
 #define	BWFM_WSEC_AES			(1u << 2)
 
 #define	BWFM_WPA_AUTH_DISABLED		(0u << 0)
+#define	BWFM_WPA_AUTH_WPA_UNSPEC	(1u << 1)	/* WPA/802.1X */
 #define	BWFM_WPA_AUTH_WPA_PSK		(1u << 2)	/* WPA-PSK */
 #define	BWFM_WPA_AUTH_WPA2_UNSPEC	(1u << 6)	/* WPA2/802.1X */
 #define	BWFM_WPA_AUTH_WPA2_PSK		(1u << 7)	/* WPA2-PSK */

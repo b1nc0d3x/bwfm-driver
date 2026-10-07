@@ -62,12 +62,7 @@ Loader tunables
 ---------------
 
     hw.bwfm_pci.autostart=0
-        Leave the chip alone after attach and run the bring-up by hand:
-
-            sysctl dev.bwfm_pci.0.bringup=1     # skip if fw_running is 1
-            sysctl dev.bwfm_pci.0.msgbuf_attach=1
-            sysctl dev.bwfm_pci.0.wlc_up=1
-            sysctl dev.bwfm_pci.0.net80211_attach=1
+        Leave the chip down after attach.
 
     hw.bwfm_pci.attach_appu_warm=0
         Skip the warm-up sequence at attach (default 1).
@@ -85,34 +80,13 @@ Sysctls (dev.bwfm_pci.0)
 ------------------------
 
     debug                  log verbosity (0 = quiet)
-    chip_alive             write 1 to check PCIe config space; safe in
-                           any chip state
-    fw_running             1 once bring-up has started the firmware
-    bringup                run the chip bring-up; refused while
-                           fw_running is 1
-    msgbuf_attach          attach the msgbuf protocol rings
-    wlc_up / wlc_down      send WLC_UP / WLC_DOWN to the firmware
-    net80211_attach        attach to net80211 (then create wlan0)
-    net80211_detach        undo net80211_attach
-    delete_flowring        write a flow ID to send FLOW_RING_DELETE
-    dump_console           drain the firmware console into dmesg
-    mac_addr               the chip's MAC address (cur_etheraddr)
-    d3_probe               firmware D3 inform/ack round trip
-    cold_reattach          firmware re-upload and full re-bring-up, as
-                           on a cold resume; drops the association
+    net80211_detach        detach from net80211 before kldunload
     crash_recover_threshold
                            consecutive command timeouts before an
-                           automatic cold_reattach (default 0, off: a
-                           timeout does not prove the firmware crashed,
-                           and rebuilding a running chip can hang the
-                           host)
-    crash_recover_events   recoveries run since attach
-    crash_probe            inject a fake crash to exercise recovery
-
-bringup is refused once the firmware is running, because writing the
-image over running firmware kills it.  The four bring-up sysctls are
-refused while the autostart thread is still running, and
-net80211_attach does nothing the second time.
+                           automatic firmware re-upload and re-bring-up
+                           (default 0, off: a timeout does not prove the
+                           firmware crashed, and rebuilding a running
+                           chip can hang the host)
 
 Security
 --------
@@ -125,9 +99,8 @@ FT.
 Known limits
 ------------
 
-- Do not kldunload bwfm_pci after a vap has been created; reboot.
-  Detach is refused while net80211 is attached (destroy wlan0 and
-  write 1 to net80211_detach first).
+- Detach is refused while net80211 is attached: destroy wlan0 and
+  write 1 to net80211_detach before kldunload.
 - After the wireless power rail has been fully power-cycled, the
   firmware has been seen to halt during PA calibration.
 - Only one access point has been tested.

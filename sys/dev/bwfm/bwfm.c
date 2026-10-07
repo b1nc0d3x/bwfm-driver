@@ -525,121 +525,18 @@ bwfm_rxctl(struct bwfm_softc *sc, const void *buf, size_t len)
 }
 
 /*
- * Walk a firmware-supplied IE blob and populate the IE-pointer fields
- * of an ieee80211_scanparams.  Same shape as ieee80211_parse_beacon's
- * IE switch, but operates on a raw byte range — no mbuf, no node, no
- * IEEE80211_DISCARD logging.  Caller must zero `sp` first.
- *
- * Stack budget on aarch64 is ~16 KB.  Going through ieee80211_input ->
- * sta_recv_mgmt -> ieee80211_parse_beacon costs ~3 frames and ~1 KB
- * of locals per call.  We're invoked once per BSS inside a per-event
- * loop, so trimming that fat is required for sustained scans not to
- * overflow the kthread stack.
- */
-static void
-bwfm_walk_ies(const uint8_t *ies, size_t ies_len,
-    struct ieee80211_scanparams *sp)
-{
-	const uint8_t *frm, *efrm;
-
-	frm = ies;
-	efrm = ies + ies_len;
-	while (efrm - frm > 1) {
-		if (frm[1] + 2 > efrm - frm)
-			break;
-		switch (*frm) {
-		case IEEE80211_ELEMID_SSID:
-			sp->ssid = __DECONST(uint8_t *, frm);
-			break;
-		case IEEE80211_ELEMID_RATES:
-			sp->rates = __DECONST(uint8_t *, frm);
-			break;
-		case IEEE80211_ELEMID_COUNTRY:
-			sp->country = __DECONST(uint8_t *, frm);
-			break;
-		case IEEE80211_ELEMID_DSPARMS:
-			if (frm[1] >= 1)
-				sp->chan = frm[2];
-			break;
-		case IEEE80211_ELEMID_TIM:
-			sp->tim = __DECONST(uint8_t *, frm);
-			sp->timoff = frm - ies;
-			break;
-		case IEEE80211_ELEMID_XRATES:
-			sp->xrates = __DECONST(uint8_t *, frm);
-			break;
-		case IEEE80211_ELEMID_ERP:
-			if (frm[1] == 1)
-				sp->erp = frm[2] | 0x100;
-			break;
-		case IEEE80211_ELEMID_HTCAP:
-			sp->htcap = __DECONST(uint8_t *, frm);
-			break;
-		case IEEE80211_ELEMID_VHT_CAP:
-			sp->vhtcap = __DECONST(uint8_t *, frm);
-			break;
-		case IEEE80211_ELEMID_VHT_OPMODE:
-			sp->vhtopmode = __DECONST(uint8_t *, frm);
-			break;
-		case IEEE80211_ELEMID_RSN:
-			sp->rsn = __DECONST(uint8_t *, frm);
-			break;
-		case IEEE80211_ELEMID_HTINFO:
-			sp->htinfo = __DECONST(uint8_t *, frm);
-			break;
-#ifdef IEEE80211_SUPPORT_MESH
-		case IEEE80211_ELEMID_MESHID:
-			sp->meshid = __DECONST(uint8_t *, frm);
-			break;
-		case IEEE80211_ELEMID_MESHCONF:
-			sp->meshconf = __DECONST(uint8_t *, frm);
-			break;
-#endif
-		case IEEE80211_ELEMID_VENDOR: {
-			static const uint8_t wpa_oui[4] = { 0x00, 0x50, 0xf2, 1 };
-			static const uint8_t wme_oui[4] = { 0x00, 0x50, 0xf2, 2 };
-			if (frm[1] >= 4 && memcmp(&frm[2], wpa_oui, 4) == 0)
-				sp->wpa = __DECONST(uint8_t *, frm);
-			else if (frm[1] >= 4 && memcmp(&frm[2], wme_oui, 4) == 0)
-				sp->wme = __DECONST(uint8_t *, frm);
-			break;
-		}
-		default:
-			break;
-		}
-		frm += frm[1] + 2;
-	}
-}
-
-/*
- * Hand one firmware-supplied BSS straight to net80211's scan cache,
- * rather than building a synthetic beacon mbuf and running it through
- * ieee80211_fmac_input_beacon and the full ieee80211_parse_beacon IE
- * walker.  Linux brcmfmac's brcmf_inform_single_bss does the same flat
- * thing (calls cfg80211_inform_bss_data with the IE blob).  Flattening
- * saves ~3-4 stack frames per BSS, which keeps sustained scans from
- * overflowing the evrx worker's stack.
- *
- * The on-stack ieee80211_frame is the minimum sc_add_scan needs:
- * i_addr2 (source) and i_addr3 (bssid) — both set to the BSSID from
- * the firmware.  No IE memory is allocated by us; sc_add_scan's
- * ieee80211_ies_init does the copy under the scan-table lock.
+ * Hand one firmware-reported BSS to net80211's scan cache through the
+ * FullMAC framework, which builds the scan entry from the IE blob.
+ * Only the Broadcom parts happen here: decoding bss_info and keeping
+ * the BSSID's chanspec for the join path.
  */
 static void
 bwfm_add_scan_result(struct bwfm_softc *sc,
     const struct bwfm_bss_info *bss, uint32_t blen, int16_t rssi)
 {
-	struct ieee80211com *ic = &sc->sc_ic;
-	struct ieee80211vap *vap;
-	struct ieee80211_channel *rxchan;
-	struct ieee80211_scanparams sp;
-	struct ieee80211_frame wh;
-	uint8_t tstamp_zero[8];
+	struct ieee80211_fmac_bss bb;
 	uint16_t ie_offset, chanspec;
 	uint32_t ie_length;
-	const uint8_t *ies;
-	int rssi_n80, freq;
-	int8_t nf;
 	uint8_t chan;
 	bool is5g;
 
@@ -652,111 +549,39 @@ bwfm_add_scan_result(struct bwfm_softc *sc,
 		return;
 	if (ie_length > 2048)
 		return;
-	ies = (const uint8_t *)bss + ie_offset;
 
 	/*
-	 * Cache the fw-reported chanspec for this BSSID before the
-	 * net80211-scan gate below.  The cache is consulted by the join
-	 * path so it can pass the chip's preferred chanspec back verbatim;
-	 * a driver-initiated scan (dev.bwfm.0.cmd_scan) bypasses
-	 * ieee80211_F_SCAN and would otherwise leave the cache empty,
+	 * Cache the fw-reported chanspec for this BSSID even when no
+	 * net80211 scan is running.  The join path passes the chip's
+	 * preferred chanspec back verbatim; a driver-initiated scan
+	 * (dev.bwfm.0.cmd_scan) would otherwise leave the cache empty,
 	 * forcing bwfm_chan_to_chanspec_d11ac's minimal 20MHz fallback.
 	 */
-	bwfm_cache_bssid_chanspec(sc, bss->bssid, le16toh(bss->chanspec));
-
-	vap = TAILQ_FIRST(&ic->ic_vaps);
-	if (vap == NULL)
-		return;
-	/*
-	 * Only deliver while a scan is live.  We bypass
-	 * ic_scan_methods->sc_add_scan (= ieee80211_swscan_add_scan)
-	 * and call the scanner-policy scan_add (= sta_add) directly.
-	 * swscan_add_scan drops every event in the ISCAN_DISCARD
-	 * window (ieee80211_scan_sw.c:970) — set at scan_start and
-	 * cleared only after the SW engine's first per-channel
-	 * callout.  For a FullMAC driver the chip emits its first
-	 * ESCAN_RESULT within milliseconds of the escan iovar, well
-	 * before that clear, so the DISCARD gate would silently
-	 * eat every scan result and leave `ifconfig list scan`
-	 * empty even with sp.ssid set and rssi sane.  Going direct
-	 * to scan_add (the scanner policy) skips the gate; sta_add
-	 * then drops the result into st->st_entry / st_hash where
-	 * scan_iterate can find it.
-	 */
-	if (ic->ic_scan == NULL || ic->ic_scan->ss_ops == NULL ||
-	    ic->ic_scan->ss_ops->scan_add == NULL ||
-	    (ic->ic_flags & IEEE80211_F_SCAN) == 0 ||
-	    ic->ic_scan->ss_vap == NULL)
-		return;
-
 	chanspec = le16toh(bss->chanspec);
+	bwfm_cache_bssid_chanspec(sc, bss->bssid, chanspec);
+
 	is5g = bwfm_chanspec_is_5ghz(chanspec);
 	chan = bss->ctl_ch != 0 ? bss->ctl_ch :
 	    bwfm_chanspec_to_chan(chanspec);
-	freq = ieee80211_ieee2mhz(chan,
+
+	memset(&bb, 0, sizeof(bb));
+	memcpy(bb.fb_bssid, bss->bssid, IEEE80211_ADDR_LEN);
+	bb.fb_capinfo = le16toh(bss->capability);
+	bb.fb_bintval = le16toh(bss->beacon_period);
+	bb.fb_rssi = rssi;
+	bb.fb_noise = bss->phy_noise;
+	bb.fb_chan_freq = ieee80211_ieee2mhz(chan,
 	    is5g ? IEEE80211_CHAN_5GHZ : IEEE80211_CHAN_2GHZ);
-	rxchan = ieee80211_find_channel(ic, freq,
-	    is5g ? IEEE80211_CHAN_A : IEEE80211_CHAN_G);
-	if (rxchan == NULL)
-		rxchan = ic->ic_curchan;
-	if (rxchan == NULL)
-		return;
-
-	nf = ieee80211_fmac_noise_floor(bss->phy_noise);
-	rssi_n80 = ((int)rssi - (int)nf) * 2;
-	if (rssi_n80 < 0)
-		rssi_n80 = 0;
-	if (rssi_n80 > 127)
-		rssi_n80 = 127;
-
-	memset(&sp, 0, sizeof(sp));
-	memset(tstamp_zero, 0, sizeof(tstamp_zero));
-	sp.bchan = ieee80211_chan2ieee(ic, rxchan);
-	sp.chan = sp.bchan;
-	sp.bintval = le16toh(bss->beacon_period);
-	sp.capinfo = le16toh(bss->capability);
-	sp.ies = __DECONST(uint8_t *, ies);
-	sp.ies_len = ie_length;
-	sp.tstamp = tstamp_zero;	/* sta_add memcpys 8 B from this */
-	bwfm_walk_ies(ies, ie_length, &sp);
-
-	/*
-	 * sta_add (ieee80211_scan_sta.c:280) does
-	 *   memcpy(ise->se_rates, sp->rates, 2 + sp->rates[1])
-	 *   memcpy(ise->se_ssid,  sp->ssid,  2 + sp->ssid[1])
-	 * with no NULL or length check (KASSERT is a no-op on
-	 * non-DEBUG kernels and the destination buffer is fixed
-	 * IEEE80211_RATE_MAXSIZE / IEEE80211_NWID_LEN bytes).
-	 * Since we bypass swscan_add_scan's ISCAN_DISCARD gate,
-	 * malformed firmware beacon clones would reach sta_add and
-	 * NULL-deref or overflow.  Drop the BSS in either case.
-	 */
-	if (sp.rates == NULL || sp.ssid == NULL)
-		return;
-	if (sp.rates[1] > IEEE80211_RATE_MAXSIZE)
-		return;
-	if (sp.ssid[1] > IEEE80211_NWID_LEN)
-		return;
-	if (sp.xrates != NULL && sp.rates[1] + sp.xrates[1] >
-	    IEEE80211_RATE_MAXSIZE)
-		return;
-
-	memset(&wh, 0, sizeof(wh));
-	wh.i_fc[0] = IEEE80211_FC0_TYPE_MGT | IEEE80211_FC0_SUBTYPE_BEACON;
-	memset(wh.i_addr1, 0xff, 6);
-	memcpy(wh.i_addr2, bss->bssid, 6);
-	memcpy(wh.i_addr3, bss->bssid, 6);
+	bb.fb_chan_flags = is5g ? 5 : 2;
+	bb.fb_ies = (const uint8_t *)bss + ie_offset;
+	bb.fb_ielen = ie_length;
 
 	if (sc->sc_debug > 0)
 		device_printf(sc->sc_dev,
-		    "scan_result chan=%u freq=%d rssi=%d ie_len=%u "
-		    "ssid_present=%d F_SCAN=%d\n",
-		    chan, freq, (int)rssi, ie_length,
-		    sp.ssid != NULL,
-		    (ic->ic_flags & IEEE80211_F_SCAN) != 0);
+		    "scan_result chan=%u freq=%u rssi=%d ie_len=%u\n",
+		    chan, bb.fb_chan_freq, (int)rssi, ie_length);
 
-	(void)ic->ic_scan->ss_ops->scan_add(ic->ic_scan, rxchan, &sp, &wh,
-	    IEEE80211_FC0_SUBTYPE_BEACON, rssi_n80, nf);
+	ieee80211_fmac_scan_result(&sc->sc_ic, &bb);
 }
 
 /*
@@ -821,6 +646,10 @@ bwfm_parse_escan_partial(struct bwfm_softc *sc, const uint8_t *p, size_t len,
  * into ieee80211_new_state / ieee80211_scan_done which can re-enter
  * the driver.
  */
+static bool	bwfm_handle_ap_event(struct bwfm_softc *,
+		    const struct bwfm_event_msg *, uint32_t, uint32_t,
+		    const uint8_t *, size_t);
+
 void
 bwfm_handle_event(struct bwfm_softc *sc, const uint8_t *p, size_t len,
     size_t evpos)
@@ -836,8 +665,19 @@ bwfm_handle_event(struct bwfm_softc *sc, const uint8_t *p, size_t len,
 	emsg = (const struct bwfm_event_msg *)(p + evpos);
 	evtype = be32toh(emsg->event_type);
 	status = be32toh(emsg->status);
-	if (evtype < nitems(sc->sc_evt_by_type))
-		atomic_add_32(&sc->sc_evt_by_type[evtype], 1);
+
+	/* An access point's station events go their own way. */
+	vap = sc->sc_ic_attached ? TAILQ_FIRST(&ic->ic_vaps) : NULL;
+	if (vap != NULL && vap->iv_opmode == IEEE80211_M_HOSTAP) {
+		size_t doff = evpos + sizeof(*emsg);
+		size_t dlen = be32toh(emsg->datalen);
+
+		if (doff > len || dlen > len - doff)
+			dlen = 0;
+		if (bwfm_handle_ap_event(sc, emsg, evtype, status,
+		    p + doff, dlen))
+			return;
+	}
 
 	if (evtype == BWFM_E_TYPE_ESCAN_RESULT &&
 	    status == BWFM_E_STATUS_PARTIAL) {
@@ -855,9 +695,7 @@ bwfm_handle_event(struct bwfm_softc *sc, const uint8_t *p, size_t len,
 		 */
 		DPRINTF(sc, 1, "scan complete (status=%u)\n", status);
 		sc->sc_scan_busy = 0;
-		atomic_add_32(&sc->sc_escan_done_evts, 1);
 		if (sc->sc_ic_attached) {
-			atomic_add_32(&sc->sc_scan_done_reqs, 1);
 			(void)taskqueue_enqueue(taskqueue_thread,
 			    &sc->sc_scan_done_task);
 		}
@@ -870,7 +708,6 @@ bwfm_handle_event(struct bwfm_softc *sc, const uint8_t *p, size_t len,
 		sc->sc_link_up = (eflags & BWFM_E_FLAG_LINK_UP) != 0;
 		sc->sc_join_busy = 0;	/* terminator: either success or fail */
 		if (sc->sc_ic_attached) {
-			atomic_add_32(&sc->sc_link_reqs, 1);
 			(void)taskqueue_enqueue(taskqueue_thread,
 			    &sc->sc_link_task);
 		}
@@ -892,7 +729,6 @@ bwfm_handle_event(struct bwfm_softc *sc, const uint8_t *p, size_t len,
 			sc->sc_link_up = 1;
 			sc->sc_join_busy = 0;
 			if (sc->sc_ic_attached) {
-				atomic_add_32(&sc->sc_link_reqs, 1);
 				(void)taskqueue_enqueue(taskqueue_thread,
 				    &sc->sc_link_task);
 			}
@@ -934,7 +770,6 @@ bwfm_handle_event(struct bwfm_softc *sc, const uint8_t *p, size_t len,
 			    &sc->sc_post_assoc_task);
 			sc->sc_link_up = 1;
 			sc->sc_join_busy = 0;
-			atomic_add_32(&sc->sc_link_reqs, 1);
 			(void)taskqueue_enqueue(taskqueue_thread,
 			    &sc->sc_link_task);
 		}
@@ -1096,7 +931,6 @@ bwfm_rx_frame(struct bwfm_softc *sc, struct mbuf *m)
 	}
 
 	evpos = 14 + sizeof(struct bwfm_bwfm_ethhdr);
-	atomic_add_int(&sc->sc_evt_count, 1);
 	bwfm_handle_event(sc, p, len, evpos);
 	m_freem(m);
 }
@@ -1116,28 +950,11 @@ bwfm_install_pmk(struct bwfm_softc *sc)
 
 	memset(&wp, 0, sizeof(wp));
 
-	if (sc->sc_wpa_pmk_raw_set) {
-		wp.key_len = htole16(BWFM_WSEC_MAX_PSK_LEN);
-		wp.flags = 0;
-		memcpy(wp.key, sc->sc_wpa_pmk_raw, BWFM_WSEC_MAX_PSK_LEN);
-	} else if (sc->sc_wpa_set) {
-		size_t pmklen = strlen(sc->sc_wpa_pmk);
-
-		/*
-		 * 2011 BCM43236 firmware uses the short (37-byte) wsec_pmk
-		 * struct so the on-chip PBKDF2 path accepts at most 32-char
-		 * passphrases.  Standard WPA2 allows up to 63 chars; longer
-		 * ones must be pre-derived on the host and pushed via the
-		 * raw-PMK path (dev.bwfm.<n>.wpa_pmk_hex).
-		 */
-		if (pmklen < 8 || pmklen > BWFM_WSEC_MAX_PSK_LEN)
-			return (EINVAL);
-		wp.key_len = htole16((uint16_t)pmklen);
-		wp.flags = htole16(BWFM_WSEC_PASSPHRASE);
-		memcpy(wp.key, sc->sc_wpa_pmk, pmklen);
-	} else {
+	if (!sc->sc_wpa_pmk_raw_set)
 		return (EINVAL);
-	}
+	wp.key_len = htole16(BWFM_WSEC_MAX_PSK_LEN);
+	wp.flags = 0;
+	memcpy(wp.key, sc->sc_wpa_pmk_raw, BWFM_WSEC_MAX_PSK_LEN);
 
 	/*
 	 * Linux brcmfmac drives this exclusively via BWFM_C_SET_WSEC_PMK
@@ -1164,10 +981,8 @@ bwfm_install_pmk(struct bwfm_softc *sc)
 
 /*
  * Program WPA2-PSK security and dispatch SET_SSID with the given
- * BSSID + SSID.  Works both from net80211's newstate hook (passing
- * vap->iv_bss bits) and from the direct-join sysctl path (which
- * bypasses net80211 so the radio can be brought up before the
- * userland integration is complete).
+ * BSSID + SSID, from net80211's newstate hook (passing vap->iv_bss
+ * bits).
  *
  * Our own order: DOWN -> infra / auth / wsec / wpa_auth / sup_wpa /
  * wsec_pmk -> UP -> join.  (OpenBSD bwfm sets wpaie / wpa_auth / wsec /
@@ -1338,6 +1153,23 @@ fail:
 	return (error);
 }
 
+/*
+ * Remember what we asked the firmware to join, so the link-up path can
+ * put net80211 on the same BSS if it is still in SCAN when the firmware
+ * reports the link (bwfm_link_task).  Every join path must call it: a
+ * join that skips it leaves the previous network here, and the link
+ * task then anchors net80211 to that BSS instead, which wpa_supplicant
+ * sees as the wrong BSSID and disconnects from.
+ */
+static void
+bwfm_note_join(struct bwfm_softc *sc, const struct ieee80211_node *ni)
+{
+	memcpy(sc->sc_join_bssid, ni->ni_bssid, sizeof(sc->sc_join_bssid));
+	sc->sc_join_ssid_len = (uint8_t)MIN(ni->ni_esslen, BWFM_MAX_SSID_LEN);
+	memcpy(sc->sc_join_ssid, ni->ni_essid, sc->sc_join_ssid_len);
+	sc->sc_join_ssid[sc->sc_join_ssid_len] = '\0';
+}
+
 /* join a WPA2 network using the stored passphrase */
 static int
 bwfm_join_wpa2(struct bwfm_softc *sc, struct ieee80211vap *vap)
@@ -1347,6 +1179,7 @@ bwfm_join_wpa2(struct bwfm_softc *sc, struct ieee80211vap *vap)
 	ni = vap->iv_bss;
 	if (ni == NULL)
 		return (EINVAL);
+	bwfm_note_join(sc, ni);
 	return (bwfm_join_wpa2_raw(sc, ni->ni_bssid,
 	    (const char *)ni->ni_essid, ni->ni_esslen));
 }
@@ -1402,6 +1235,7 @@ bwfm_join_open(struct bwfm_softc *sc, struct ieee80211vap *vap)
 	v = htole32(0);
 	(void)bwfm_iovar_set(sc, "wpa_auth", &v, sizeof(v));
 
+	bwfm_note_join(sc, ni);
 	memset(&join, 0, sizeof(join));
 	join.ssid.len = htole32(slen);
 	memcpy(join.ssid.ssid, ni->ni_essid, slen);
@@ -1483,34 +1317,19 @@ static void
 bwfm_scan_done_task(void *arg, int pending)
 {
 	struct bwfm_softc *sc = arg;
-	struct ieee80211vap *vap;
 
-	atomic_add_32(&sc->sc_scan_done_cover, (uint32_t)pending);
 
 	if (!sc->sc_ic_attached)
 		return;
-	vap = TAILQ_FIRST(&sc->sc_ic.ic_vaps);
-	if (vap == NULL)
-		return;
-	/*
-	 * The firmware's escan has delivered every result, so end
-	 * net80211's scan.  ieee80211_scan_done alone only wakes the
-	 * software scanner, which then walks on through its whole channel
-	 * list (about 10 s) while an association request from
-	 * wpa_supplicant waits behind it until wpa_supplicant's own 10 s
-	 * authentication timeout fires.  So cancel the scan as well; a
-	 * cancelled scan still sends the scan-done notification.
-	 */
-	ieee80211_scan_done(vap);
-	if (sc->sc_ic.ic_flags & IEEE80211_F_SCAN)
-		ieee80211_cancel_scan(vap);
+	/* The firmware's escan has delivered every result. */
+	ieee80211_fmac_scan_done(&sc->sc_ic);
 }
 
 /*
  * Deferred link state transition.  Firmware emits LINK up when it's
  * fully associated and the 4-way handshake completed; net80211 at
  * that point is sitting in AUTH (from ieee80211_sta_join walking the
- * vap there in the join_target sysctl path).  We fast-forward
+ * vap there).  We fast-forward
  * AUTH -> ASSOC -> RUN here because the firmware did the actual
  * mgmt-frame work that net80211's SoftMAC state machine would
  * otherwise expect us to do.
@@ -1575,7 +1394,6 @@ bwfm_link_task(void *arg, int pending)
 	struct ieee80211vap *vap;
 	struct ieee80211_node *ni;
 
-	atomic_add_32(&sc->sc_link_cover, (uint32_t)pending);
 
 	if (!sc->sc_ic_attached) {
 		DPRINTF(sc, 0,
@@ -1842,29 +1660,6 @@ bwfm_vap_create(struct ieee80211com *ic, const char name[IFNAMSIZ],
 	bwfm_set_fw_macaddr(sc, mac);
 
 	/*
-	 * FullMAC: the firmware monitors the BSS and reports LINK-down
-	 * when the AP is genuinely gone.  net80211's default software
-	 * beacon-miss timer would otherwise fire ~1s after RUN (this
-	 * driver never feeds beacons up to net80211), and with
-	 * ROAMING_AUTO that drives a reassociate (RUN->ASSOC) which
-	 * tears the link down mid-connection.  Disable swbmiss and mark
-	 * roaming as driver-controlled so the firmware owns BSS
-	 * monitoring and roaming.
-	 */
-	vap->iv_flags_ext &= ~IEEE80211_FEXT_SWBMISS;
-	vap->iv_roaming = IEEE80211_ROAMING_DEVICE;
-
-	/*
-	 * Hand vap-level slots to the FullMAC framework.  fmac_newstate
-	 * intercepts AUTH/ASSOC and side-effect-dispatches the join via
-	 * fmop_assoc, then chains to bwfm_newstate (the saved hook).
-	 * fmac_key_set / fmac_key_delete forward straight into the
-	 * fmop_set_key / fmop_del_key ops; the chip-side dispatch lives
-	 * in bwfm_fmop_*.
-	 */
-	ieee80211_fmac_vap_attach(vap);
-
-	/*
 	 * Wire the standard net80211 ifmedia callbacks.  With NULL
 	 * media_status wpa_supplicant's BSD driver bails at
 	 * SIOCGIFMEDIA with "Programming error" and never runs a
@@ -1942,11 +1737,22 @@ bwfm_parent(struct ieee80211com *ic)
 		    error);
 		if (error == 0)
 			sc->sc_wlc_up = false;
-	} else if (!sc->sc_wlc_up) {
-		error = bwfm_dcmd_set(sc, BWFM_C_UP, &v, sizeof(v));
-		DPRINTF(sc, 0, "parent: vap up; WLC_UP rc=%d\n", error);
-		if (error == 0)
-			sc->sc_wlc_up = true;
+	} else {
+		if (!sc->sc_wlc_up) {
+			error = bwfm_dcmd_set(sc, BWFM_C_UP, &v, sizeof(v));
+			DPRINTF(sc, 0, "parent: vap up; WLC_UP rc=%d\n",
+			    error);
+			if (error == 0)
+				sc->sc_wlc_up = true;
+		}
+		/*
+		 * net80211 marks the first vap running and leaves the rest
+		 * of its start to us: it expects ic_parent to call
+		 * ieee80211_start_all once the device is up.  Without it a
+		 * vap brought up by a single SIOCSIFFLAGS, as hostapd does,
+		 * stays in INIT and its BSS never starts.
+		 */
+		ieee80211_start_all(ic);
 	}
 }
 
@@ -2026,8 +1832,29 @@ static int
 bwfm_transmit(struct ieee80211com *ic, struct mbuf *m)
 {
 	struct bwfm_softc *sc = ic->ic_softc;
+	struct ieee80211_node *ni;
+	int error;
 
-	return (sc->sc_bus_ops->bs_txdata(sc, m));
+	/*
+	 * Each frame carries a node reference in m_pkthdr.rcvif, which
+	 * the driver must drop once it has the frame.  On an error
+	 * net80211 would drop it itself and free the mbuf, but the
+	 * transports always consume the mbuf: bwfm_deencap_80211 may have
+	 * replaced its head, and the queues free it when they are full.
+	 * Handing back an error would make net80211 use and free it a
+	 * second time, which panicked an access point sending faster than
+	 * SDIO could carry.  So count the error here and report success.
+	 */
+	ni = (struct ieee80211_node *)m->m_pkthdr.rcvif;
+	m->m_pkthdr.rcvif = NULL;
+	error = sc->sc_bus_ops->bs_txdata(sc, m);
+	if (ni != NULL) {
+		if (error != 0)
+			if_inc_counter(ni->ni_vap->iv_ifp, IFCOUNTER_OERRORS,
+			    1);
+		ieee80211_free_node(ni);
+	}
+	return (0);
 }
 
 /*
@@ -2063,10 +1890,7 @@ bwfm_dispatch_scan(struct bwfm_softc *sc)
 	int err;
 
 	/*
-	 * Refuse if a scan is already in flight.  Same guard as
-	 * bwfm_sdio_sysctl_cmd_scan but at the bwfm_softc layer so
-	 * BOTH the fmop_scan_start path (this function) and the
-	 * cmd_scan sysctl share state.  Mirrors Linux brcmfmac's
+	 * Refuse if a scan is already in flight.  Mirrors Linux brcmfmac's
 	 * BRCMF_SCAN_STATUS_BUSY (cfg80211.c:1524) returning
 	 * -EAGAIN.  Without it, three back-to-back
 	 * `ifconfig wlan0 scan` invocations push three escan iovars
@@ -2282,11 +2106,113 @@ bwfm_chan_to_chanspec(struct bwfm_softc *sc, uint8_t chan)
 	return (bwfm_chan_to_chanspec_d11ac(chan));
 }
 
+/*
+ * Ask the firmware which channels the radio offers ("chanspecs") so
+ * net80211 never offers a band or channel the chip cannot use.  The
+ * bands follow from the list itself; WLC_GET_BANDLIST is only a
+ * fallback.  Runs once at attach, with the firmware up.  On failure
+ * the fixed table in bwfm_getradiocaps stays in use.
+ *
+ * The list is for the firmware's current country, so the 2.4 GHz
+ * side keeps net80211's default channels 1-14 and lets the regdomain
+ * choose among them; only 5 GHz, where the chips differ most, comes
+ * from the list.  It holds every width (20, 40, 80 MHz), which runs
+ * past 1 KB on the BCM43455, while the PCIe and USB control paths
+ * carry about 1 KB at most.  So try sizes from large to small and keep
+ * the first that works.
+ */
+static const size_t bwfm_chanspecs_sizes[] = { 2048, 1536, 1000 };
+
+static void
+bwfm_query_radio(struct bwfm_softc *sc)
+{
+	uint32_t bands[4], *list;
+	size_t len;
+	uint32_t i, n;
+	uint16_t cs;
+	uint8_t ch;
+	int j, k, rc;
+	bool d11n = sc->sc_chip != NULL && sc->sc_chip->d11n;
+
+	sc->sc_radio_known = false;
+	sc->sc_radio_2g = sc->sc_radio_5g = false;
+	sc->sc_radio_n5g = 0;
+
+	list = malloc(bwfm_chanspecs_sizes[0], M_TEMP, M_WAITOK);
+	rc = ENOENT;
+	for (i = 0; i < nitems(bwfm_chanspecs_sizes) && rc != 0; i++) {
+		memset(list, 0, bwfm_chanspecs_sizes[0]);
+		len = bwfm_chanspecs_sizes[i];
+		rc = bwfm_iovar_get(sc, "chanspecs", list, &len);
+	}
+	if (rc == 0 && len >= sizeof(uint32_t)) {
+		n = MIN(le32toh(list[0]), len / sizeof(uint32_t) - 1);
+		for (i = 1; i <= n; i++) {
+			cs = (uint16_t)le32toh(list[i]);
+			/* 20 MHz entries only: one per channel. */
+			if (d11n ? (cs & 0x0c00) != 0x0800 :
+			    (cs & 0x3800) != 0x1000)
+				continue;
+			ch = bwfm_chanspec_to_chan(cs);
+			if (ch >= 1 && ch <= 14) {
+				sc->sc_radio_2g = true;
+				continue;
+			}
+			if (ch < 36)
+				continue;
+			sc->sc_radio_5g = true;
+			if (sc->sc_radio_n5g >=
+			    (int)nitems(sc->sc_radio_5g_chans))
+				continue;
+			/* keep the list sorted and unique */
+			for (j = 0; j < sc->sc_radio_n5g &&
+			    sc->sc_radio_5g_chans[j] < ch; j++)
+				;
+			if (j < sc->sc_radio_n5g &&
+			    sc->sc_radio_5g_chans[j] == ch)
+				continue;
+			for (k = sc->sc_radio_n5g; k > j; k--)
+				sc->sc_radio_5g_chans[k] =
+				    sc->sc_radio_5g_chans[k - 1];
+			sc->sc_radio_5g_chans[j] = ch;
+			sc->sc_radio_n5g++;
+		}
+	}
+	free(list, M_TEMP);
+
+	if (!sc->sc_radio_2g && !sc->sc_radio_5g) {
+		/* No usable list: ask for the bands alone. */
+		memset(bands, 0, sizeof(bands));
+		len = sizeof(bands);
+		rc = bwfm_dcmd_get(sc, BWFM_C_GET_BANDLIST, bands, &len);
+		if (rc == 0 && len >= 2 * sizeof(uint32_t)) {
+			n = MIN(le32toh(bands[0]), nitems(bands) - 1);
+			for (i = 1; i <= n; i++) {
+				if (le32toh(bands[i]) == BWFM_WLC_BAND_2G)
+					sc->sc_radio_2g = true;
+				else if (le32toh(bands[i]) == BWFM_WLC_BAND_5G)
+					sc->sc_radio_5g = true;
+			}
+		}
+	}
+	if (!sc->sc_radio_2g && !sc->sc_radio_5g) {
+		device_printf(sc->sc_dev, "radio: firmware gave no channel "
+		    "or band list (error %d); using fixed channels\n", rc);
+		return;
+	}
+	sc->sc_radio_known = true;
+	device_printf(sc->sc_dev, "radio: %s%s%s, %d 5 GHz channels from "
+	    "firmware\n", sc->sc_radio_2g ? "2.4 GHz" : "",
+	    sc->sc_radio_2g && sc->sc_radio_5g ? " + " : "",
+	    sc->sc_radio_5g ? "5 GHz" : "", sc->sc_radio_n5g);
+}
+
 /* report which channels the radio supports */
 static void
 bwfm_getradiocaps(struct ieee80211com *ic, int maxchans, int *nchans,
     struct ieee80211_channel chans[])
 {
+	struct bwfm_softc *sc = ic->ic_softc;
 	static const uint8_t unii_1[] = { 36, 40, 44, 48 };
 	static const uint8_t unii_2[] = { 52, 56, 60, 64 };
 	static const uint8_t unii_2_ext[] = {
@@ -2295,16 +2221,24 @@ bwfm_getradiocaps(struct ieee80211com *ic, int maxchans, int *nchans,
 	static const uint8_t unii_3[] = { 149, 153, 157, 161, 165 };
 	uint8_t bands[IEEE80211_MODE_BYTES];
 
-	(void)ic;
-	memset(bands, 0, sizeof(bands));
-	setbit(bands, IEEE80211_MODE_11B);
-	setbit(bands, IEEE80211_MODE_11G);
 	*nchans = 0;
-	ieee80211_add_channels_default_2ghz(chans, maxchans, nchans,
-	    bands, 0);
+	if (!sc->sc_radio_known || sc->sc_radio_2g) {
+		memset(bands, 0, sizeof(bands));
+		setbit(bands, IEEE80211_MODE_11B);
+		setbit(bands, IEEE80211_MODE_11G);
+		ieee80211_add_channels_default_2ghz(chans, maxchans, nchans,
+		    bands, 0);
+	}
+	if (sc->sc_radio_known && !sc->sc_radio_5g)
+		return;
 
 	memset(bands, 0, sizeof(bands));
 	setbit(bands, IEEE80211_MODE_11A);
+	if (sc->sc_radio_known && sc->sc_radio_n5g > 0) {
+		ieee80211_add_channel_list_5ghz(chans, maxchans, nchans,
+		    sc->sc_radio_5g_chans, sc->sc_radio_n5g, bands, 0);
+		return;
+	}
 	ieee80211_add_channel_list_5ghz(chans, maxchans, nchans,
 	    unii_1, nitems(unii_1), bands, 0);
 	ieee80211_add_channel_list_5ghz(chans, maxchans, nchans,
@@ -2362,9 +2296,37 @@ bwfm_fmop_scan_start(struct ieee80211com *ic,
 }
 
 /*
+ * Stop a running firmware scan: a legacy WLC_SCAN request for the
+ * single channel -1, as Linux brcmfmac's brcmf_abort_scanning does.
+ */
+static void
+bwfm_fmop_scan_cancel(struct ieee80211com *ic)
+{
+	struct bwfm_softc *sc = ic->ic_softc;
+	struct {
+		struct bwfm_scan_params_v0	sp;
+		uint16_t			chan;
+		uint16_t			pad;
+	} __packed req;
+	int error;
+
+	memset(&req, 0, sizeof(req));
+	memset(req.sp.bssid, 0xff, sizeof(req.sp.bssid));
+	req.sp.bss_type = 2;			/* any */
+	req.sp.nprobes = htole32(-1);
+	req.sp.active_time = htole32(-1);
+	req.sp.passive_time = htole32(-1);
+	req.sp.home_time = htole32(-1);
+	req.sp.channel_num = htole32(1);
+	req.chan = htole16(0xffff);
+	error = bwfm_dcmd_set(sc, BWFM_C_SCAN, &req, sizeof(req));
+	DPRINTF(sc, 1, "scan_cancel: WLC_SCAN abort rc=%d\n", error);
+}
+
+/*
  * Configure chip for WPA2 with HOST-side EAPOL.  Used when net80211
  * (or wpa_supplicant via net80211) requests a WPA-protected assoc
- * but no PSK was staged via dev.bwfm.<n>.wpa_pmk -- meaning the
+ * but no PSK was staged via net.wlan.<n>.fullmac_pmk -- meaning the
  * 4-way handshake will run in userspace, not in firmware.
  *
  * Differs from bwfm_join_wpa2_raw in two ways:
@@ -2632,32 +2594,17 @@ bwfm_join_wpa2_host_eapol(struct bwfm_softc *sc, struct ieee80211vap *vap)
 	 * firmware-supplicant joins (FWSUP_PSK / SAE); we push it here as
 	 * well, empirically.  The 4-way still runs in userspace either way.
 	 */
-	if (sc->sc_wpa_set || sc->sc_wpa_pmk_raw_set) {
+	if (sc->sc_wpa_pmk_raw_set) {
 		struct bwfm_wsec_pmk_le wp;
-		size_t klen;
 		int rc;
 
 		memset(&wp, 0, sizeof(wp));
-		if (sc->sc_wpa_pmk_raw_set) {
-			klen = BWFM_WSEC_MAX_PSK_LEN;
-			wp.key_len = htole16((uint16_t)klen);
-			wp.flags = 0;
-			memcpy(wp.key, sc->sc_wpa_pmk_raw, klen);
-		} else {
-			klen = strlen(sc->sc_wpa_pmk);
-			if (klen < 8 || klen > BWFM_WSEC_MAX_PSK_LEN)
-				klen = 0;
-			wp.key_len = htole16((uint16_t)klen);
-			wp.flags = htole16(BWFM_WSEC_PASSPHRASE);
-			memcpy(wp.key, sc->sc_wpa_pmk, klen);
-		}
-		if (klen > 0) {
-			rc = bwfm_dcmd_set(sc, BWFM_C_SET_WSEC_PMK, &wp,
-			    sizeof(wp));
-			DPRINTF(sc, 0,
-			    "host-EAPOL: SET_WSEC_PMK(132) rc=%d klen=%zu\n",
-			    rc, klen);
-		}
+		wp.key_len = htole16(BWFM_WSEC_MAX_PSK_LEN);
+		wp.flags = 0;
+		memcpy(wp.key, sc->sc_wpa_pmk_raw, BWFM_WSEC_MAX_PSK_LEN);
+		rc = bwfm_dcmd_set(sc, BWFM_C_SET_WSEC_PMK, &wp, sizeof(wp));
+		explicit_bzero(&wp, sizeof(wp));
+		DPRINTF(sc, 0, "host-EAPOL: SET_WSEC_PMK(132) rc=%d\n", rc);
 	}
 
 	/*
@@ -2758,16 +2705,7 @@ bwfm_join_wpa2_host_eapol(struct bwfm_softc *sc, struct ieee80211vap *vap)
 		    chanspec_list);
 	}
 
-	/*
-	 * Remember what we asked the firmware to join, so the link-up path
-	 * can put net80211 on the same BSS if it is still in SCAN when the
-	 * firmware reports the link (bwfm_link_task).  The join sysctl sets
-	 * these too; a wpa_supplicant join only comes through here.
-	 */
-	memcpy(sc->sc_join_bssid, ni->ni_bssid, sizeof(sc->sc_join_bssid));
-	sc->sc_join_ssid_len = (uint8_t)MIN(slen, BWFM_MAX_SSID_LEN);
-	memcpy(sc->sc_join_ssid, ni->ni_essid, sc->sc_join_ssid_len);
-	sc->sc_join_ssid[sc->sc_join_ssid_len] = '\0';
+	bwfm_note_join(sc, ni);
 
 	DPRINTF(sc, 0,
 	    "join WPA2/host-EAPOL: ssid=\"%.*s\" "
@@ -2811,14 +2749,13 @@ bwfm_assoc_task(void *arg, int pending)
 	bool wpa_vap;
 	int error;
 
-	atomic_add_32(&sc->sc_assoc_cover, (uint32_t)pending);
 
 	if (vap == NULL || !sc->sc_ic_attached)
 		return;
 
 	/*
 	 * Dispatch by intended security mode:
-	 *   - PSK staged via dev.bwfm.<n>.wpa_pmk[_hex] => in-firmware
+	 *   - PSK staged via net.wlan.<n>.fullmac_pmk => in-firmware
 	 *     supplicant path (legacy / old fw).
 	 *   - net80211 vap has WPA flags set but no PSK staged =>
 	 *     host-EAPOL path (wpa_supplicant runs the 4-way).
@@ -2831,7 +2768,7 @@ bwfm_assoc_task(void *arg, int pending)
 	wpa_vap = (vap->iv_flags &
 	    (IEEE80211_F_WPA1 | IEEE80211_F_WPA2)) != 0;
 
-	if (sc->sc_wpa_set || sc->sc_wpa_pmk_raw_set)
+	if (sc->sc_wpa_pmk_raw_set)
 		error = bwfm_join_wpa2(sc, vap);
 	else if (wpa_vap)
 		error = bwfm_join_wpa2_host_eapol(sc, vap);
@@ -2881,7 +2818,6 @@ bwfm_fmop_assoc(struct ieee80211com *ic, const struct ieee80211_fmac_assoc *fa)
 	 * ieee80211_fmac_link_up.
 	 */
 	sc->sc_assoc_vap = vap;
-	atomic_add_32(&sc->sc_assoc_reqs, 1);
 	(void)taskqueue_enqueue(taskqueue_thread, &sc->sc_assoc_task);
 	return (0);
 }
@@ -3170,19 +3106,33 @@ bwfm_fmop_set_key(struct ieee80211com *ic, const struct ieee80211_key *k)
 	if (k->wk_keyix == IEEE80211_KEYIX_NONE ||
 	    (k->wk_flags & IEEE80211_KEY_GROUP) == 0) {
 		/*
-		 * Pairwise key.  Drain EAPOL first, and afterwards authorize
-		 * the peer's data path (both done by bwfm_key_task).
+		 * Pairwise key: the peer's address and no flags.  Drain
+		 * EAPOL first, and afterwards authorize the peer's data path
+		 * (both done by bwfm_key_task).
 		 */
-		flags |= BWFM_WSEC_PRIMARY_KEY;
-		ea = (vap != NULL && vap->iv_bss != NULL) ?
-		    vap->iv_bss->ni_bssid : bcast;
-		authorize = (vap != NULL && vap->iv_bss != NULL) ?
-		    vap->iv_bss->ni_bssid : NULL;
+		if (vap != NULL && vap->iv_opmode == IEEE80211_M_HOSTAP) {
+			/* an access point keys each station by its address */
+			ea = k->wk_macaddr;
+			authorize = k->wk_macaddr;
+		} else {
+			ea = (vap != NULL && vap->iv_bss != NULL) ?
+			    vap->iv_bss->ni_bssid : bcast;
+			authorize = (vap != NULL && vap->iv_bss != NULL) ?
+			    vap->iv_bss->ni_bssid : NULL;
+		}
 		return (bwfm_key_enqueue(sc, 0, algo, flags,
 		    k->wk_key, k->wk_keylen, ea, true, authorize));
 	}
 
-	/* Group key. */
+	/*
+	 * Group key: BWFM_WSEC_PRIMARY_KEY and a zero address.  The flag
+	 * belongs to the group key, not the pairwise one, as in OpenBSD
+	 * bwfm_set_key_cb (set only when !ext_key) and Linux
+	 * brcmf_cfg80211_add_key.  With it on the pairwise key instead,
+	 * the BCM43455's 7.45 firmware sends unicast frames the AP cannot
+	 * use, while broadcast and EAPOL still pass.
+	 */
+	flags = BWFM_WSEC_PRIMARY_KEY;
 	if (algo == BWFM_CRYPTO_ALGO_TKIP) {
 		uint8_t tk[32];
 		int rc;
@@ -3195,10 +3145,17 @@ bwfm_fmop_set_key(struct ieee80211com *ic, const struct ieee80211_key *k)
 		 * as Linux brcmfmac (brcmf_cfg80211_add_key) swaps them for a
 		 * station.  Sending only 16 bytes gets rc=5 and no group key,
 		 * and with a TKIP group cipher no broadcast traffic passes.
+		 * An access point sends with the group key, so its TX key
+		 * comes first and Linux leaves the order alone there.
 		 */
 		memcpy(tk, k->wk_key, 16);
-		memcpy(tk + 16, k->wk_rxmic, 8);
-		memcpy(tk + 24, k->wk_txmic, 8);
+		if (vap != NULL && vap->iv_opmode == IEEE80211_M_HOSTAP) {
+			memcpy(tk + 16, k->wk_txmic, 8);
+			memcpy(tk + 24, k->wk_rxmic, 8);
+		} else {
+			memcpy(tk + 16, k->wk_rxmic, 8);
+			memcpy(tk + 24, k->wk_txmic, 8);
+		}
 		rc = bwfm_key_enqueue(sc, k->wk_keyix, algo, flags, tk,
 		    sizeof(tk), group_ea, false, NULL);
 		explicit_bzero(tk, sizeof(tk));
@@ -3248,14 +3205,340 @@ bwfm_fmop_set_country(struct ieee80211com *ic, const char cc[3])
 	return (bwfm_iovar_set(sc, "country", country, sizeof(country)));
 }
 
+/* switch firmware power save: PM_FAST when on, always awake when off */
+static int
+bwfm_fmop_set_powersave(struct ieee80211com *ic, bool enabled)
+{
+	struct bwfm_softc *sc = ic->ic_softc;
+	uint32_t v = htole32(enabled ? BWFM_PM_FAST : BWFM_PM_OFF);
+
+	return (bwfm_dcmd_set(sc, BWFM_C_SET_PM, &v, sizeof(v)));
+}
+
+/*
+ * Signal of the associated AP: WLC_GET_RSSI with a zeroed scb_val
+ * (station mode reports the current BSS) and WLC_GET_PHY_NOISE, as
+ * Linux brcmfmac's get_station does.
+ */
+static int
+bwfm_fmop_get_signal(struct ieee80211com *ic, int *rssi_dbm, int *noise_dbm)
+{
+	struct bwfm_softc *sc = ic->ic_softc;
+	struct {			/* brcmf_scb_val_le: 12 bytes, */
+		int32_t		val;	/* not packed */
+		uint8_t		ea[6];
+		uint8_t		pad[2];
+	} scb;
+	int32_t noise = 0;
+	size_t len;
+	int error;
+
+	memset(&scb, 0, sizeof(scb));
+	len = sizeof(scb);
+	error = bwfm_dcmd_get(sc, BWFM_C_GET_RSSI, &scb, &len);
+	if (error != 0)
+		return (error);
+	*rssi_dbm = (int32_t)le32toh(scb.val);
+	len = sizeof(noise);
+	if (bwfm_dcmd_get(sc, BWFM_C_GET_PHY_NOISE, &noise, &len) == 0)
+		*noise_dbm = (int32_t)le32toh(noise);
+	else
+		*noise_dbm = 0;		/* the framework picks a default */
+	return (0);
+}
+
+/*
+ * Keep a PMK for the next join that uses the chip's own supplicant
+ * (bwfm_install_pmk pushes it then).  Zero length clears it.
+ */
+static int
+bwfm_fmop_set_pmk(struct ieee80211com *ic, const uint8_t *pmk, size_t len)
+{
+	struct bwfm_softc *sc = ic->ic_softc;
+
+	if (len == 0) {
+		sc->sc_wpa_pmk_raw_set = false;
+		explicit_bzero(sc->sc_wpa_pmk_raw, sizeof(sc->sc_wpa_pmk_raw));
+		return (0);
+	}
+	if (len != sizeof(sc->sc_wpa_pmk_raw))
+		return (EINVAL);
+	memcpy(sc->sc_wpa_pmk_raw, pmk, len);
+	sc->sc_wpa_pmk_raw_set = true;
+	return (0);
+}
+
+/*
+ * Access point.  The firmware runs the BSS: beacons, probe responses,
+ * authentication and association, station ageing.  The host configures
+ * it here and hears about stations through the *_IND events; hostapd
+ * runs the WPA handshake over EAPOL frames, as wpa_supplicant does for
+ * a station.  The sequence is OpenBSD's bwfm_hostap and Linux
+ * brcmf_cfg80211_start_ap without multiple BSSes: AP mode can only be
+ * switched with the radio down, the channel and security go in before
+ * WLC_UP, and the SSID (with a broadcast BSSID) starts the BSS.
+ */
+static int
+bwfm_dcmd_set_int(struct bwfm_softc *sc, uint32_t cmd, uint32_t val)
+{
+	uint32_t v = htole32(val);
+
+	return (bwfm_dcmd_set(sc, cmd, &v, sizeof(v)));
+}
+
+static int
+bwfm_iovar_set_int(struct bwfm_softc *sc, const char *name, uint32_t val)
+{
+	uint32_t v = htole32(val);
+
+	return (bwfm_iovar_set(sc, name, &v, sizeof(v)));
+}
+
+/* The firmware's wpa_auth for the key management hostapd offers. */
+static uint32_t
+bwfm_ap_wpa_auth(const struct ieee80211_fmac_ap *ap)
+{
+	uint32_t wpa_auth = 0;
+
+	if (ap->fp_wpa & 2) {
+		if (ap->fp_akms & (1u << RSN_ASE_8021X_PSK))
+			wpa_auth |= BWFM_WPA_AUTH_WPA2_PSK;
+		if (ap->fp_akms & (1u << RSN_ASE_8021X_UNSPEC))
+			wpa_auth |= BWFM_WPA_AUTH_WPA2_UNSPEC;
+		if (ap->fp_akms & (1u << RSN_ASE_8021X_PSK_SHA256))
+			wpa_auth |= BWFM_WPA_AUTH_WPA2_PSK_SHA256;
+		if (ap->fp_akms & (1u << RSN_ASE_8021X_UNSPEC_SHA256))
+			wpa_auth |= BWFM_WPA_AUTH_WPA2_1X_SHA256;
+		if (ap->fp_akms & (1u << 8))		/* SAE */
+			wpa_auth |= BWFM_WPA_AUTH_WPA3_SAE_PSK;
+	}
+	if (ap->fp_wpa & 1) {
+		if (ap->fp_akms & (1u << WPA_ASE_8021X_PSK))
+			wpa_auth |= BWFM_WPA_AUTH_WPA_PSK;
+		if (ap->fp_akms & (1u << WPA_ASE_8021X_UNSPEC))
+			wpa_auth |= BWFM_WPA_AUTH_WPA_UNSPEC;
+	}
+	return (wpa_auth);
+}
+
+static int
+bwfm_fmop_start_ap(struct ieee80211com *ic, const struct ieee80211_fmac_ap *ap)
+{
+	struct bwfm_softc *sc = ic->ic_softc;
+	struct bwfm_join_params join;
+	uint32_t wsec = BWFM_WSEC_NONE, wpa_auth = BWFM_WPA_AUTH_DISABLED;
+	uint32_t mfp = BWFM_MFP_NONE, ciphers;
+	uint16_t chanspec;
+	int error;
+
+	if (ap->fp_ssidlen == 0 || ap->fp_ssidlen > BWFM_MAX_SSID_LEN ||
+	    ap->fp_chan_ieee == 0)
+		return (EINVAL);
+	if (ap->fp_wpa != 0) {
+		ciphers = ap->fp_ucast | ap->fp_mcast;
+		if (ciphers & (1u << IEEE80211_CIPHER_AES_CCM))
+			wsec |= BWFM_WSEC_AES;
+		if (ciphers & (1u << IEEE80211_CIPHER_TKIP))
+			wsec |= BWFM_WSEC_TKIP;
+		wpa_auth = bwfm_ap_wpa_auth(ap);
+		if (wsec == BWFM_WSEC_NONE || wpa_auth == 0) {
+			device_printf(sc->sc_dev, "AP: unsupported security "
+			    "(ciphers 0x%x, key management 0x%x)\n", ciphers,
+			    ap->fp_akms);
+			return (EOPNOTSUPP);
+		}
+		if (ap->fp_rsncaps & IEEE80211_FMAC_RSNCAP_MFPR)
+			mfp = BWFM_MFP_REQUIRED;
+		else if (ap->fp_rsncaps & IEEE80211_FMAC_RSNCAP_MFPC)
+			mfp = BWFM_MFP_CAPABLE;
+	} else if (ap->fp_privacy) {
+		device_printf(sc->sc_dev, "AP: static WEP is not supported\n");
+		return (EOPNOTSUPP);
+	}
+	chanspec = bwfm_chan_to_chanspec(sc, ap->fp_chan_ieee);
+
+	sc->sc_ap_up = false;
+	sc->sc_link_up = false;
+	(void)bwfm_iovar_set_int(sc, "mpc", 0);
+	error = bwfm_dcmd_set_int(sc, BWFM_C_DOWN, 1);
+	if (error == 0)
+		sc->sc_wlc_up = false;
+	(void)bwfm_dcmd_set_int(sc, BWFM_C_SET_INFRA, 1);
+	error = bwfm_dcmd_set_int(sc, BWFM_C_SET_AP, 1);
+	if (error != 0) {
+		device_printf(sc->sc_dev, "AP: SET_AP failed: %d\n", error);
+		goto up;
+	}
+	(void)bwfm_dcmd_set_int(sc, BWFM_C_SET_BCNPRD, ap->fp_bintval);
+	(void)bwfm_dcmd_set_int(sc, BWFM_C_SET_DTIMPRD, ap->fp_dtim);
+	error = bwfm_iovar_set_int(sc, "chanspec", chanspec);
+	if (error != 0) {
+		device_printf(sc->sc_dev, "AP: chanspec 0x%04x (channel %u) "
+		    "refused: %d\n", chanspec, ap->fp_chan_ieee, error);
+		goto unap;
+	}
+	(void)bwfm_dcmd_set_int(sc, BWFM_C_SET_AUTH, BWFM_AUTH_OPEN);
+	(void)bwfm_iovar_set_int(sc, "wsec", wsec);
+	(void)bwfm_iovar_set_int(sc, "wpa_auth", wpa_auth);
+	error = bwfm_iovar_set_int(sc, "mfp", mfp);
+	if (error != 0 && mfp != BWFM_MFP_NONE) {
+		device_printf(sc->sc_dev, "AP: mfp %u refused: %d\n", mfp,
+		    error);
+		goto unap;
+	}
+	error = bwfm_dcmd_set_int(sc, BWFM_C_UP, 1);
+	if (error != 0) {
+		device_printf(sc->sc_dev, "AP: WLC_UP failed: %d\n", error);
+		goto unap;
+	}
+	sc->sc_wlc_up = true;
+
+	memset(&join, 0, sizeof(join));
+	join.ssid.len = htole32(ap->fp_ssidlen);
+	memcpy(join.ssid.ssid, ap->fp_ssid, ap->fp_ssidlen);
+	memset(join.assoc.bssid, 0xff, sizeof(join.assoc.bssid));
+	error = bwfm_dcmd_set(sc, BWFM_C_SET_SSID, &join,
+	    BWFM_JOIN_PARAMS_FIXED_SIZE);
+	if (error != 0) {
+		device_printf(sc->sc_dev, "AP: SET_SSID failed: %d\n", error);
+		goto unap;
+	}
+	(void)bwfm_iovar_set_int(sc, "closednet", ap->fp_hidden ? 1 : 0);
+	sc->sc_ap_up = true;
+	/*
+	 * The firmware writes its own RSN element into the beacon, with 16
+	 * PTKSA replay counters since it runs WMM, and stations compare it
+	 * with hostapd's copy in handshake message 3.  hostapd advertises
+	 * 16 only with wmm_enabled=1; otherwise every station gives up
+	 * with "IE in 3/4 msg does not match" and reason 17.
+	 */
+	if ((ap->fp_wpa & 2) != 0 && ap->fp_ielen != 0 &&
+	    (ap->fp_rsncaps & 0x000c) != 0x000c)
+		device_printf(sc->sc_dev, "AP: hostapd's RSN element differs "
+		    "from the firmware's beacon (replay counters); stations "
+		    "will fail the handshake.  Set wmm_enabled=1 in "
+		    "hostapd.conf\n");
+	device_printf(sc->sc_dev, "AP: \"%.*s\" up on channel %u "
+	    "(chanspec 0x%04x), wsec 0x%x wpa_auth 0x%x mfp %u\n",
+	    ap->fp_ssidlen, ap->fp_ssid, ap->fp_chan_ieee, chanspec, wsec,
+	    wpa_auth, mfp);
+	return (0);
+
+unap:
+	(void)bwfm_dcmd_set_int(sc, BWFM_C_DOWN, 1);
+	(void)bwfm_dcmd_set_int(sc, BWFM_C_SET_AP, 0);
+up:
+	if (ic->ic_nrunning > 0 &&
+	    bwfm_dcmd_set_int(sc, BWFM_C_UP, 1) == 0)
+		sc->sc_wlc_up = true;
+	return (error);
+}
+
+/* Take the BSS down and put the firmware back in station mode. */
+static int
+bwfm_fmop_stop_ap(struct ieee80211com *ic)
+{
+	struct bwfm_softc *sc = ic->ic_softc;
+	int error;
+
+	if (sc->sc_dying)
+		return (0);
+	sc->sc_ap_up = false;
+	if (bwfm_dcmd_set_int(sc, BWFM_C_DOWN, 1) == 0)
+		sc->sc_wlc_up = false;
+	error = bwfm_dcmd_set_int(sc, BWFM_C_SET_AP, 0);
+	(void)bwfm_iovar_set_int(sc, "wsec", 0);
+	(void)bwfm_iovar_set_int(sc, "wpa_auth", 0);
+	(void)bwfm_iovar_set_int(sc, "mfp", BWFM_MFP_NONE);
+	if (ic->ic_nrunning > 0 &&
+	    bwfm_dcmd_set_int(sc, BWFM_C_UP, 1) == 0)
+		sc->sc_wlc_up = true;
+	DPRINTF(sc, 0, "AP: stopped, SET_AP 0 rc=%d\n", error);
+	return (error);
+}
+
+/* Send a station away (all of them for the broadcast address). */
+static int
+bwfm_fmop_sta_deauth(struct ieee80211com *ic, const uint8_t mac[6],
+    uint16_t reason)
+{
+	struct bwfm_softc *sc = ic->ic_softc;
+	struct bwfm_scb_val_le sv;
+	int error;
+
+	if (!sc->sc_ap_up)
+		return (0);
+	memset(&sv, 0, sizeof(sv));
+	sv.val = htole32(reason);
+	memcpy(sv.ea, mac, sizeof(sv.ea));
+	error = bwfm_dcmd_set(sc, BWFM_C_SCB_DEAUTHENTICATE_FOR_REASON,
+	    &sv, sizeof(sv));
+	DPRINTF(sc, 0, "AP: deauth %6D reason %u rc=%d\n", mac, ":", reason,
+	    error);
+	return (error);
+}
+
+/*
+ * Firmware events while we are an access point.  Stations come and go
+ * through the *_IND events, which carry the station's address, and for
+ * (re)association its request's elements.  Returns true when the event
+ * was an AP event and is dealt with.
+ */
+static bool
+bwfm_handle_ap_event(struct bwfm_softc *sc, const struct bwfm_event_msg *emsg,
+    uint32_t evtype, uint32_t status, const uint8_t *data, size_t datalen)
+{
+	struct ieee80211com *ic = &sc->sc_ic;
+	uint32_t reason = be32toh(emsg->reason);
+
+	switch (evtype) {
+	case BWFM_E_ASSOC_IND:
+	case BWFM_E_REASSOC_IND:
+		DPRINTF(sc, 0, "AP: %s %6D status=%u reason=%u ies=%zu\n",
+		    evtype == BWFM_E_ASSOC_IND ? "ASSOC_IND" : "REASSOC_IND",
+		    emsg->addr, ":", status, reason, datalen);
+		if (status == BWFM_E_STATUS_SUCCESS && reason == 0)
+			ieee80211_fmac_sta_join(ic, emsg->addr, data, datalen,
+			    evtype == BWFM_E_REASSOC_IND);
+		return (true);
+	case BWFM_E_DEAUTH_IND:
+	case BWFM_E_DISASSOC_IND:
+	case BWFM_E_DEAUTH:
+	case BWFM_E_TYPE_DISASSOC:
+		DPRINTF(sc, 0, "AP: station %6D left (event %u reason %u)\n",
+		    emsg->addr, ":", evtype, reason);
+		ieee80211_fmac_sta_leave(ic, emsg->addr, (uint16_t)reason);
+		return (true);
+	case BWFM_E_AUTH_IND:
+	case BWFM_E_TYPE_AUTH:
+	case BWFM_E_TYPE_ASSOC:
+	case BWFM_E_TYPE_SET_SSID:
+	case BWFM_E_TYPE_LINK:
+	case BWFM_E_TYPE_JOIN:
+		DPRINTF(sc, 1, "AP: event %u %6D status=%u reason=%u "
+		    "flags=0x%x\n", evtype, emsg->addr, ":", status, reason,
+		    be16toh(emsg->flags));
+		return (true);
+	default:
+		return (false);
+	}
+}
+
 static const struct ieee80211_fullmac_ops bwfm_fmops = {
 	.fmop_name	   = "bwfm",
 	.fmop_scan_start   = bwfm_fmop_scan_start,
+	.fmop_scan_cancel  = bwfm_fmop_scan_cancel,
 	.fmop_assoc	   = bwfm_fmop_assoc,
 	.fmop_disassoc	   = bwfm_fmop_disassoc,
 	.fmop_set_key	   = bwfm_fmop_set_key,
 	.fmop_del_key	   = bwfm_fmop_del_key,
 	.fmop_set_country  = bwfm_fmop_set_country,
+	.fmop_set_powersave = bwfm_fmop_set_powersave,
+	.fmop_get_signal   = bwfm_fmop_get_signal,
+	.fmop_set_pmk      = bwfm_fmop_set_pmk,
+	.fmop_start_ap     = bwfm_fmop_start_ap,
+	.fmop_stop_ap      = bwfm_fmop_stop_ap,
+	.fmop_sta_deauth   = bwfm_fmop_sta_deauth,
 };
 
 /* set up the driver and attach it to the wifi stack */
@@ -3300,6 +3583,7 @@ bwfm_attach(struct bwfm_softc *sc)
 	    IEEE80211_CRYPTO_TKIP |
 	    IEEE80211_CRYPTO_WEP;
 
+	bwfm_query_radio(sc);
 	bwfm_getradiocaps(ic, IEEE80211_CHAN_MAX, &ic->ic_nchans,
 	    ic->ic_channels);
 
@@ -3307,15 +3591,6 @@ bwfm_attach(struct bwfm_softc *sc)
 
 	ieee80211_ifattach(ic);
 	sc->sc_ic_attached = true;
-
-	/*
-	 * Attach the FullMAC framework.  It takes over ic_scan_start /
-	 * ic_scan_end here; the vap-level shims (fmac_newstate,
-	 * fmac_key_set) are installed by ieee80211_fmac_vap_attach()
-	 * from bwfm_vap_create.
-	 */
-	(void)ieee80211_fmac_attach(ic, &bwfm_fmops,
-	    IEEE80211_FMAC_CAP_FW_SCAN | IEEE80211_FMAC_CAP_ONCHIP_SUP);
 
 	ic->ic_vap_create = bwfm_vap_create;
 	ic->ic_vap_delete = bwfm_vap_delete;
@@ -3329,6 +3604,25 @@ bwfm_attach(struct bwfm_softc *sc)
 	ic->ic_update_mcast = bwfm_update_mcast;
 
 	/*
+	 * Attach the FullMAC framework last, once the ic methods are set:
+	 * it takes over ic_scan_start / ic_scan_end and wraps
+	 * ic_vap_create, so each vap gets the framework's shims and
+	 * defaults.  Its ops are bwfm_fmops minus what the transport
+	 * cannot do.
+	 */
+	sc->sc_fmops = bwfm_fmops;
+	if (sc->sc_bus_ops->bs_no_powersave)
+		sc->sc_fmops.fmop_set_powersave = NULL;
+	if (sc->sc_bus_ops->bs_no_hostap) {
+		sc->sc_fmops.fmop_start_ap = NULL;
+		sc->sc_fmops.fmop_stop_ap = NULL;
+		sc->sc_fmops.fmop_sta_deauth = NULL;
+	}
+	if (ieee80211_fmac_attach(ic, &sc->sc_fmops,
+	    IEEE80211_FMAC_CAP_FW_SCAN | IEEE80211_FMAC_CAP_ONCHIP_SUP) != 0)
+		device_printf(sc->sc_dev, "FullMAC framework attach failed\n");
+
+	/*
 	 * Tell devd the device is ready for a vap.  The firmware can come up
 	 * after rc's netif has already created the wlans_<dev> interfaces,
 	 * or the device can be plugged in later; etc/devd/bwfm.conf creates
@@ -3340,70 +3634,14 @@ bwfm_attach(struct bwfm_softc *sc)
 }
 
 /*
- * WPA2-PSK passphrase sysctl.  Stores the ASCII passphrase (8..63
- * bytes per WPA2 spec) in the softc; bwfm_assoc_task checks
- * sc_wpa_set on the next join to pick the WPA2 dispatch path.
- * Read-back returns the "<set>" sentinel so the
- * passphrase does not leak through sysctl introspection.  Empty
- * write clears.
- */
-static int
-bwfm_pmk_sysctl(SYSCTL_HANDLER_ARGS)
-{
-	struct bwfm_softc *sc = arg1;
-	char buf[64];
-	size_t len;
-	int error;
-
-	memset(buf, 0, sizeof(buf));
-	if (sc->sc_wpa_set)
-		strlcpy(buf, "<set>", sizeof(buf));
-	error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
-	if (error != 0 || req->newptr == NULL) {
-		/*
-		 * explicit_bzero the local passphrase buffer
-		 * even on read/error paths.  Plain memset is elided by
-		 * the compiler when it can prove the memory dies with
-		 * the stack frame; explicit_bzero is the guaranteed
-		 * "you WILL zero this" primitive.  Prevents leftover
-		 * PMK bytes surviving on a reused kernel stack page.
-		 */
-		explicit_bzero(buf, sizeof(buf));
-		return (error);
-	}
-	if (strcmp(buf, "<set>") == 0) {
-		explicit_bzero(buf, sizeof(buf));
-		return (0);
-	}
-	len = strnlen(buf, sizeof(buf));
-	if (len == 0) {
-		sc->sc_wpa_set = false;
-		explicit_bzero(sc->sc_wpa_pmk, sizeof(sc->sc_wpa_pmk));
-		DPRINTF(sc, 0, "WPA2 PMK cleared\n");
-		explicit_bzero(buf, sizeof(buf));
-		return (0);
-	}
-	if (len < 8 || len > 63) {
-		explicit_bzero(buf, sizeof(buf));
-		return (EINVAL);
-	}
-	explicit_bzero(sc->sc_wpa_pmk, sizeof(sc->sc_wpa_pmk));
-	memcpy(sc->sc_wpa_pmk, buf, len);
-	sc->sc_wpa_set = true;
-	DPRINTF(sc, 0, "WPA2 PMK stored (%zu bytes)\n", len);
-	explicit_bzero(buf, sizeof(buf));
-	return (0);
-}
-
-/*
  * Look up the BSS we just joined in net80211's scan cache and call
  * ieee80211_sta_join with it.  sta_join sets ic_curchan + builds an
  * iv_bss node + transitions vap state, which is exactly the
  * scaffolding our deferred link task needs before it can call
  * ieee80211_new_state(RUN) without NULL-derefing in sync_curchan.
  *
- * The scan cache must be populated for this to work — caller is
- * expected to have triggered a scan before the direct-join sysctl.
+ * The scan cache must be populated for this to work: the caller is
+ * expected to have run a scan first.
  */
 struct bwfm_mlme_lookup {
 	const uint8_t			*bssid;
@@ -3484,500 +3722,6 @@ bwfm_sta_join_from_cache(struct bwfm_softc *sc)
 }
 
 /*
- * scan_now sysctl.  Writing any non-zero int triggers a broadcast
- * escan; useful for kicking the firmware in a non-net80211 path
- * (e.g. before any vap exists or when net80211's scan-cache aged
- * everything out).
- */
-static int
-bwfm_scan_sysctl(SYSCTL_HANDLER_ARGS)
-{
-	struct bwfm_softc *sc = arg1;
-	int trigger = 0;
-	int error;
-
-	error = sysctl_handle_int(oidp, &trigger, 0, req);
-	if (error != 0 || req->newptr == NULL)
-		return (error);
-	if (trigger == 0)
-		return (0);
-	error = bwfm_dispatch_scan(sc);
-	DPRINTF(sc, 0, "scan_now dispatch rc=%d\n", error);
-	return (error);
-}
-
-/*
- * Direct WPA2 join sysctl.  Bypasses net80211's SCAN/AUTH state
- * machine — writes the BCDC iovars and SET_SSID directly, letting the
- * firmware handle auth + 4-way handshake using the PMK already
- * installed via wpa_pmk.  Format: "BSSID:SSID" with BSSID as 6
- * colon-separated hex bytes.  Useful for radio-side testing without
- * net80211 or wpa_supplicant in the loop.
- * Empty string means "abort" (BWFM_C_DOWN).
- */
-static int
-bwfm_join_sysctl(SYSCTL_HANDLER_ARGS)
-{
-	struct bwfm_softc *sc = arg1;
-	char buf[96];
-	uint8_t bssid[6];
-	const char *ssid;
-	unsigned int b[6];
-	size_t ssid_len;
-	int error, n, off, matched;
-
-	memset(buf, 0, sizeof(buf));
-	error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
-	if (error != 0 || req->newptr == NULL)
-		return (error);
-	if (buf[0] == '\0') {
-		uint32_t v = htole32(0);
-
-		(void)bwfm_dcmd_set(sc, BWFM_C_DOWN, &v, sizeof(v));
-		DPRINTF(sc, 0, "join aborted\n");
-		return (0);
-	}
-	/*
-	 * If no PSK staged, fall through to bwfm_join_open: useful for
-	 * (a) joining an OPEN AP and (b) chip-side iovar validation
-	 * against a WPA2 AP (chip will auth + assoc, AP will deauth
-	 * after timeout; the chip's AUTH/ASSOC_IND events confirm the
-	 * join sequence reached the air).
-	 */
-	off = 0;
-	matched = sscanf(buf, "%x:%x:%x:%x:%x:%x:%n",
-	    &b[0], &b[1], &b[2], &b[3], &b[4], &b[5], &off);
-	if (matched != 6 || off == 0 || buf[off] == '\0')
-		return (EINVAL);
-	n = off;
-	for (int i = 0; i < 6; i++) {
-		if (b[i] > 0xff)
-			return (EINVAL);
-		bssid[i] = (uint8_t)b[i];
-	}
-	ssid = buf + n;
-	ssid_len = strnlen(ssid, sizeof(buf) - n);
-	if (ssid_len == 0 || ssid_len > BWFM_MAX_SSID_LEN)
-		return (EINVAL);
-
-	memcpy(sc->sc_join_bssid, bssid, 6);
-	memcpy(sc->sc_join_ssid, ssid, ssid_len);
-	sc->sc_join_ssid[ssid_len] = '\0';
-	sc->sc_join_ssid_len = ssid_len;
-
-	/*
-	 * Preferred path: route the join through net80211's state
-	 * machine.  sta_join_from_cache calls ieee80211_sta_join, which
-	 * walks the vap to AUTH; the framework's newstate shim then
-	 * dispatches the firmware join (bwfm_fmop_assoc).  When firmware
-	 * emits LINK up,
-	 * bwfm_link_task fast-forwards ASSOC -> RUN.  This is what makes
-	 * wlan0 usable from dhclient + userland sockets.
-	 *
-	 * If the scan cache has no matching BSS (no scan run yet, or BSS
-	 * aged out), fall back to the raw direct dispatch which at least
-	 * gets the radio associated -- useful for end-to-end firmware
-	 * validation even if userland can't use the link.
-	 */
-	error = bwfm_sta_join_from_cache(sc);
-	if (error == 0) {
-		DPRINTF(sc, 0,
-		    "join_target: dispatched via sta_join (net80211 tracked)\n");
-		return (0);
-	}
-	DPRINTF(sc, 0,
-	    "join_target: sta_join_from_cache rc=%d; falling back to "
-	    "raw direct dispatch\n", error);
-
-	if (sc->sc_wpa_set || sc->sc_wpa_pmk_raw_set) {
-		error = bwfm_join_wpa2_raw(sc, bssid, ssid, ssid_len);
-		DPRINTF(sc, 0, "join_target raw WPA2 dispatch rc=%d\n", error);
-	} else {
-		struct bwfm_join_params join;
-		uint32_t v;
-
-		size_t jlen;
-		uint16_t chanspec;
-
-		if (sc->sc_join_busy) {
-			DPRINTF(sc, 0, "join_target: join in flight, EAGAIN\n");
-			return (EAGAIN);
-		}
-		sc->sc_join_busy = 1;
-
-		/*
-		 * No DOWN/UP wrap -- Linux brcmfmac doesn't, and BCM43455
-		 * fw 7.45.x's join state machine doesn't fire AUTH after
-		 * a DOWN/UP bounce.  Just reset RSN config in place.
-		 */
-		v = htole32(1);
-		(void)bwfm_dcmd_set(sc, BWFM_C_SET_INFRA, &v, sizeof(v));
-		v = htole32(BWFM_AUTH_OPEN);
-		(void)bwfm_dcmd_set(sc, BWFM_C_SET_AUTH, &v, sizeof(v));
-		v = htole32(0);
-		(void)bwfm_iovar_set(sc, "wsec", &v, sizeof(v));
-		v = htole32(0);
-		(void)bwfm_iovar_set(sc, "wpa_auth", &v, sizeof(v));
-
-		memset(&join, 0, sizeof(join));
-		join.ssid.len = htole32(ssid_len);
-		memcpy(join.ssid.ssid, ssid, ssid_len);
-		memcpy(join.assoc.bssid, bssid, 6);
-
-		/*
-		 * Pass the fw-cached chanspec via chanspec_list[0] so the
-		 * chip parks on the AP's actual channel instead of doing
-		 * a from-scratch SSID hunt that often doesn't converge to
-		 * AUTH on BCM43455 fw 7.45.x.
-		 */
-		chanspec = bwfm_lookup_bssid_chanspec(sc, bssid);
-		if (chanspec != 0) {
-			join.assoc.chanspec_num = htole32(1);
-			join.assoc.chanspec_list[0] = htole16(chanspec);
-			jlen = BWFM_JOIN_PARAMS_FIXED_SIZE + sizeof(uint16_t);
-		} else {
-			join.assoc.chanspec_num = 0;
-			jlen = BWFM_JOIN_PARAMS_FIXED_SIZE;
-		}
-
-		DPRINTF(sc, 0,
-		    "join OPEN: ssid=\"%.*s\" bssid=%02x:%02x:%02x:%02x:%02x:%02x "
-		    "chanspec=0x%04x jlen=%zu\n",
-		    (int)ssid_len, ssid,
-		    bssid[0], bssid[1], bssid[2],
-		    bssid[3], bssid[4], bssid[5],
-		    chanspec, jlen);
-		error = bwfm_dcmd_set(sc, BWFM_C_SET_SSID, &join, jlen);
-		if (error != 0)
-			sc->sc_join_busy = 0;
-		DPRINTF(sc, 0, "join_target raw OPEN dispatch rc=%d\n", error);
-	}
-	return (error);
-}
-
-/*
- * Raw 32-byte PMK sysctl.  Userspace computes the PMK with
- *   wpa_passphrase <ssid> <passphrase>
- * and writes the 64-char hex string here.  Preferred over wpa_pmk
- * because the 2011 BCM43236 firmware rejects the passphrase-form
- * wsec_pmk install with BCME_BADARG.  Empty string clears.
- */
-static int
-bwfm_pmk_hex_sysctl(SYSCTL_HANDLER_ARGS)
-{
-	struct bwfm_softc *sc = arg1;
-	char buf[80];
-	uint8_t pmk[32];
-	size_t len;
-	int error;
-
-	memset(buf, 0, sizeof(buf));
-	if (sc->sc_wpa_pmk_raw_set)
-		strlcpy(buf, "<set>", sizeof(buf));
-	error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
-	if (error != 0 || req->newptr == NULL)
-		return (error);
-	if (strcmp(buf, "<set>") == 0)
-		return (0);
-	len = strnlen(buf, sizeof(buf));
-	if (len == 0) {
-		sc->sc_wpa_pmk_raw_set = false;
-		memset(sc->sc_wpa_pmk_raw, 0, sizeof(sc->sc_wpa_pmk_raw));
-		DPRINTF(sc, 0, "WPA2 raw PMK cleared\n");
-		return (0);
-	}
-	if (len != 64)
-		return (EINVAL);
-	for (int i = 0; i < 32; i++) {
-		unsigned int b;
-
-		if (sscanf(buf + i * 2, "%2x", &b) != 1 || b > 0xff)
-			return (EINVAL);
-		pmk[i] = (uint8_t)b;
-	}
-	memcpy(sc->sc_wpa_pmk_raw, pmk, 32);
-	sc->sc_wpa_pmk_raw_set = true;
-	DPRINTF(sc, 0, "WPA2 raw PMK stored (32 bytes)\n");
-	return (0);
-}
-
-/*
- * iovar_get sysctl.  Write an iovar name to fetch; subsequent read
- * returns the last-fetched value as a hex byte string.  Useful for
- * probing the firmware's live state — caps, ver, mfp, etc.
- */
-static int
-bwfm_iovar_get_sysctl(SYSCTL_HANDLER_ARGS)
-{
-	struct bwfm_softc *sc = arg1;
-	char namebuf[64];
-	size_t outlen;
-	int error;
-
-	memset(namebuf, 0, sizeof(namebuf));
-	if (req->newptr == NULL) {
-		char hex[BWFM_IOVAR_DUMP_MAX * 3 + 1];
-		size_t i, n;
-
-		mtx_lock(&sc->sc_ctl_mtx);
-		n = sc->sc_iovar_value_len;
-		if (n > BWFM_IOVAR_DUMP_MAX)
-			n = BWFM_IOVAR_DUMP_MAX;
-		for (i = 0; i < n; i++)
-			snprintf(hex + i * 3, 4, "%02x ",
-			    sc->sc_iovar_value[i]);
-		hex[i ? i * 3 - 1 : 0] = '\0';
-		mtx_unlock(&sc->sc_ctl_mtx);
-		return (sysctl_handle_string(oidp, hex, sizeof(hex), req));
-	}
-
-	error = sysctl_handle_string(oidp, namebuf, sizeof(namebuf), req);
-	if (error != 0)
-		return (error);
-
-	mtx_lock(&sc->sc_ctl_mtx);
-	strlcpy(sc->sc_iovar_name, namebuf, sizeof(sc->sc_iovar_name));
-	mtx_unlock(&sc->sc_ctl_mtx);
-
-	outlen = BWFM_IOVAR_DUMP_MAX;
-	{
-		uint8_t scratch[BWFM_IOVAR_DUMP_MAX];
-
-		memset(scratch, 0, sizeof(scratch));
-		error = bwfm_iovar_get(sc, namebuf, scratch, &outlen);
-		mtx_lock(&sc->sc_ctl_mtx);
-		if (error != 0) {
-			sc->sc_iovar_value_len = 0;
-			DPRINTF(sc, 0, "iovar_get(\"%s\") rc=%d\n",
-			    namebuf, error);
-		} else {
-			memcpy(sc->sc_iovar_value, scratch, outlen);
-			sc->sc_iovar_value_len = outlen;
-			DPRINTF(sc, 0,
-			    "iovar_get(\"%s\") returned %zu bytes\n",
-			    namebuf, outlen);
-		}
-		mtx_unlock(&sc->sc_ctl_mtx);
-	}
-	return (0);
-}
-
-/*
- * event_stats: what the firmware reported, and whether every resulting
- * task request was handled.  "req" counts enqueues; "cover" sums the
- * taskqueue's pending count over the task's runs.  req == cover means no
- * request was lost (coalesced requests are covered by one run).
- */
-static int
-bwfm_event_stats_sysctl(SYSCTL_HANDLER_ARGS)
-{
-	static const struct { int t; const char *n; } names[] = {
-		{ 0, "SET_SSID" }, { 1, "JOIN" }, { 3, "AUTH" }, { 5, "DEAUTH" },
-		{ 6, "DEAUTH_IND" }, { 7, "ASSOC" }, { 11, "DISASSOC" },
-		{ 12, "DISASSOC_IND" }, { 16, "LINK" }, { 25, "EAPOL_MSG" },
-		{ 46, "PSK_SUP" }, { 54, "IF" }, { 69, "ESCAN_RESULT" },
-		{ 74, "FIFO_CREDIT_MAP" },
-	};
-	struct bwfm_softc *sc = arg1;
-	struct sbuf *sb;
-	const char *nm;
-	int error, t;
-	size_t k;
-
-	sb = sbuf_new_for_sysctl(NULL, NULL, 512, req);
-	sbuf_printf(sb, "events:");
-	for (t = 0; t < (int)nitems(sc->sc_evt_by_type); t++) {
-		if (sc->sc_evt_by_type[t] == 0)
-			continue;
-		nm = NULL;
-		for (k = 0; k < nitems(names); k++)
-			if (names[k].t == t)
-				nm = names[k].n;
-		if (nm != NULL)
-			sbuf_printf(sb, " %s=%u", nm, sc->sc_evt_by_type[t]);
-		else
-			sbuf_printf(sb, " E%d=%u", t, sc->sc_evt_by_type[t]);
-	}
-	sbuf_printf(sb, "\nescan_done_events=%u\n", sc->sc_escan_done_evts);
-	sbuf_printf(sb, "scan_done_task req=%u cover=%u%s\n",
-	    sc->sc_scan_done_reqs, sc->sc_scan_done_cover,
-	    sc->sc_scan_done_reqs == sc->sc_scan_done_cover ? " ok" : " LOST");
-	sbuf_printf(sb, "link_task req=%u cover=%u%s\n",
-	    sc->sc_link_reqs, sc->sc_link_cover,
-	    sc->sc_link_reqs == sc->sc_link_cover ? " ok" : " LOST");
-	sbuf_printf(sb, "assoc_task req=%u cover=%u%s",
-	    sc->sc_assoc_reqs, sc->sc_assoc_cover,
-	    sc->sc_assoc_reqs == sc->sc_assoc_cover ? " ok" : " LOST");
-	error = sbuf_finish(sb);
-	sbuf_delete(sb);
-	return (error);
-}
-
-/*
- * iovar_set sysctl.  Format: "name:hexbytes" where hexbytes is an
- * even-length hex string (no separators).  Lets operators push a raw
- * iovar payload for protocol forensics without recompiling.
- */
-static int
-bwfm_iovar_set_sysctl(SYSCTL_HANDLER_ARGS)
-{
-	struct bwfm_softc *sc = arg1;
-	char buf[768];
-	uint8_t bytes[256];
-	const char *colon, *hex;
-	char name[64];
-	size_t namelen, hexlen, nbytes, i;
-	int error;
-
-	/*
-	 * Safety gate.  Two conditions must hold before we push
-	 * a raw operator-supplied iovar payload at the firmware:
-	 *   1. sc_unsafe_iovars must be non-zero (opt-in flag).
-	 *   2. The caller must hold PRIV_DRIVER.  Redundant against
-	 *      the sysctl's own root check on most systems, but the
-	 *      explicit priv_check adds jail restriction: a jailed
-	 *      root without PRIV_DRIVER cannot reach the chip.
-	 * Without this gate the ~65 iovar handlers on the chip (2011
-	 * blob) are a live pipe to a decade of Broadcom firmware CVEs
-	 * for anyone who owns root.  Compile with
-	 * `options BWFM_UNSAFE_IOVARS_DEFAULT_ON` to skip the opt-in flag.
-	 */
-#ifndef BWFM_UNSAFE_IOVARS_DEFAULT_ON
-	if (sc->sc_unsafe_iovars == 0)
-		return (EPERM);
-#endif
-	error = priv_check(req->td, PRIV_DRIVER);
-	if (error != 0)
-		return (error);
-
-	memset(buf, 0, sizeof(buf));
-	error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
-	if (error != 0 || req->newptr == NULL)
-		return (error);
-
-	colon = strchr(buf, ':');
-	if (colon == NULL)
-		return (EINVAL);
-	namelen = (size_t)(colon - buf);
-	if (namelen == 0 || namelen >= sizeof(name))
-		return (EINVAL);
-	memcpy(name, buf, namelen);
-	name[namelen] = '\0';
-
-	hex = colon + 1;
-	hexlen = strnlen(hex, sizeof(buf) - namelen - 1);
-	if (hexlen % 2 != 0 || hexlen / 2 > sizeof(bytes))
-		return (EINVAL);
-	nbytes = hexlen / 2;
-	for (i = 0; i < nbytes; i++) {
-		unsigned int v;
-
-		if (sscanf(&hex[i * 2], "%2x", &v) != 1)
-			return (EINVAL);
-		bytes[i] = (uint8_t)v;
-	}
-
-	error = bwfm_iovar_set(sc, name, bytes, nbytes);
-	DPRINTF(sc, 0, "iovar_set(\"%s\", %zu bytes) rc=%d\n",
-	    name, nbytes, error);
-	return (error);
-}
-
-/*
- * sup_dump sysctl.  Paired with the patched BCM43236 firmware (see
- * tools/patch_sup_dump.py): the injected "sup_dump" iovar reads
- * bytes from the on-chip supplicant context [*(wlc+0x12) + offset]
- * and returns them via the iovar reply.
- *
- * Wire format on the iovar GET path:
- *
- *     "sup_dump\0" | <u32 offset LE> | <u32 length LE>
- *
- * Writes: parse "OFFSET LENGTH" (decimal or 0x-prefixed hex).
- * Reads:  return the last fetched bytes as space-separated hex.
- */
-static int
-bwfm_sup_dump_sysctl(SYSCTL_HANDLER_ARGS)
-{
-	struct bwfm_softc *sc = arg1;
-	char input[64];
-	uint8_t params[8];
-	uint8_t scratch[BWFM_SUP_DUMP_MAX];
-	uint64_t off, len;
-	char *p;
-	size_t outlen;
-	int error;
-
-	if (req->newptr == NULL) {
-		char hex[BWFM_SUP_DUMP_MAX * 3 + 64];
-		size_t i, n, used;
-
-		mtx_lock(&sc->sc_ctl_mtx);
-		n = sc->sc_sup_dump_len;
-		used = snprintf(hex, sizeof(hex), "off=%#x len=%zu",
-		    sc->sc_sup_dump_off, n);
-		if (n != 0 && used + 1 < sizeof(hex))
-			hex[used++] = ' ';
-		for (i = 0; i < n && used + 3 < sizeof(hex); i++) {
-			used += snprintf(hex + used, sizeof(hex) - used,
-			    "%02x ", sc->sc_sup_dump[i]);
-		}
-		if (used > 0 && hex[used - 1] == ' ')
-			hex[used - 1] = '\0';
-		mtx_unlock(&sc->sc_ctl_mtx);
-		return (sysctl_handle_string(oidp, hex, sizeof(hex), req));
-	}
-
-	memset(input, 0, sizeof(input));
-	error = sysctl_handle_string(oidp, input, sizeof(input), req);
-	if (error != 0)
-		return (error);
-
-	off = strtouq(input, &p, 0);
-	if (p == input)
-		return (EINVAL);
-	while (*p == ' ' || *p == '\t')
-		p++;
-	len = strtouq(p, NULL, 0);
-	if (len == 0 || len > BWFM_SUP_DUMP_MAX)
-		return (EINVAL);
-	if (off > 0xffffffffULL)
-		return (EINVAL);
-
-	params[0] = (uint8_t)(off >>  0);
-	params[1] = (uint8_t)(off >>  8);
-	params[2] = (uint8_t)(off >> 16);
-	params[3] = (uint8_t)(off >> 24);
-	params[4] = (uint8_t)(len >>  0);
-	params[5] = (uint8_t)(len >>  8);
-	params[6] = (uint8_t)(len >> 16);
-	params[7] = (uint8_t)(len >> 24);
-
-	outlen = (size_t)len;
-	memset(scratch, 0, sizeof(scratch));
-	error = bwfm_iovar_get_with_params(sc, "sup_dump",
-	    params, sizeof(params), scratch, &outlen);
-
-	mtx_lock(&sc->sc_ctl_mtx);
-	sc->sc_sup_dump_off = (uint32_t)off;
-	if (error != 0) {
-		sc->sc_sup_dump_len = 0;
-		DPRINTF(sc, 0, "sup_dump(off=%#jx len=%ju) rc=%d\n",
-		    (uintmax_t)off, (uintmax_t)len, error);
-	} else {
-		if (outlen > BWFM_SUP_DUMP_MAX)
-			outlen = BWFM_SUP_DUMP_MAX;
-		memcpy(sc->sc_sup_dump, scratch, outlen);
-		sc->sc_sup_dump_len = outlen;
-		DPRINTF(sc, 0,
-		    "sup_dump(off=%#jx len=%ju) returned %zu bytes\n",
-		    (uintmax_t)off, (uintmax_t)len, outlen);
-	}
-	mtx_unlock(&sc->sc_ctl_mtx);
-	return (error);
-}
-
-/*
  * Bring the firmware to the operating point net80211 expects.  Order:
  *   BWFM_C_UP            - data plane up
  *   event_msgs           - subscribe to the events the driver demuxes
@@ -3986,8 +3730,7 @@ bwfm_sup_dump_sysctl(SYSCTL_HANDLER_ARGS)
  *   sup_wpa = 0          - host-side EAPOL mode for fresh credentials
  *
  * Called from each transport's attach once the BCDC path is alive.
- * All errors are non-fatal; the transport logs them but continues so
- * the user can still poke the firmware via the iovar_* sysctls.
+ * All errors are non-fatal; the transport logs them and continues.
  */
 /*
  * CLM (Country Locale Matrix) blob upload via the "clmload" iovar.
@@ -4105,6 +3848,11 @@ bwfm_runtime_iovars(struct bwfm_softc *sc)
 	SETBIT(mask, BWFM_E_TYPE_DISASSOC);
 	SETBIT(mask, BWFM_E_EAPOL_MSG);
 	SETBIT(mask, BWFM_E_TYPE_ESCAN_RESULT);
+	SETBIT(mask, BWFM_E_AUTH_IND);		/* access point */
+	SETBIT(mask, BWFM_E_DEAUTH_IND);
+	SETBIT(mask, BWFM_E_ASSOC_IND);
+	SETBIT(mask, BWFM_E_REASSOC_IND);
+	SETBIT(mask, BWFM_E_DISASSOC_IND);
 #undef SETBIT
 	error = bwfm_iovar_set(sc, "event_msgs", mask, sizeof(mask));
 	DPRINTF(sc, 0, "event_msgs iovar rc=%d\n", error);
@@ -4242,64 +3990,6 @@ bwfm_runtime_iovars(struct bwfm_softc *sc)
 	    "WARNING: firmware blob is from 2011 and predates Broadpwn/Kr00k/"
 	    "FragAttacks; see the driver's SECURITY.md.  Use for experimental/CTF "
 	    "only.\n");
-}
-
-/*
- * Register the operator-facing sysctls that live on the bwfm core.
- * Transports call this after bwfm_attach() so the sysctl tree exists
- * and the softc is fully initialised.
- */
-void
-bwfm_sysctl_attach(struct bwfm_softc *sc)
-{
-	struct sysctl_ctx_list *ctx = device_get_sysctl_ctx(sc->sc_dev);
-	struct sysctl_oid *tree = device_get_sysctl_tree(sc->sc_dev);
-
-	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "wpa_pmk",
-	    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    bwfm_pmk_sysctl, "A",
-	    "WPA2-PSK passphrase (8..63 ASCII; empty clears)");
-	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "wpa_pmk_hex",
-	    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    bwfm_pmk_hex_sysctl, "A",
-	    "Raw 32-byte PMK as 64 hex chars (preferred for "
-	    "2011 BCM43236 firmware; compute via wpa_passphrase)");
-	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "scan_now",
-	    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
-	    bwfm_scan_sysctl, "I",
-	    "Trigger broadcast escan (write 1)");
-	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "join_target",
-	    CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
-	    bwfm_join_sysctl, "A",
-	    "Direct WPA2 join: 'aa:bb:cc:dd:ee:ff:SSID' "
-	    "(set wpa_pmk first; empty to abort)");
-	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "iovar_get",
-	    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    bwfm_iovar_get_sysctl, "A",
-	    "Write iovar name to fetch; read returns hex value");
-	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "event_stats",
-	    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
-	    bwfm_event_stats_sysctl, "A",
-	    "Firmware events by type, and each task's requests vs coverage");
-	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "iovar_set",
-	    CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_MPSAFE, sc, 0,
-	    bwfm_iovar_set_sysctl, "A",
-	    "Write 'name:hexpayload' to push a raw iovar "
-	    "(gated by dev.bwfm.<n>.unsafe=1)");
-	/*
-	 * Safety gate for the raw iovar_set path.  Also gates
-	 * the CMD52/CMD53 raw-SDIO path on the SDIO transport's cdev.
-	 * Default 0.  See sc_unsafe_iovars comment in bwfmvar.h.
-	 */
-	SYSCTL_ADD_INT(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "unsafe",
-	    CTLFLAG_RW, &sc->sc_unsafe_iovars, 0,
-	    "Allow raw iovar_set + cdev CMD52/CMD53 (chip-CVE surface). "
-	    "0=off (default), 1=on (root+PRIV_DRIVER still required).");
-	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "sup_dump",
-	    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    bwfm_sup_dump_sysctl, "A",
-	    "Write 'OFFSET LEN' (patched fw); read returns hex bytes "
-	    "from *(wlc+0x12)+OFFSET");
 }
 
 /* detach the driver from the wifi stack */

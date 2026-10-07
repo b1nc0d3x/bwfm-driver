@@ -504,15 +504,12 @@ tr_setup_tx:
 	}
 }
 
-/* count status pulses on the interrupt endpoint */
+/* keep the interrupt endpoint's status transfer running */
 static void
 bwfm_usb_int_in_cb(struct usb_xfer *xfer, usb_error_t error)
 {
-	struct bwfm_usb_softc *sc = usbd_xfer_softc(xfer);
-
 	switch (USB_GET_STATE(xfer)) {
 	case USB_ST_TRANSFERRED:
-		atomic_add_int(&sc->bus_sc.sc_evt_count, 1);
 		/* FALLTHROUGH */
 	case USB_ST_SETUP:
 		usbd_xfer_set_frame_len(xfer, 0, usbd_xfer_max_len(xfer));
@@ -799,10 +796,6 @@ bwfm_usb_attach(device_t dev)
 	    "debug", CTLFLAG_RWTUN, &bsc->sc_debug, 0,
 	    "Verbosity: 0=milestones, 1=protocol, 2=per-frame, "
 	    "3=hex dumps");
-	SYSCTL_ADD_UINT(device_get_sysctl_ctx(dev),
-	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
-	    "evt_count", CTLFLAG_RD, &bsc->sc_evt_count, 0,
-	    "Firmware events received via EP0 + INT-IN pulses");
 
 	device_set_usb_desc(dev);
 
@@ -938,7 +931,6 @@ bwfm_usb_attach(device_t dev)
 	if (error != 0)
 		goto fail;
 	bwfm_runtime_iovars(bsc);
-	bwfm_sysctl_attach(bsc);
 
 	return (0);
 

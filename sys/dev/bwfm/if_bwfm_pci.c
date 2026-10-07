@@ -59,16 +59,9 @@
 
 #define	BWFM_PCI_DESC	"Broadcom FullMAC PCIe"
 
-/* Forward declarations for sysctls defined at end-of-file. */
-static int bwfm_pci_sysctl_net80211_attach(SYSCTL_HANDLER_ARGS);
+/* Forward declarations. */
 static int bwfm_pci_sysctl_net80211_detach(SYSCTL_HANDLER_ARGS);
-static int bwfm_pci_sysctl_msgbuf_attach(SYSCTL_HANDLER_ARGS);
 static void bwfm_pci_preinit_dcmds(struct bwfm_pci_softc *sc);
-static int bwfm_pci_sysctl_dump_console(SYSCTL_HANDLER_ARGS);
-static int bwfm_pci_sysctl_wlc_up(SYSCTL_HANDLER_ARGS);
-static int bwfm_pci_sysctl_delete_flowring(SYSCTL_HANDLER_ARGS);
-static int bwfm_pci_sysctl_wlc_down(SYSCTL_HANDLER_ARGS);
-static int bwfm_pci_sysctl_mac_addr(SYSCTL_HANDLER_ARGS);
 
 /*
  * Loader tunables for attach-time behaviour.  Any attach-time chip
@@ -85,20 +78,19 @@ SYSCTL_INT(_hw_bwfm_pci, OID_AUTO, attach_appu_warm, CTLFLAG_RDTUN,
 /*
  * Bring the chip all the way up after attach: firmware, msgbuf, WLC_UP and
  * net80211, so the device shows up in net.wlan.devices like any other wifi
- * card and userland only has to create wlan0.  0 leaves it to the
- * bringup/msgbuf_attach/wlc_up/net80211_attach sysctls.  If it goes wrong
- * at boot, "set hw.bwfm_pci.autostart=0" at the loader prompt.
+ * card and userland only has to create wlan0.  0 leaves the chip down.
+ * If it goes wrong at boot, "set hw.bwfm_pci.autostart=0" at the loader
+ * prompt.
  */
 static int bwfm_pci_autostart_dflt = 1;
 SYSCTL_INT(_hw_bwfm_pci, OID_AUTO, autostart, CTLFLAG_RDTUN,
     &bwfm_pci_autostart_dflt, 0,
     "Bring the chip up (firmware, msgbuf, net80211) after attach.  "
-    "0 leaves it to the bring-up sysctls.");
+    "0 leaves the chip down.");
 /*
  * There is deliberately no tunable that forces bring-up from attach
  * itself: a wedge there combined with a persistent loader.conf setting
- * would make every boot wedge.  Manual bring-up goes through the runtime
- * sysctl dev.bwfm_pci.N.bringup=1, which does not survive a reboot.
+ * would make every boot wedge.  Bring-up runs in the autostart thread.
  */
 
 /* Vendor IDs. */
@@ -145,9 +137,9 @@ static const struct bwfm_pci_devmatch bwfm_pci_devs[] = {
  *
  * bringup_supported=true means the full bringup chain in
  * bwfm_pci_bringup_sequence() has been implemented + tested for this
- * chip.  false means probe/warmup/diagnostic sysctls work but
- * `bringup=1` will refuse (rather than wedge the host trying to run
- * 43602-specific PMU init on a chip that doesn't have those registers).
+ * chip.  false means the chip is probed and warmed up but not brought
+ * up (rather than wedge the host trying to run 43602-specific PMU init
+ * on a chip that doesn't have those registers).
  *
  * mem_core = ID of the on-chip memory core to power up in
  * enter_download_state.  43602 has SOCRAM (0x80e).  The 4360-family
@@ -410,9 +402,9 @@ struct bwfm_pci_softc {
 	bool			 sc_chip_alive;
 	/*
 	 * Set when bring-up reaches wait_fw_ready, cleared by
-	 * cold_reattach.  The bringup sysctl refuses while it is set:
-	 * uploading over running firmware kills it, and the recovery
-	 * that follows can hang the host.
+	 * cold_reattach.  Bring-up refuses while it is set: uploading
+	 * over running firmware kills it, and the recovery that follows
+	 * can hang the host.
 	 */
 	bool			 sc_fw_running;
 	/* The autostart thread is running; detach waits for it. */
@@ -427,8 +419,6 @@ struct bwfm_pci_softc {
 	 * after firmware boot halts the running CR4.
 	 */
 	uint32_t		 sc_fw_ramsize;
-	/* dump_console read cursor into the fw log ring. */
-	uint32_t		 sc_console_read_idx;
 
 	struct bwfm_pci_core	 sc_cores[BWFM_PCI_MAX_CORES];
 	int			 sc_ncores;
@@ -660,7 +650,7 @@ static int bwfm_pci_ec_write_byte(uint8_t off __unused,
  * long enough to panic with a spin lock held too long.
  *
  * On success the ChipID (BAR0[0x00]) goes from 0xffffffff (cold) to
- * 0xaa52 (BCM43602 warm); dev.bwfm_pci.N.chip_alive=1 checks it.
+ * 0xaa52 (BCM43602 warm).
  */
 #define BWFM_APPU_PERST_SLEEP_US   250000    /* 250 ms after APWC=1 */
 #define BWFM_APPU_POLL_INTERVAL_US 10000     /* 10 ms per iter */
@@ -2252,9 +2242,7 @@ bwfm_pci_wait_fw_ready(struct bwfm_pci_softc *sc, uint32_t ramsize,
 }
 
 /*
- * Chip bring-up, run by the autostart thread or by
- *
- *     sysctl dev.bwfm_pci.0.bringup=1
+ * Chip bring-up, run by the autostart thread.
  *
  * With debug output on, each step logs "STARTING" and "DONE", so if a
  * step wedges the machine the last STARTING line names it.
@@ -2329,7 +2317,7 @@ bwfm_pci_bringup_sequence(struct bwfm_pci_softc *sc)
 	/*
 	 * Escape hatch: chip_reset's own gate refuses when sc_chip_alive
 	 * is false.  Force true for the duration; on failure we clear it
-	 * so later per-sysctl pokes don't blindly touch BAR0.
+	 * so later steps don't blindly touch BAR0.
 	 */
 	sc->sc_chip_alive = true;
 
@@ -2445,41 +2433,6 @@ fail:
 	    rc, device_get_unit(dev));
 	sc->sc_chip_alive = false;
 	return (rc);
-}
-
-static int
-bwfm_pci_sysctl_bringup(SYSCTL_HANDLER_ARGS)
-{
-	struct bwfm_pci_softc *sc = arg1;
-	int trig = 0, error;
-
-	error = sysctl_handle_int(oidp, &trig, 0, req);
-	if (error != 0 || req->newptr == NULL)
-		return (error);
-	if (trig == 0)
-		return (0);
-	if (sc->sc_autostart_running)
-		return (EBUSY);	/* two bring-ups at once can hang */
-	if (sc->sc_fw_running) {
-		device_printf(sc->sc_dev,
-		    "bringup: firmware already running; not uploading again\n");
-		return (EALREADY);
-	}
-	return (bwfm_pci_bringup_sequence(sc));
-}
-
-static int
-bwfm_pci_sysctl_chip_alive(SYSCTL_HANDLER_ARGS)
-{
-	struct bwfm_pci_softc *sc = arg1;
-	int trig = 0, error;
-
-	error = sysctl_handle_int(oidp, &trig, 0, req);
-	if (error != 0 || req->newptr == NULL)
-		return (error);
-	if (trig == 0)
-		return (0);
-	return (bwfm_pci_chip_alive_cfg(sc) ? 0 : ENXIO);
 }
 
 /*
@@ -2755,15 +2708,15 @@ bwfm_pci_load_firmware(struct bwfm_pci_softc *sc)
 }
 
 /* ------------------------------------------------------------------
- * Recovery and diagnostic paths.
+ * Recovery paths.
  *
  * On Apple machines the BCM43602's PCIe memory decoder stays gated
  * until the platform unlock above completes, and any BAR0 read while
  * it is gated triggers a Master Abort and a Machine Check,
  * which on x86 is an instant reboot with no panic message.  Chip-side
  * operations are therefore explicit steps that check for a live chip
- * first, and the manual ones are sysctls.  They all log through
- * device_printf so the trail lands in dmesg.
+ * first.  They all log through device_printf so the trail lands in
+ * dmesg.
  * ------------------------------------------------------------------ */
 
 /*
@@ -2950,7 +2903,7 @@ bwfm_pci_maybe_queue_crash_recover(struct bwfm_pci_softc *sc)
  * Firmware crash auto-recovery taskqueue callback.  Runs on
  * taskqueue_thread after the DCMD timeout path bumps
  * mb->stat_dcmd_timeout_consec past sc_crash_recover_threshold.  Body
- * mirrors what the cold_reattach sysctl does; the pending flag is
+ * runs bwfm_pci_cold_reattach; the pending flag is
  * flipped back to false so a subsequent crash burst re-arms.
  */
 static void
@@ -2968,87 +2921,6 @@ bwfm_pci_crash_recover_task(void *ctx, int pending __unused)
 	sc->sc_crash_recover_pending = false;
 }
 
-/*
- * Diagnostic: manually trigger the crash-recover task without waiting
- * for real DCMD timeouts.  Sets the pending flag and enqueues the task;
- * task body then calls cold_reattach.  Same effect as
- * `sysctl dev.bwfm_pci.N.cold_reattach=1` but exercises the async
- * taskqueue path that a real fw crash would take.
- */
-static int
-bwfm_pci_sysctl_crash_probe(SYSCTL_HANDLER_ARGS)
-{
-	struct bwfm_pci_softc *sc = arg1;
-	int trig = 0, error;
-
-	error = sysctl_handle_int(oidp, &trig, 0, req);
-	if (error != 0 || req->newptr == NULL || trig == 0)
-		return (error);
-	if (sc->sc_crash_recover_pending) {
-		device_printf(sc->sc_dev,
-		    "crash_probe: already pending, ignored\n");
-		return (0);
-	}
-	sc->sc_crash_recover_pending = true;
-	sc->sc_crash_recover_events++;
-	device_printf(sc->sc_dev,
-	    "crash_probe: injecting event #%u, enqueueing task\n",
-	    sc->sc_crash_recover_events);
-	taskqueue_enqueue(taskqueue_thread, &sc->sc_crash_recover_task);
-	return (0);
-}
-
-/*
- * Diagnostic: force cold_reattach without going through ACPI S3.  Tears
- * the running msgbuf state down and rebuilds — chip will drop the
- * current association and reconnect once wpa_supplicant reissues its
- * scan/assoc.  Safe to run on a working link; it exercises the cold
- * resume path without a physical suspend cycle.
- */
-static int
-bwfm_pci_sysctl_cold_reattach(SYSCTL_HANDLER_ARGS)
-{
-	struct bwfm_pci_softc *sc = arg1;
-	int trig = 0, error;
-
-	error = sysctl_handle_int(oidp, &trig, 0, req);
-	if (error != 0 || req->newptr == NULL || trig == 0)
-		return (error);
-	return (bwfm_pci_cold_reattach(sc));
-}
-
-/*
- * Diagnostic: run the D3 mailbox handshake (H2D_HOST_D3_INFORM, then
- * wait up to 2s for D2H_DEV_D3_ACK) and follow with H2D_HOST_D0_INFORM,
- * without touching WLC, net80211 or the PCIe bus D-state.  Exercises
- * the firmware side of suspend/resume without an actual ACPI S3; the
- * chip stays associated across the round trip.
- */
-static int
-bwfm_pci_sysctl_d3_probe(SYSCTL_HANDLER_ARGS)
-{
-	struct bwfm_pci_softc *sc = arg1;
-	int trig = 0, error, rc_send, rc_ack;
-
-	error = sysctl_handle_int(oidp, &trig, 0, req);
-	if (error != 0 || req->newptr == NULL || trig == 0)
-		return (error);
-
-	rc_send = bwfm_pci_msgbuf_send_mb_data(sc, BWFM_H2D_HOST_D3_INFORM);
-	if (rc_send == 0) {
-		rc_ack = bwfm_pci_msgbuf_wait_mb_ack(sc,
-		    BWFM_D2H_DEV_D3_ACK, 2000);
-		device_printf(sc->sc_dev,
-		    "d3_probe: D3_INFORM sent, D3_ACK rc=%d\n", rc_ack);
-	} else {
-		device_printf(sc->sc_dev,
-		    "d3_probe: D3_INFORM send rc=%d\n", rc_send);
-	}
-	(void)bwfm_pci_msgbuf_send_mb_data(sc, BWFM_H2D_HOST_D0_INFORM);
-	device_printf(sc->sc_dev, "d3_probe: D0_INFORM sent\n");
-	return (0);
-}
-
 static void
 bwfm_pci_attach_sysctls(struct bwfm_pci_softc *sc)
 {
@@ -3060,98 +2932,16 @@ bwfm_pci_attach_sysctls(struct bwfm_pci_softc *sc)
 	    CTLFLAG_RWTUN, &sc->bus_sc.sc_debug, 0,
 	    "Verbosity level for DPRINTF chatter (0=silent, 1=attach info, "
 	    "2=proto trace, 3=data-path, 4=register poke).");
-	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "chip_alive",
-	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    bwfm_pci_sysctl_chip_alive, "I",
-	    "Write 1 to probe PCIe cfg-space aliveness (VID + BAR0_WINDOW "
-	    "readback).  Returns 0 if cfg responds, ENXIO if link is down. "
-	    "This is safe on any chip state because cfg-space is served by "
-	    "the root complex, not the chip -- it never wedges.  It does "
-	    "NOT prove BAR0 MMIO is safe; for that use chip_probe_mmio "
-	    "(which wedges if backplane is cold).");
-	SYSCTL_ADD_BOOL(ctx, list, OID_AUTO, "fw_running",
-	    CTLFLAG_RD, &sc->sc_fw_running, 0,
-	    "1 once bring-up has started the firmware.  bringup refuses "
-	    "while it is set.");
-	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "bringup",
-	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    bwfm_pci_sysctl_bringup, "I",
-	    "Write 1 to run full bring-up sequence: chip_reset "
-	    "-> core_walk -> ramsize_query -> enter_download_state -> "
-	    "load_firmware -> nvram_inject -> armcr4_release -> "
-	    "wait_fw_ready.  Each step prints STARTING/DONE markers.  "
-	    "Now guarded by chip_alive_cfg pre-flight; refuses if PCIe cfg "
-	    "reports link down.  Note: cfg-alive does NOT prove BAR0 MMIO "
-	    "is safe -- backplane clock may still be off after APPU.");
-	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "msgbuf_attach",
-	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    bwfm_pci_sysctl_msgbuf_attach, "I",
-	    "Write 1 to read fw shared struct, allocate 5 common rings + "
-	    "scratch buffers via bus_dma, and publish DMA addresses to "
-	    "fw.  Requires armcr4_release to have fired first.");
-	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "delete_flowring",
-	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    bwfm_pci_sysctl_delete_flowring, "I",
-	    "Write local flowid (>=0) to send FLOW_RING_DELETE + wait "
-	    "up to 2 s for CMPLT.  Marks the slot CLOSED on success.  "
-	    "Used to verify the delete protocol standalone.");
-	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "wlc_up",
-	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    bwfm_pci_sysctl_wlc_up, "I",
-	    "Write 1 to send WLC_UP DCMD (2), bringing chip WLAN up.");
-	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "wlc_down",
-	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    bwfm_pci_sysctl_wlc_down, "I",
-	    "Write 1 to send WLC_DOWN DCMD (3).");
-	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "net80211_attach",
-	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    bwfm_pci_sysctl_net80211_attach, "I",
-	    "Write 1 to attach the ieee80211com and expose the driver as "
-	    "wlan0 via net80211.  Requires fw running + msgbuf_attach done.");
 	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "net80211_detach",
 	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
 	    bwfm_pci_sysctl_net80211_detach, "I",
 	    "Write 1 to detach the ieee80211com (undo net80211_attach).");
-	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "dump_console",
-	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    bwfm_pci_sysctl_dump_console, "I",
-	    "Write 1 to drain the fw runtime console and print any new "
-	    "lines to dmesg (fw: ...).  Requires msgbuf_attach first.");
-	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "mac_addr",
-	    CTLTYPE_STRING | CTLFLAG_RD, sc, 0,
-	    bwfm_pci_sysctl_mac_addr, "A",
-	    "Read chip's cur_etheraddr via GET_VAR (262).");
-	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "d3_probe",
-	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    bwfm_pci_sysctl_d3_probe, "I",
-	    "Fire mbdata H2D_HOST_D3_INFORM + wait 2s for D2H_DEV_D3_ACK "
-	    "+ H2D_HOST_D0_INFORM, without touching WLC/net80211/PCIe bus.  "
-	    "Diagnostic for the fw side of item #4 (D3 suspend/resume).");
-	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "cold_reattach",
-	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    bwfm_pci_sysctl_cold_reattach, "I",
-	    "Write 1 to force the ACPI-S3 cold-resume path: msgbuf_detach, "
-	    "APPU warm, dstate cycle, full bringup (fw reupload), msgbuf "
-	    "reattach, WLC_UP, preinit.  Chip drops current association "
-	    "and rebuilds; wpa_supplicant re-associates once fw is back.  "
-	    "For iterating on item #4b without needing physical S3 cycles.");
 	SYSCTL_ADD_UINT(ctx, list, OID_AUTO, "crash_recover_threshold",
 	    CTLFLAG_RW, &sc->sc_crash_recover_threshold, 0,
 	    "Consecutive DCMD-timeout count that triggers automatic "
 	    "cold_reattach.  Default 0 (off): a timeout does not prove "
 	    "the firmware crashed, and rebuilding a running chip can "
 	    "hang the host.");
-	SYSCTL_ADD_UINT(ctx, list, OID_AUTO, "crash_recover_events",
-	    CTLFLAG_RD, &sc->sc_crash_recover_events, 0,
-	    "Number of times the fw-crash auto-recovery task has been "
-	    "queued since attach (item #13).");
-	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "crash_probe",
-	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
-	    bwfm_pci_sysctl_crash_probe, "I",
-	    "Write 1 to inject a fake crash event and exercise the "
-	    "async crash_recover task queue.  Behaviour equivalent to "
-	    "cold_reattach but goes through taskqueue_thread the same "
-	    "way a real DCMD-timeout burst would (item #13).");
 }
 
 /* ------------------------------------------------------------------
@@ -3611,6 +3401,7 @@ bwfm_pci_bs_wait_eapol_drain(struct bwfm_softc *bsc, int timeout_ms)
 }
 
 static const struct bwfm_bus_ops bwfm_pci_bus_ops = {
+	.bs_no_hostap	= true,
 	.bs_txctl	= bwfm_pci_bs_txctl,
 	.bs_rxctl	= bwfm_pci_bs_rxctl,
 	.bs_txdata	= bwfm_pci_bs_txdata,
@@ -3645,7 +3436,7 @@ bwfm_pci_attach(device_t dev)
 		    sc->sc_chip->notes, sc->sc_chip->rambase,
 		    sc->sc_chip->fw_name,
 		    sc->sc_chip->bringup_supported ? "" :
-		    ", BRINGUP NOT IMPLEMENTED — sysctl bringup=1 will refuse");
+		    ", bring-up not implemented for this chip");
 	}
 
 	/*
@@ -3752,8 +3543,7 @@ bwfm_pci_attach(device_t dev)
 	 *
 	 * Everything chip-side waits until the warm sequence below has
 	 * run; the rest of the bring-up then happens in the autostart
-	 * thread started at the end of attach (or by the bring-up sysctls,
-	 * with hw.bwfm_pci.autostart=0), so kldload always finishes
+	 * thread started at the end of attach, so kldload always finishes
 	 * cleanly.
 	 */
 	bwfm_pci_attach_sysctls(sc);
@@ -3780,10 +3570,9 @@ bwfm_pci_attach(device_t dev)
 	 * writes, so unlike chip_reset's watchdog write it cannot wedge a
 	 * cold chip.
 	 *
-	 * If APPU fails after all retries, attach still succeeds and the
-	 * sysctls stay available for manual recovery; the chip just is not
-	 * usable until something else warms it (a macOS boot, a power
-	 * cycle).
+	 * If APPU fails after all retries, attach still succeeds; the chip
+	 * just is not usable until something else warms it (a macOS boot,
+	 * a power cycle).
 	 */
 	{
 		int do_appu = bwfm_pci_attach_appu_warm_dflt;
@@ -3798,8 +3587,7 @@ bwfm_pci_attach(device_t dev)
 			if (rc != 0) {
 				device_printf(dev,
 				    "attach: APPU warm failed rc=%d - chip "
-				    "likely unusable this session; sysctls "
-				    "still available for manual recovery.\n",
+				    "likely unusable this session.\n",
 				    rc);
 				goto attach_done;
 			}
@@ -3810,8 +3598,8 @@ bwfm_pci_attach(device_t dev)
 		rc = bwfm_pci_apple_dstate_cycle(sc);
 		if (rc != 0) {
 			device_printf(dev,
-			    "attach: dstate_cycle failed rc=%d - continuing "
-			    "with sysctls available for manual recovery.\n",
+			    "attach: dstate_cycle failed rc=%d - "
+			    "continuing.\n",
 			    rc);
 		}
 
@@ -3833,10 +3621,7 @@ bwfm_pci_attach(device_t dev)
 
 		PDPRINTF(sc, 0,
 		    "attach: warm sequence complete (APPU + dstate_cycle + "
-		    "chip_probe).  Fire final bringup manually with "
-		    "dev.bwfm_pci.%d.bringup=1 — runtime sysctl is per-"
-		    "session so a wedge doesn't persist.\n",
-		    device_get_unit(dev));
+		    "chip_probe).\n");
 	}
 
 	/*
@@ -3868,7 +3653,7 @@ attach_done:
 		    "%s start", device_get_nameunit(dev)) != 0) {
 			sc->sc_autostart_running = false;
 			device_printf(dev, "attach: could not start the "
-			    "autostart thread; use the bring-up sysctls\n");
+			    "autostart thread\n");
 		}
 	}
 	return (0);
@@ -3904,8 +3689,8 @@ bwfm_pci_detach(device_t dev)
 	/*
 	 * Teardown ordering (reverse of attach — LIFO):
 	 *
-	 *   1. Set sc_dying + wake in-flight DCMD sleepers so any sysctl
-	 *      handler currently blocked in a DCMD bails through the
+	 *   1. Set sc_dying + wake in-flight DCMD sleepers so any caller
+	 *      currently blocked in a DCMD bails through the
 	 *      sc_dying check before we destroy the mutex it sleeps on.
 	 *   2. If chip is up, send WLC_DOWN so fw stops autonomous DMA
 	 *      (event bursts, scan results) before we tear the ISR down.
@@ -3935,7 +3720,7 @@ bwfm_pci_detach(device_t dev)
 		TAILQ_FOREACH(r, &bsc->sc_ctl_pending, link)
 			wakeup(r);
 		/*
-		 * Wait for any sysctl handler blocked in a dcmd to bail
+		 * Wait for any caller blocked in a dcmd to bail
 		 * through the sc_dying check before we destroy the mutex
 		 * they sleep on.  Each wakeup (or the 1s timeout) rechecks
 		 * sc_dying, so the wait is bounded.
@@ -3957,8 +3742,8 @@ bwfm_pci_detach(device_t dev)
 	 * and the DCMD would just error.  Ignore return: chip may already
 	 * be halted, and by this point the alternative is limping past.
 	 *
-	 * Note: sc_wlc_up mirrors fw pub->up state (set in
-	 * bwfm_pci_sysctl_wlc_up + bwfm.c's various post-WLC_UP paths).
+	 * Note: sc_wlc_up mirrors fw pub->up state (set by the autostart
+	 * thread and bwfm.c's post-WLC_UP paths).
 	 */
 	if (bsc->sc_wlc_up) {
 		(void)bwfm_pci_msgbuf_dcmd_set_int(sc, BWFM_C_DOWN, 0);
@@ -4182,184 +3967,8 @@ bwfm_pci_msgbuf_unbind_intr(struct bwfm_pci_softc *sc)
 	sc->sc_irq_handle = NULL;
 }
 
-/* Sysctl: fire msgbuf_attach on a fw-live chip. */
-static int
-bwfm_pci_sysctl_msgbuf_attach(SYSCTL_HANDLER_ARGS)
-{
-	struct bwfm_pci_softc *sc = arg1;
-	int trig = 0, error;
-
-	error = sysctl_handle_int(oidp, &trig, 0, req);
-	if (error != 0 || req->newptr == NULL || trig == 0)
-		return (error);
-	if (sc->sc_autostart_running)
-		return (EBUSY);
-	return (bwfm_pci_msgbuf_attach(sc));
-}
-
-/*
- * Read the firmware's runtime console at TCM console_addr.  Console
- * layout (from Linux brcmfmac):
- *   +0..+7  reserved
- *   +8..+11 buf_addr (u32) — TCM offset of ring buffer
- *   +12..+15 bufsize (u32)
- *   +16..+19 write_idx (u32) — fw increments as it prints
- *
- * We keep our own read index and print everything from it up to
- * write_idx, so each call prints what the firmware logged since the
- * previous one.
- */
-static int
-bwfm_pci_sysctl_dump_console(SYSCTL_HANDLER_ARGS)
-{
-	struct bwfm_pci_softc *sc = arg1;
-	struct bwfm_pci_msgbuf *mb = bwfm_pci_msgbuf_state(sc);
-	uint32_t base, buf_addr, bufsize, write_idx;
-	uint32_t idx, count;
-	int trig = 0, error;
-	char line[256];
-	uint32_t linelen = 0;
-
-	error = sysctl_handle_int(oidp, &trig, 0, req);
-	if (error != 0 || req->newptr == NULL || trig == 0)
-		return (error);
-	if (mb == NULL || !mb->attached) {
-		device_printf(sc->sc_dev,
-		    "dump_console: msgbuf not attached\n");
-		return (ENOENT);
-	}
-	base = mb->console_addr;
-	if (base == 0) {
-		device_printf(sc->sc_dev,
-		    "dump_console: console_addr not set\n");
-		return (ENOENT);
-	}
-	buf_addr = bus_space_read_4(sc->sc_bar2_t, sc->sc_bar2_h, base + 8);
-	bufsize = bus_space_read_4(sc->sc_bar2_t, sc->sc_bar2_h, base + 12);
-	write_idx = bus_space_read_4(sc->sc_bar2_t, sc->sc_bar2_h, base + 16);
-	device_printf(sc->sc_dev,
-	    "dump_console: base=0x%x buf=0x%x size=%u w_idx=%u r_idx=%u\n",
-	    base, buf_addr, bufsize, write_idx, sc->sc_console_read_idx);
-
-	if (bufsize == 0 || bufsize > 0x100000)
-		return (EINVAL);
-	idx = sc->sc_console_read_idx;
-	if (idx >= bufsize)
-		idx = 0;
-
-	count = (write_idx >= idx) ?
-	    (write_idx - idx) : (bufsize - idx + write_idx);
-	if (count == 0) {
-		device_printf(sc->sc_dev, "dump_console: no new data\n");
-		return (0);
-	}
-	if (count > 8192)
-		count = 8192;
-
-	while (count-- > 0) {
-		uint8_t ch = bus_space_read_1(sc->sc_bar2_t, sc->sc_bar2_h,
-		    buf_addr + idx);
-		idx++;
-		if (idx >= bufsize)
-			idx = 0;
-		if (ch == '\r')
-			continue;
-		if (ch == '\n' || linelen >= sizeof(line) - 1) {
-			line[linelen] = '\0';
-			if (linelen > 0)
-				device_printf(sc->sc_dev, "fw: %s\n", line);
-			linelen = 0;
-			continue;
-		}
-		if (ch >= 32 && ch < 127)
-			line[linelen++] = ch;
-	}
-	if (linelen > 0) {
-		line[linelen] = '\0';
-		device_printf(sc->sc_dev, "fw: %s\n", line);
-	}
-	sc->sc_console_read_idx = idx;
-	return (0);
-}
-
 /* WLC_GET_VAR */
 #define	BWFM_DCMD_GET_VAR	262
-/* Sysctl: write 1 to send WLC_UP. */
-static int
-bwfm_pci_sysctl_wlc_up(SYSCTL_HANDLER_ARGS)
-{
-	struct bwfm_pci_softc *sc = arg1;
-	int trig = 0, error;
-
-	error = sysctl_handle_int(oidp, &trig, 0, req);
-	if (error != 0 || req->newptr == NULL || trig == 0)
-		return (error);
-	if (sc->sc_autostart_running)
-		return (EBUSY);
-	error = bwfm_pci_msgbuf_dcmd_set_int(sc, BWFM_C_UP, 0);
-	device_printf(sc->sc_dev, "wlc_up: %s (err=%d)\n",
-	    error == 0 ? "ok" : "fail", error);
-	if (error == 0)
-		sc->bus_sc.sc_wlc_up = true;
-	return (0);
-}
-
-/*
- * Sysctl: write a local flowid to run a synchronous FLOW_RING_DELETE
- * and wait for its completion, to exercise the delete protocol on its
- * own rather than during a live association.
- */
-static int
-bwfm_pci_sysctl_delete_flowring(SYSCTL_HANDLER_ARGS)
-{
-	struct bwfm_pci_softc *sc = arg1;
-	int flowid = -1, error;
-
-	error = sysctl_handle_int(oidp, &flowid, 0, req);
-	if (error != 0 || req->newptr == NULL || flowid < 0)
-		return (error);
-	error = bwfm_pci_msgbuf_flowring_delete(sc, (uint16_t)flowid);
-	device_printf(sc->sc_dev,
-	    "delete_flowring: local_id=%d rc=%d\n", flowid, error);
-	return (0);
-}
-
-/* Sysctl: write 1 to send WLC_DOWN. */
-static int
-bwfm_pci_sysctl_wlc_down(SYSCTL_HANDLER_ARGS)
-{
-	struct bwfm_pci_softc *sc = arg1;
-	int trig = 0, error;
-
-	error = sysctl_handle_int(oidp, &trig, 0, req);
-	if (error != 0 || req->newptr == NULL || trig == 0)
-		return (error);
-	error = bwfm_pci_msgbuf_dcmd_set_int(sc, BWFM_C_DOWN, 0);
-	device_printf(sc->sc_dev, "wlc_down: %s (err=%d)\n",
-	    error == 0 ? "ok" : "fail", error);
-	return (0);
-}
-
-/* Sysctl: read the cur_etheraddr iovar and format it as a MAC string. */
-static int
-bwfm_pci_sysctl_mac_addr(SYSCTL_HANDLER_ARGS)
-{
-	struct bwfm_pci_softc *sc = arg1;
-	uint8_t mac[6] = { 0 };
-	char buf[32];
-	size_t rlen = sizeof(mac);
-	int error;
-
-	error = bwfm_pci_msgbuf_dcmd_get_var(sc, "cur_etheraddr",
-	    mac, &rlen);
-	if (error != 0 || rlen != sizeof(mac))
-		snprintf(buf, sizeof(buf), "(err=%d rlen=%zu)", error, rlen);
-	else
-		snprintf(buf, sizeof(buf),
-		    "%02x:%02x:%02x:%02x:%02x:%02x",
-		    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-	return (sysctl_handle_string(oidp, buf, sizeof(buf), req));
-}
 
 /* Firmware setup run before net80211 attach and after a cold reattach. */
 static void
@@ -4496,26 +4105,11 @@ bwfm_pci_net80211_attach(struct bwfm_pci_softc *sc)
 	 * would break the firmware-supplicant mode: the chip would not
 	 * transmit data, since the wsec_key path is not running.
 	 */
-	bwfm_sysctl_attach(bsc);
 	device_printf(sc->sc_dev,
 	    "net80211_attach: OK — create wlan0 with "
 	    "`ifconfig wlan0 create wlandev %s`\n",
 	    device_get_nameunit(sc->sc_dev));
 	return (0);
-}
-
-static int
-bwfm_pci_sysctl_net80211_attach(SYSCTL_HANDLER_ARGS)
-{
-	struct bwfm_pci_softc *sc = arg1;
-	int trig = 0, error;
-
-	error = sysctl_handle_int(oidp, &trig, 0, req);
-	if (error != 0 || req->newptr == NULL || trig == 0)
-		return (error);
-	if (sc->sc_autostart_running)
-		return (EBUSY);
-	return (bwfm_pci_net80211_attach(sc));
 }
 
 /*
@@ -4558,8 +4152,8 @@ out:
 		device_printf(sc->sc_dev, "autostart: stopped at %s for "
 		    "detach\n", step);
 	else if (error != 0)
-		device_printf(sc->sc_dev, "autostart: %s failed (%d); the "
-		    "bring-up sysctls are still there\n", step, error);
+		device_printf(sc->sc_dev, "autostart: %s failed (%d)\n",
+		    step, error);
 	else
 		device_printf(sc->sc_dev, "autostart: up; %s is in "
 		    "net.wlan.devices\n", device_get_nameunit(sc->sc_dev));

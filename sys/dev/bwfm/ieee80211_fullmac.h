@@ -52,20 +52,6 @@ struct ieee80211_key;
 struct ieee80211_scanparams;
 
 /*
- * Per-frame receive info attached by the driver when handing a
- * mgmt-frame mbuf up via ieee80211_fmac_input_beacon().  The
- * framework converts these absolute-dBm values into net80211's
- * half-dB-above-noise units and hands the parsed frame, with that
- * rssi and noise floor, straight to the scan module's scan_add.
- */
-struct ieee80211_fmac_rxinfo {
-	uint16_t	fri_chan_freq;	/* MHz */
-	uint8_t		fri_chan_ieee;	/* IEEE channel number */
-	int8_t		fri_rssi_dbm;	/* signed dBm */
-	int8_t		fri_noise_dbm;	/* signed dBm; see below */
-};
-
-/*
  * net80211 takes signal as dB above the noise floor (rssi - nf, in half
  * dB) and refuses to join a BSS too close to it.  Firmware noise figures
  * are not always plausible: the BCM43602 at times reports phy_noise =
@@ -87,16 +73,14 @@ ieee80211_fmac_noise_floor(int dbm)
 }
 
 /*
- * Per-scan-result payload the driver assembles from a firmware
- * "scan result" event and hands up via ieee80211_fmac_scan_result().
- * The framework synthesises a probe-response-equivalent buffer from
- * these fields plus the supplied IE blob and feeds it into the
- * usual net80211 scan cache.
+ * One BSS the firmware found, filled in by the driver and handed up
+ * with ieee80211_fmac_scan_result().  The SSID, rates and the other
+ * elements come from fb_ies, the information elements exactly as the
+ * firmware reported them; the framework parses them and adds the
+ * entry to net80211's scan cache.  Signal and noise are plain dBm.
  */
 struct ieee80211_fmac_bss {
 	uint8_t		fb_bssid[IEEE80211_ADDR_LEN];	/* AP MAC address */
-	uint8_t		fb_ssid[IEEE80211_NWID_LEN];	/* network name */
-	uint8_t		fb_ssidlen;	/* network name length */
 	uint16_t	fb_capinfo;	/* host byte order */
 	uint16_t	fb_bintval;	/* beacon interval */
 	int		fb_rssi;	/* dBm; negative */
@@ -125,6 +109,37 @@ struct ieee80211_fmac_assoc {
 };
 
 /*
+ * Access point the framework asks the driver to run, when a hostap
+ * vap reaches RUN.  The firmware builds its own beacons and answers
+ * probes, so this is the whole BSS as net80211 and hostapd(8)
+ * configured it.  Security comes from the RSN (or WPA) element
+ * hostapd hands net80211; with fp_wpa zero the BSS is open, and
+ * fp_privacy alone means static WEP.  Ciphers are IEEE80211_CIPHER_*
+ * bit sets (1 << cipher); fp_akms holds RSN_ASE_* bits (1 << akm).
+ */
+struct ieee80211_fmac_ap {
+	uint8_t		fp_bssid[IEEE80211_ADDR_LEN];	/* our address */
+	uint8_t		fp_ssid[IEEE80211_NWID_LEN];	/* network name */
+	uint8_t		fp_ssidlen;
+	bool		fp_hidden;	/* no SSID in beacons */
+	uint16_t	fp_chan_freq;	/* MHz */
+	uint8_t		fp_chan_ieee;	/* channel number */
+	uint16_t	fp_bintval;	/* beacon interval, TU */
+	uint8_t		fp_dtim;	/* DTIM period, beacons */
+	bool		fp_privacy;	/* privacy bit (WEP or WPA) */
+	uint8_t		fp_wpa;		/* 1 = WPA, 2 = RSN, 3 = both */
+	uint32_t	fp_ucast;	/* pairwise ciphers */
+	uint32_t	fp_mcast;	/* group cipher */
+	uint32_t	fp_akms;	/* key management suites */
+	uint16_t	fp_rsncaps;	/* RSN capabilities (MFPC 0x80, MFPR 0x40) */
+	uint8_t		fp_ielen;
+	uint8_t		fp_ies[255];	/* hostapd's WPA/RSN elements, raw */
+};
+
+#define	IEEE80211_FMAC_RSNCAP_MFPR	0x0040	/* MFP required */
+#define	IEEE80211_FMAC_RSNCAP_MFPC	0x0080	/* MFP capable */
+
+/*
  * Ops vtable.  Required entries are marked; optional ones may be
  * NULL when the chip doesn't expose that path.  All ops are called
  * from process or taskqueue context (never IRQ) — the framework
@@ -135,7 +150,12 @@ struct ieee80211_fmac_assoc {
 struct ieee80211_fullmac_ops {
 	const char	*fmop_name;	/* driver tag for diag (required) */
 
-	/* Scan.  Required. */
+	/*
+	 * Scan.  fmop_scan_start is required: start the firmware's scan
+	 * and report each result, then call ieee80211_fmac_scan_done.
+	 * fmop_scan_cancel is optional: the framework calls it only when
+	 * net80211 ends a scan the firmware is still running.
+	 */
 	int		(*fmop_scan_start)(struct ieee80211com *,
 			    const uint8_t *ssid, size_t ssidlen,
 			    bool active);
@@ -158,26 +178,64 @@ struct ieee80211_fullmac_ops {
 	int		(*fmop_del_key)(struct ieee80211com *,
 			    const struct ieee80211_key *);
 
-	/* Regulatory.  Required. */
+	/*
+	 * Optional: regulatory.  Called with the two-letter country
+	 * (NUL-terminated) after the user changes it, from a taskqueue
+	 * thread.  Without it the firmware keeps its own default.
+	 */
 	int		(*fmop_set_country)(struct ieee80211com *,
 			    const char cc[3]);
 
-	/* Optional: PMK install (chips with on-chip supplicant). */
+	/*
+	 * Optional: PMK for chips whose own supplicant runs the 4-way.
+	 * The framework adds a write-only net.wlan.N.fullmac_pmk sysctl
+	 * and passes a 32-byte PMK, or NULL and 0 to clear it.  Called
+	 * from the sysctl path; may sleep.
+	 */
 	int		(*fmop_set_pmk)(struct ieee80211com *,
 			    const uint8_t *pmk, size_t pmklen);
 
-	/*
-	 * Optional: emit an EAPOL frame back at the host's
-	 * wpa_supplicant.  Not called by the framework yet; EAPOL
-	 * is delivered by ieee80211_fmac_eapol_rx through
-	 * ieee80211_vap_deliver_data.
-	 */
-	int		(*fmop_eapol_tx)(struct ieee80211com *,
-			    const void *buf, size_t len);
 
-	/* Optional: power save knob. */
+	/*
+	 * Optional: power save.  When present the framework advertises
+	 * IEEE80211_C_PMGT, applies `ifconfig powersave` without
+	 * restarting the vap, and re-sends the setting each time the
+	 * link comes up.  Called from the ioctl path or the context
+	 * that called ieee80211_fmac_link_up; may sleep.
+	 */
 	int		(*fmop_set_powersave)(struct ieee80211com *,
 			    bool enabled);
+
+	/*
+	 * Optional: current signal and noise of the associated AP, in
+	 * dBm.  The framework polls it every two seconds while a station
+	 * link is up, from a taskqueue thread, and reports the cached
+	 * values to net80211 (ifconfig, wpa_supplicant), which otherwise
+	 * sees only scan-time signal on a FullMAC device.
+	 */
+	int		(*fmop_get_signal)(struct ieee80211com *,
+			    int *rssi_dbm, int *noise_dbm);
+
+	/*
+	 * Optional: access point.  With fmop_start_ap and fmop_stop_ap
+	 * both present the framework advertises IEEE80211_C_HOSTAP.
+	 * When a hostap vap reaches RUN it calls fmop_start_ap with the
+	 * BSS to run (again, with the new settings, if the vap restarts),
+	 * and fmop_stop_ap when the vap leaves RUN.  The driver reports
+	 * stations with ieee80211_fmac_sta_join and _sta_leave; the
+	 * framework keeps net80211's station table, so hostapd and
+	 * `ifconfig list sta` work unchanged.  fmop_sta_deauth, also
+	 * optional, sends a station away when net80211 or hostapd
+	 * deauthenticates or disassociates it (a broadcast address means
+	 * every station).  All three are called from a taskqueue thread
+	 * and may sleep.
+	 */
+	int		(*fmop_start_ap)(struct ieee80211com *,
+			    const struct ieee80211_fmac_ap *);
+	int		(*fmop_stop_ap)(struct ieee80211com *);
+	int		(*fmop_sta_deauth)(struct ieee80211com *,
+			    const uint8_t mac[IEEE80211_ADDR_LEN],
+			    uint16_t reason);
 };
 
 /*
@@ -192,20 +250,31 @@ struct ieee80211_fullmac_ops {
 int	ieee80211_fmac_attach(struct ieee80211com *,
 	    const struct ieee80211_fullmac_ops *, uint32_t caps);
 void	ieee80211_fmac_detach(struct ieee80211com *);
-void	ieee80211_fmac_vap_attach(struct ieee80211vap *);
 
 /* Firmware event -> framework. */
 void	ieee80211_fmac_scan_result(struct ieee80211com *,
 	    const struct ieee80211_fmac_bss *);
+/* scan_done ends net80211's scan: call it once the firmware is done. */
 void	ieee80211_fmac_scan_done(struct ieee80211com *);
-void	ieee80211_fmac_input_beacon(struct ieee80211com *, struct mbuf *,
-	    const struct ieee80211_fmac_rxinfo *);
+/* link_up may call driver ops: call it from a context that can sleep. */
 int	ieee80211_fmac_link_up(struct ieee80211com *,
 	    const uint8_t bssid[IEEE80211_ADDR_LEN]);
 int	ieee80211_fmac_link_down(struct ieee80211com *, uint16_t reason);
 void	ieee80211_fmac_eapol_rx(struct ieee80211com *,
 	    const uint8_t ap_mac[IEEE80211_ADDR_LEN],
 	    const void *buf, size_t len);
+
+/*
+ * Access point: a station associated (ies = the elements of its
+ * (re)association request, as the firmware passed them up) or left.
+ * Both copy what they need and return at once, so they are safe from
+ * any context the driver's event path runs in.
+ */
+void	ieee80211_fmac_sta_join(struct ieee80211com *,
+	    const uint8_t mac[IEEE80211_ADDR_LEN],
+	    const uint8_t *ies, size_t ielen, bool reassoc);
+void	ieee80211_fmac_sta_leave(struct ieee80211com *,
+	    const uint8_t mac[IEEE80211_ADDR_LEN], uint16_t reason);
 
 #endif /* _KERNEL */
 #endif /* _NET80211_IEEE80211_FULLMAC_H_ */

@@ -23,6 +23,7 @@
 #include <net80211/ieee80211_var.h>
 
 #include "bwfmreg.h"
+#include "ieee80211_fullmac.h"
 
 struct bwfm_softc;
 
@@ -100,6 +101,24 @@ struct bwfm_bus_ops {
 	 */
 	void	(*bs_flowring_purge)(struct bwfm_softc *);
 	int	(*bs_wait_eapol_drain)(struct bwfm_softc *, int timeout_ms);
+
+	/*
+	 * The transport cannot run with firmware power save on.  SDIO
+	 * chips that sleep need the host to wake the bus before every
+	 * transfer, which bwfm_sdio does not do yet; with PM on, the
+	 * BCM43455 passes no traffic.  bwfm then leaves power save out
+	 * of the ops it gives the FullMAC framework.
+	 */
+	bool	bs_no_powersave;
+
+	/*
+	 * The transport cannot carry an access point's traffic.  The PCIe
+	 * transport opens one transmit ring per destination and only for
+	 * the station's single peer; an AP needs a ring per station plus
+	 * one for broadcast, which it does not build yet.  bwfm then
+	 * leaves the AP ops out, and net80211 refuses hostap vaps.
+	 */
+	bool	bs_no_hostap;
 };
 
 /*
@@ -167,25 +186,13 @@ struct bwfm_softc {
 	bool				 sc_dying;	/* detach in progress */
 	bool				 sc_tasks_inited;	/* TASK_INITs done */
 	uint16_t			 sc_bcdc_reqid;	/* next control request id */
-	uint32_t			 sc_evt_count;	/* count of firmware events seen */
-	/*
-	 * Verification counters (dev.bwfm.N.event_stats): events by type,
-	 * and for each task how often it was requested and how many
-	 * requests its runs covered (the taskqueue "pending" sum).  The
-	 * two must match, or a request was lost.
-	 */
-	uint32_t			 sc_evt_by_type[128];
-	uint32_t			 sc_escan_done_evts;
-	uint32_t			 sc_scan_done_reqs, sc_scan_done_cover;
-	uint32_t			 sc_link_reqs, sc_link_cover;
-	uint32_t			 sc_assoc_reqs, sc_assoc_cover;
 	uint8_t				 sc_macaddr[IEEE80211_ADDR_LEN];	/* our MAC address */
 
 	struct mtx			 sc_mtx;	/* main softc lock */
 	struct mtx			 sc_ctl_mtx;	/* control-request lock */
 	struct bwfm_ctl_pending		 sc_ctl_pending;	/* waiting control requests */
 	/*
-	 * Outstanding dcmd_get / dcmd_set callers (sysctl handlers etc.
+	 * Outstanding dcmd_get / dcmd_set callers (net80211 tasks etc.
 	 * can sleep here for seconds).  Detach must wait for this to drain
 	 * before destroying sc_ctl_mtx; the dying flag plus per-request
 	 * wakeup() lets the sleepers bail promptly.
@@ -209,6 +216,7 @@ struct bwfm_softc {
 	struct task			 sc_scan_done_task;	/* deferred scan-done work */
 	struct task			 sc_link_task;	/* deferred link-change work */
 	bool				 sc_link_up;	/* link is currently up */
+	bool				 sc_ap_up;	/* firmware runs our BSS */
 
 	/*
 	 * Scan-in-flight guard.  Linux brcmfmac
@@ -248,20 +256,22 @@ struct bwfm_softc {
 	 * 1 = in-fw supplicant) so join_wpa2 knows whether to install
 	 * PMK via wsec_pmk (in-fw) or seed keys via host EAPOL.
 	 */
+	/* FullMAC ops handed to the framework: bwfm_fmops minus what the
+	 * transport cannot do. */
+	struct ieee80211_fullmac_ops	 sc_fmops;
+	/*
+	 * Radio capabilities read from the firmware at attach
+	 * (bwfm_query_radio): which bands it has, and its 20 MHz 5 GHz
+	 * channels.  bwfm_getradiocaps falls back to a fixed table when
+	 * sc_radio_known is false.
+	 */
+	bool				 sc_radio_known;
+	bool				 sc_radio_2g;
+	bool				 sc_radio_5g;
+	int				 sc_radio_n5g;
+	uint8_t				 sc_radio_5g_chans[64];
 	bool				 sc_sup_wpa_ok;
 	uint32_t			 sc_sup_wpa_current;
-
-	/*
-	 * Safety gate on the raw iovar_set / cdev CMD52/CMD53 paths.
-	 * Default 0 (off); set `dev.bwfm.<n>.unsafe=1` before poking the
-	 * chip through those sysctls / ioctls.  This chip family has a
-	 * large CVE backlog (Broadpwn, Kr00k, FragAttacks) reachable
-	 * through arbitrary iovar_set payloads, so the driver shouldn't
-	 * hand root (much less every jail with PRIV_DRIVER) a live pipe
-	 * to them without an explicit opt-in.  Compile with
-	 * `options BWFM_UNSAFE_IOVARS_DEFAULT_ON` to default it on.
-	 */
-	int				 sc_unsafe_iovars;
 
 	/*
 	 * Join / leave dispatch deferral.  fmop_assoc + fmop_disassoc
@@ -289,34 +299,9 @@ struct bwfm_softc {
 	char				 sc_join_ssid[BWFM_MAX_SSID_LEN + 1];
 	uint8_t				 sc_join_ssid_len;
 
-	/* WPA secret material staged from userspace. */
-	char				 sc_wpa_pmk[64];
-	bool				 sc_wpa_set;
+	/* PMK from net.wlan.N.fullmac_pmk, for the chip's own supplicant. */
 	uint8_t				 sc_wpa_pmk_raw[32];
 	bool				 sc_wpa_pmk_raw_set;
-
-	/*
-	 * Per-instance scratch for the iovar_get / iovar_set sysctls.
-	 * Held here (not as file-scope statics) so multiple adapters
-	 * do not stomp each other's last-fetched value.  Guarded by
-	 * sc_ctl_mtx.
-	 */
-#define	BWFM_IOVAR_DUMP_MAX	256
-	char				 sc_iovar_name[64];
-	uint8_t				 sc_iovar_value[BWFM_IOVAR_DUMP_MAX];
-	size_t				 sc_iovar_value_len;
-
-	/*
-	 * sup_dump scratch: paired with the patched firmware (see
-	 * tools/patch_sup_dump.py).  Writes parse "OFFSET LENGTH",
-	 * issue a GET on the injected "sup_dump" iovar with those 8
-	 * bytes as params, and stash the reply here.  Reads return
-	 * the most recent dump as hex.  Guarded by sc_ctl_mtx.
-	 */
-#define	BWFM_SUP_DUMP_MAX	256
-	uint8_t				 sc_sup_dump[BWFM_SUP_DUMP_MAX];
-	size_t				 sc_sup_dump_len;
-	uint32_t			 sc_sup_dump_off;
 };
 
 /*
@@ -347,7 +332,6 @@ void	bwfm_detach(struct bwfm_softc *);
  * See bwfm.c for the full contract.
  */
 void	bwfm_transport_teardown(struct bwfm_softc *);
-void	bwfm_sysctl_attach(struct bwfm_softc *);
 void	bwfm_runtime_iovars(struct bwfm_softc *);
 int	bwfm_dcmd_get(struct bwfm_softc *, uint32_t cmd, void *buf,
 	    size_t *lenp);

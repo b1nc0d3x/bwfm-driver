@@ -156,10 +156,8 @@ struct bwfm_sdpcm_state {
 	uint8_t		max_seq;
 	bool		credit_seen;
 	bool		fc_off;
-	/* Statistics, exported as dev.bwfm.N.sdio_stats. */
-	uint32_t	max_seq_updates;	/* credit values taken from rx */
-	uint32_t	data_tx;		/* data frames sent */
-	uint32_t	window_violations;	/* data frames sent past max_seq */
+	uint32_t	rx_frames;		/* frames read from the F2 FIFO; the
+					 * watchdog compares it across passes */
 
 	/*
 	 * BCDC request-id counter, bumped per request so firmware
@@ -223,6 +221,7 @@ struct bwfm_sdpcm_state {
 #define	BWFM_I_HMB_FC_CHANGE		(1u << 5)
 #define	BWFM_I_HMB_FRAME_IND		(1u << 6)
 #define	BWFM_I_HMB_HOST_INT		(1u << 7)
+#define	BWFM_I_CHIPACTIVE		(1u << 29)	/* chip left doze */
 #define	BWFM_SMB_NAK			(1u << 0)
 #define	BWFM_SMB_INT_ACK		(1u << 1)
 

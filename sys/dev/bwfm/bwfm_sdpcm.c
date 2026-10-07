@@ -63,6 +63,7 @@
 #include "bwfm_sdpcm.h"
 
 /* Forward to the existing softc layout. */
+
 struct bwfm_sdio_softc;
 
 /* Framing helpers. */
@@ -375,13 +376,6 @@ bwfm_sdpcm_tx_dataframe(struct bwfm_sdpcm_state *st, device_t f2_dev,
 	}
 
 	mtx_lock(&st->sp_lock);
-	{
-		uint8_t room = (uint8_t)(st->max_seq - st->tx_seq);
-
-		if (st->credit_seen && (room == 0 || (room & 0x80) != 0))
-			st->window_violations++;
-	}
-	st->data_tx++;
 	tx_seq = st->tx_seq++;
 	mtx_unlock(&st->sp_lock);
 
@@ -536,6 +530,7 @@ bwfm_sdpcm_rx_frames(struct bwfm_sdpcm_state *st, device_t f2_dev)
 	uint8_t chanflag, dataoff;
 	uint16_t framelen, fcksum;
 	struct mbuf *m;
+	size_t nextlen = 0;
 	int err;
 	int frames = 0;
 
@@ -548,16 +543,34 @@ bwfm_sdpcm_rx_frames(struct bwfm_sdpcm_state *st, device_t f2_dev)
 
 	for (;;) {
 		/*
-		 * Read only the hwhdr to learn the frame length, then the
-		 * body.  Linux brcmf_sdio_readframes reads a 64-byte first
-		 * chunk (BRCMF_FIRSTREAD) instead; peeking only the 4-byte
-		 * hwhdr right-sizes the body read and spots the (0,0)
-		 * end-of-stream marker at once.
+		 * Read-ahead.  Each frame's swhdr carries nextlen, the
+		 * padded length of the frame behind it in 16-byte units, so
+		 * that whole frame comes in one CMD53 instead of a header
+		 * read and a body read, as Linux brcmf_sdio_readframes and
+		 * OpenBSD bwfm_sdio_rx_frames do.  A frame longer than
+		 * promised gets its remainder in a second read.
+		 */
+		if (nextlen != 0) {
+			err = bwfm_sdpcm_f2_xfer(f2_dev, st->f2_addr, bounce,
+			    nextlen, false);
+			if (err != 0) {
+				break;
+			}
+			memcpy(&hwhdr, bounce, sizeof(hwhdr));
+		} else {
+		/*
+		 * No hint: read only the hwhdr to learn the frame length,
+		 * then the body.  Linux brcmf_sdio_readframes reads a
+		 * 64-byte first chunk (BRCMF_FIRSTREAD) instead; peeking
+		 * only the 4-byte hwhdr right-sizes the body read and
+		 * spots the (0,0) end-of-stream marker at once.
 		 */
 		err = bwfm_sdpcm_f2_xfer(f2_dev, st->f2_addr, &hwhdr,
 		    sizeof(hwhdr), false);
-		if (err != 0)
+		if (err != 0) {
 			break;
+		}
+		}
 
 		framelen = le16toh(hwhdr.frmlen);
 		fcksum   = le16toh(hwhdr.cksum);
@@ -583,12 +596,45 @@ bwfm_sdpcm_rx_frames(struct bwfm_sdpcm_state *st, device_t f2_dev)
 		 * frames and breaks the 4-way handshake.  The firmware pads
 		 * frames in the FIFO, so the extra bytes are its own.
 		 */
-		memcpy(bounce, &hwhdr, sizeof(hwhdr));
-		err = bwfm_sdpcm_f2_xfer(f2_dev, st->f2_addr,
-		    bounce + sizeof(hwhdr),
-		    roundup2((size_t)framelen - sizeof(hwhdr), 4), false);
-		if (err != 0)
-			break;
+		if (nextlen != 0) {
+			/* Read-ahead fell short: fetch the rest. */
+			if (roundup2((size_t)framelen, 4) > nextlen) {
+				err = bwfm_sdpcm_f2_xfer(f2_dev, st->f2_addr,
+				    bounce + nextlen,
+				    roundup2((size_t)framelen, 4) - nextlen,
+				    false);
+				if (err != 0) {
+					break;
+				}
+			}
+		} else {
+			memcpy(bounce, &hwhdr, sizeof(hwhdr));
+			err = bwfm_sdpcm_f2_xfer(f2_dev, st->f2_addr,
+			    bounce + sizeof(hwhdr),
+			    roundup2((size_t)framelen - sizeof(hwhdr), 4),
+			    false);
+			if (err != 0) {
+				break;
+			}
+		}
+		/*
+		 * The next frame's length, for the read-ahead above.  The
+		 * BCM43455's control replies carry an all-0xff swhdr, and a
+		 * superframe's nextlen describes its own layout; take
+		 * neither, and nothing that would not fit the bounce buffer.
+		 */
+		{
+			uint8_t nl = bounce[sizeof(hwhdr) + 2];
+			uint8_t cf = bounce[sizeof(hwhdr) + 1] & 0x0f;
+
+			nextlen = (size_t)nl << 4;
+			if (nl == 0xff ||
+			    cf == BWFM_SDPCM_SWHDR_CHANNEL_GLOM ||
+			    nextlen < sizeof(hwhdr) +
+			    sizeof(struct bwfm_sdpcm_swhdr) ||
+			    nextlen > BWFM_SDPCM_RX_BOUNCE_MAX)
+				nextlen = 0;
+		}
 
 		err = bwfm_sdpcm_parse_headers(bounce, framelen,
 		    &chanflag, &dataoff, &framelen);
@@ -600,6 +646,7 @@ bwfm_sdpcm_rx_frames(struct bwfm_sdpcm_state *st, device_t f2_dev)
 			break;
 
 		frames++;
+		st->rx_frames++;
 
 		/*
 		 * Credit: take the firmware's max sequence number from every
@@ -621,7 +668,6 @@ bwfm_sdpcm_rx_frames(struct bwfm_sdpcm_state *st, device_t f2_dev)
 					mx = st->tx_seq + 2;
 				st->max_seq = mx;
 				st->credit_seen = true;
-				st->max_seq_updates++;
 				mtx_unlock(&st->sp_lock);
 			}
 		}
