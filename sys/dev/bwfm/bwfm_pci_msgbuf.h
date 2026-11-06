@@ -1,0 +1,933 @@
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause AND ISC
+ *
+ * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
+ * Copyright (c) 2010-2016 Broadcom Corporation
+ * Copyright (c) 2017 Patrick Wildt <patrick@blueri.se>
+ *
+ * Broadcom PCIe MSGBUF protocol — native FreeBSD port from
+ * Linux upstream brcmfmac.  No linuxkpi.
+ *
+ * Reference: drivers/net/wireless/broadcom/brcm80211/brcmfmac/
+ *   {msgbuf.h, msgbuf.c, commonring.c, commonring.h, pcie.c}
+ * in linux-6.6.  Layout constants and structure fields are
+ * fw-visible and must match byte-for-byte.
+ *
+ * Portions derived from Linux brcmfmac (msgbuf.c, commonring.h) and
+ * OpenBSD sys/dev/pci/if_bwfm_pci.h are ISC licensed.
+ */
+
+#ifndef _DEV_BWFM_BWFM_PCI_MSGBUF_H_
+#define _DEV_BWFM_BWFM_PCI_MSGBUF_H_
+
+#include <sys/types.h>
+#include <sys/_callout.h>
+#include <sys/mutex.h>
+#include <sys/queue.h>
+#include <sys/sx.h>
+#include <sys/bus.h>
+#include <sys/condvar.h>
+#include <sys/_task.h>
+
+#include <machine/bus.h>
+
+struct mbuf;
+
+/*
+ * Deferred WL_EVENT payload.  drain_d2h_ring queues it from interrupt
+ * context with ring->lock held, and msgbuf_event_task delivers it from
+ * taskqueue_thread with no interrupt-side lock held.
+ *
+ * Event delivery (bwfm_handle_event -> ieee80211_add_scan_result) takes
+ * IEEE80211_LOCK, while net80211's ic_scan_start holds IEEE80211_LOCK
+ * across the wait for the scan DCMD's IOCTL_CMPLT.  Delivering events
+ * inline from the interrupt path would therefore deadlock.
+ */
+struct bwfm_pci_event {
+	STAILQ_ENTRY(bwfm_pci_event) link;
+	uint16_t datalen;
+	uint8_t  data[8192];	/* BWFM_MSGBUF_MAX_CTL_PKT_SIZE */
+};
+
+/* -----------------------------------------------------------------
+ * Common ring constants (matches Linux msgbuf.h:10-24).
+ * ----------------------------------------------------------------- */
+#define	BWFM_H2D_CONTROL_SUBMIT_MAX_ITEM	64
+/* Firmware events queued for the event task, at about 8 KB each. */
+#define	BWFM_PCI_EVENT_Q_MAX			128
+#define	BWFM_H2D_RXPOST_SUBMIT_MAX_ITEM		1024
+#define	BWFM_D2H_CONTROL_COMPLETE_MAX_ITEM	64
+#define	BWFM_D2H_TX_COMPLETE_MAX_ITEM		1024
+#define	BWFM_D2H_RX_COMPLETE_MAX_ITEM		1024
+#define	BWFM_H2D_TXFLOWRING_MAX_ITEM		512
+
+#define	BWFM_H2D_CONTROL_SUBMIT_ITEMSIZE	40
+#define	BWFM_H2D_RXPOST_SUBMIT_ITEMSIZE		32
+#define	BWFM_D2H_CONTROL_COMPLETE_ITEMSIZE	24
+#define	BWFM_D2H_TX_COMPLETE_ITEMSIZE_PRE_V7	16
+#define	BWFM_D2H_TX_COMPLETE_ITEMSIZE		24
+#define	BWFM_D2H_RX_COMPLETE_ITEMSIZE_PRE_V7	32
+#define	BWFM_D2H_RX_COMPLETE_ITEMSIZE		40
+#define	BWFM_H2D_TXFLOWRING_ITEMSIZE		48
+
+/* Ring IDs — index into commonrings[] (pcie.c:408-430). */
+#define	BWFM_H2D_MSGRING_CONTROL_SUBMIT		0
+#define	BWFM_H2D_MSGRING_RXPOST_SUBMIT		1
+#define	BWFM_D2H_MSGRING_CONTROL_COMPLETE	2
+#define	BWFM_D2H_MSGRING_TX_COMPLETE		3
+#define	BWFM_D2H_MSGRING_RX_COMPLETE		4
+#define	BWFM_NROF_COMMON_MSGRINGS		5
+
+/* -----------------------------------------------------------------
+ * Shared-info struct offsets (Linux pcie.c:223-233).
+ * Read via BAR2[sharedram_addr + N].
+ * ----------------------------------------------------------------- */
+#define	BWFM_SHARED_FLAGS_OFFSET		0	/* u32 */
+#define	BWFM_SHARED_CONSOLE_ADDR_OFFSET		20	/* u32 */
+#define	BWFM_SHARED_MAX_RXBUFPOST_OFFSET	34	/* u16 */
+#define	BWFM_SHARED_RX_DATAOFFSET_OFFSET	36	/* u32 */
+#define	BWFM_SHARED_HTOD_MB_DATA_ADDR_OFFSET	40	/* u32 */
+#define	BWFM_SHARED_DTOH_MB_DATA_ADDR_OFFSET	44	/* u32 */
+#define	BWFM_SHARED_RING_INFO_ADDR_OFFSET	48	/* u32 */
+#define	BWFM_SHARED_DMA_SCRATCH_LEN_OFFSET	52	/* u32 */
+#define	BWFM_SHARED_DMA_SCRATCH_ADDR_OFFSET	56	/* u64 (lo,hi) */
+#define	BWFM_SHARED_DMA_RINGUPD_LEN_OFFSET	64	/* u32 */
+#define	BWFM_SHARED_DMA_RINGUPD_ADDR_OFFSET	68	/* u64 (lo,hi) */
+
+#define	BWFM_PCIE_SHARED_VERSION_MASK		0x000000FF
+#define	BWFM_PCIE_MIN_SHARED_VERSION		5
+#define	BWFM_PCIE_MAX_SHARED_VERSION		7
+#define	BWFM_PCIE_SHARED_DMA_INDEX		0x00010000
+#define	BWFM_PCIE_SHARED_DMA_2B_IDX		0x00100000
+#define	BWFM_PCIE_SHARED_HOSTRDY_DB1		0x10000000
+
+/*
+ * D3 / D0 mailbox values written to htod_mb_data_addr in TCM and read
+ * from dtoh_mb_data_addr for fw ack.  Fires the SBMBX config-space
+ * doorbell (offset 0x98 in PCI config space) to notify fw.  Reference:
+ * brcmfmac pcie.c BRCMF_H2D_HOST_D3_INFORM / BRCMF_D2H_DEV_D3_ACK.
+ */
+#define	BWFM_H2D_HOST_D3_INFORM			0x00000001
+#define	BWFM_D2H_DEV_D3_ACK			0x00000001
+#define	BWFM_H2D_HOST_D0_INFORM_IN_USE		0x00000008
+#define	BWFM_H2D_HOST_D0_INFORM			0x00000010
+#define	BWFM_PCI_REG_SBMBX			0x98
+
+/* Ring-info struct offsets within the ringinfo TCM block. */
+#define	BWFM_RINGINFO_RINGMEM_OFFSET		0	/* u32 */
+#define	BWFM_RINGINFO_H2D_W_IDX_PTR_OFFSET	4	/* u32 */
+#define	BWFM_RINGINFO_H2D_R_IDX_PTR_OFFSET	8	/* u32 */
+#define	BWFM_RINGINFO_D2H_W_IDX_PTR_OFFSET	12	/* u32 */
+#define	BWFM_RINGINFO_D2H_R_IDX_PTR_OFFSET	16	/* u32 */
+#define	BWFM_RINGINFO_H2D_W_IDX_HOST_OFFSET	20	/* u64 */
+#define	BWFM_RINGINFO_H2D_R_IDX_HOST_OFFSET	28	/* u64 */
+#define	BWFM_RINGINFO_D2H_W_IDX_HOST_OFFSET	36	/* u64 */
+#define	BWFM_RINGINFO_D2H_R_IDX_HOST_OFFSET	44	/* u64 */
+#define	BWFM_RINGINFO_MAX_FLOWRINGS_OFFSET	52	/* u16 */
+#define	BWFM_RINGINFO_MAX_SUBMISSIONRINGS_OFFSET 54	/* u16 */
+#define	BWFM_RINGINFO_MAX_COMPLETIONRINGS_OFFSET 56	/* u16 */
+
+/* Per-ring "ringmem" entry — 16 bytes each (pcie.c:240-244). */
+#define	BWFM_RING_MAX_ITEM_OFFSET		4	/* u16 */
+#define	BWFM_RING_LEN_ITEMS_OFFSET		6	/* u16 */
+#define	BWFM_RING_MEM_BASE_ADDR_OFFSET		8	/* u64 (lo,hi) */
+#define	BWFM_RING_MEM_SZ			16
+#define	BWFM_RING_STATE_SZ			8
+
+/* -----------------------------------------------------------------
+ * PCIe2 core register offsets (Linux pcie.c:134-149,
+ * brcmf_reginfo_default, which covers BCM43602).  All are relative
+ * to the PCIe2 core base found by the EROM walk.
+ * ----------------------------------------------------------------- */
+#define	BWFM_PCIE2REG_INTMASK			0x24
+#define	BWFM_PCIE2REG_MAILBOXINT		0x48
+#define	BWFM_PCIE2REG_MAILBOXMASK		0x4C
+#define	BWFM_PCIE2REG_H2D_MAILBOX_0		0x140
+#define	BWFM_PCIE2REG_H2D_MAILBOX_1		0x144
+
+#define	BWFM_PCIE_MB_INT_FN0_0			0x0100
+#define	BWFM_PCIE_MB_INT_FN0_1			0x0200
+#define	BWFM_PCIE_MB_INT_FN0			(BWFM_PCIE_MB_INT_FN0_0 | \
+						 BWFM_PCIE_MB_INT_FN0_1)
+#define	BWFM_PCIE_MB_INT_D2H0_DB0		0x00010000
+#define	BWFM_PCIE_MB_INT_D2H0_DB1		0x00020000
+#define	BWFM_PCIE_MB_INT_D2H1_DB0		0x00040000
+#define	BWFM_PCIE_MB_INT_D2H1_DB1		0x00080000
+#define	BWFM_PCIE_MB_INT_D2H2_DB0		0x00100000
+#define	BWFM_PCIE_MB_INT_D2H2_DB1		0x00200000
+#define	BWFM_PCIE_MB_INT_D2H3_DB0		0x00400000
+#define	BWFM_PCIE_MB_INT_D2H3_DB1		0x00800000
+#define	BWFM_PCIE_MB_INT_D2H_DB			(BWFM_PCIE_MB_INT_D2H0_DB0 | \
+						 BWFM_PCIE_MB_INT_D2H0_DB1 | \
+						 BWFM_PCIE_MB_INT_D2H1_DB0 | \
+						 BWFM_PCIE_MB_INT_D2H1_DB1 | \
+						 BWFM_PCIE_MB_INT_D2H2_DB0 | \
+						 BWFM_PCIE_MB_INT_D2H2_DB1 | \
+						 BWFM_PCIE_MB_INT_D2H3_DB0 | \
+						 BWFM_PCIE_MB_INT_D2H3_DB1)
+
+/* -----------------------------------------------------------------
+ * MSGBUF packet layouts.  The wire format is little-endian (__le32 in
+ * Linux).  Fields here are plain integers; byte-order conversion is
+ * done at the use sites where it matters.
+ * ----------------------------------------------------------------- */
+
+#define	BWFM_MSGBUF_TYPE_GEN_STATUS		0x1
+#define	BWFM_MSGBUF_TYPE_RING_STATUS		0x2
+#define	BWFM_MSGBUF_TYPE_FLOW_RING_CREATE	0x3
+#define	BWFM_MSGBUF_TYPE_FLOW_RING_CREATE_CMPLT	0x4
+#define	BWFM_MSGBUF_TYPE_FLOW_RING_DELETE	0x5
+#define	BWFM_MSGBUF_TYPE_FLOW_RING_DELETE_CMPLT	0x6
+#define	BWFM_MSGBUF_TYPE_IOCTLPTR_REQ		0x9
+#define	BWFM_MSGBUF_TYPE_IOCTLPTR_REQ_ACK	0xA
+#define	BWFM_MSGBUF_TYPE_IOCTLRESP_BUF_POST	0xB
+#define	BWFM_MSGBUF_TYPE_IOCTL_CMPLT		0xC
+#define	BWFM_MSGBUF_TYPE_EVENT_BUF_POST		0xD
+#define	BWFM_MSGBUF_TYPE_WL_EVENT		0xE
+#define	BWFM_MSGBUF_TYPE_TX_POST		0xF
+#define	BWFM_MSGBUF_TYPE_TX_STATUS		0x10
+#define	BWFM_MSGBUF_TYPE_RXBUF_POST		0x11
+#define	BWFM_MSGBUF_TYPE_RX_CMPLT		0x12
+
+#define	BWFM_IOCTL_REQ_PKTID			0xFFFE
+#define	BWFM_MSGBUF_MAX_CTL_PKT_SIZE		8192
+#define	BWFM_MSGBUF_TX_IOCTL_MAX_MSG_SIZE	1518	/* ETH_FRAME_LEN + FCS */
+
+struct msgbuf_buf_addr {
+	uint32_t	low_addr;
+	uint32_t	high_addr;
+} __packed;
+
+struct msgbuf_common_hdr {
+	uint8_t		msgtype;
+	uint8_t		ifidx;
+	uint8_t		flags;
+	uint8_t		rsvd0;
+	uint32_t	request_id;
+} __packed;
+
+struct msgbuf_ioctl_req_hdr {
+	struct msgbuf_common_hdr	msg;
+	uint32_t			cmd;
+	uint16_t			trans_id;
+	uint16_t			input_buf_len;
+	uint16_t			output_buf_len;
+	uint16_t			rsvd0[3];
+	struct msgbuf_buf_addr		req_buf_addr;
+	uint32_t			rsvd1[2];
+} __packed;
+
+struct msgbuf_completion_hdr {
+	uint16_t	status;
+	uint16_t	flow_ring_id;
+} __packed;
+
+struct msgbuf_ioctl_resp_hdr {
+	struct msgbuf_common_hdr	msg;
+	struct msgbuf_completion_hdr	compl_hdr;
+	uint16_t			resp_len;
+	uint16_t			trans_id;
+	uint32_t			cmd;
+	uint32_t			rsvd0;
+} __packed;
+
+struct msgbuf_rx_ioctl_resp_or_event {
+	struct msgbuf_common_hdr	msg;
+	uint16_t			host_buf_len;
+	uint16_t			rsvd0[3];
+	struct msgbuf_buf_addr		host_buf_addr;
+	uint32_t			rsvd1[4];
+} __packed;
+
+/* TX descriptor into a flowring (48 bytes; Linux msgbuf.c:95). */
+struct msgbuf_tx_msghdr {
+	struct msgbuf_common_hdr	msg;
+	uint8_t				txhdr[14];	/* ETH_HLEN */
+	uint8_t				flags;
+	uint8_t				seg_cnt;
+	struct msgbuf_buf_addr		metadata_buf_addr;
+	struct msgbuf_buf_addr		data_buf_addr;
+	uint16_t			metadata_buf_len;
+	uint16_t			data_len;
+	uint32_t			rsvd0;
+} __packed;
+
+/*
+ * Fw's ack of a TX_POST (16 bytes; Linux msgbuf.c:162).  Arrives on the
+ * D2H TX_COMPLETE ring, whose items are 16 bytes pre-v7 and 24 in v7.
+ */
+struct msgbuf_tx_status {
+	struct msgbuf_common_hdr	msg;
+	struct msgbuf_completion_hdr	compl_hdr;
+	uint16_t			metadata_len;
+	uint16_t			tx_status;
+} __packed;
+
+/* Host → fw: create a flowring for a peer (40 bytes; msgbuf.c:181). */
+struct msgbuf_tx_flowring_create_req {
+	struct msgbuf_common_hdr	msg;
+	uint8_t				da[6];
+	uint8_t				sa[6];
+	uint8_t				tid;
+	uint8_t				if_flags;
+	uint16_t			flow_ring_id;
+	uint8_t				tc;
+	uint8_t				priority;
+	uint16_t			int_vector;
+	uint16_t			max_items;
+	uint16_t			len_item;
+	struct msgbuf_buf_addr		flow_ring_addr;
+} __packed;
+
+/* Fw's ack of a create request (24 bytes, D2H control-complete ring). */
+struct msgbuf_flowring_create_resp {
+	struct msgbuf_common_hdr	msg;
+	struct msgbuf_completion_hdr	compl_hdr;
+	uint32_t			rsvd0[3];
+} __packed;
+
+/*
+ * FLOW_RING_DELETE request — sent on H2D_CTRL_SUBMIT.  Symmetric to
+ * FLOW_RING_CREATE but only carries flow_ring_id + reason.
+ */
+struct msgbuf_tx_flowring_delete_req {
+	struct msgbuf_common_hdr	msg;
+	uint16_t			flow_ring_id;
+	uint16_t			reason;
+	uint32_t			rsvd0[7];
+} __packed;
+
+/* Fw's ack of a delete request (D2H ctrl completion ring). */
+struct msgbuf_flowring_delete_resp {
+	struct msgbuf_common_hdr	msg;
+	struct msgbuf_completion_hdr	compl_hdr;
+	uint32_t			rsvd0[3];
+} __packed;
+
+/* Fw → host async event descriptor (Linux msgbuf.c:145). */
+struct msgbuf_rx_event {
+	struct msgbuf_common_hdr	msg;
+	struct msgbuf_completion_hdr	compl_hdr;
+	uint16_t			event_data_len;
+	uint16_t			seqnum;
+	uint16_t			rsvd0[4];
+} __packed;
+
+/*
+ * Fw → host RX packet descriptor (Linux msgbuf.c:169).  The struct is
+ * 32 bytes; the RX_COMPLETE ring slot is 40 bytes in v7, 32 pre-v7.
+ */
+struct msgbuf_rx_complete {
+	struct msgbuf_common_hdr	msg;
+	struct msgbuf_completion_hdr	compl_hdr;
+	uint16_t			metadata_len;
+	uint16_t			data_len;
+	uint16_t			data_offset;
+	uint16_t			flags;
+	uint32_t			rx_status_0;
+	uint32_t			rx_status_1;
+	uint32_t			rsvd0;
+} __packed;
+
+/* Host → fw RXBUF_POST descriptor (Linux msgbuf.c:107; 32 bytes). */
+struct msgbuf_rx_bufpost {
+	struct msgbuf_common_hdr	msg;
+	uint16_t			metadata_buf_len;
+	uint16_t			data_buf_len;
+	uint32_t			rsvd0;
+	struct msgbuf_buf_addr		metadata_buf_addr;
+	struct msgbuf_buf_addr		data_buf_addr;
+} __packed;
+
+/* RXPOST/EVENT/IOCTLRESP constants (Linux msgbuf.c:56-60). */
+#define	BWFM_MSGBUF_MAX_PKT_SIZE		2048	/* rx data buf */
+#define	BWFM_MSGBUF_RXBUFPOST_THRESHOLD		32
+#define	BWFM_MSGBUF_MAX_EVENTBUF_POST		8
+#define	BWFM_MSGBUF_MAX_IOCTLRESPBUF_POST	8
+#define	BWFM_MSGBUF_MAX_RXPOST			512	/* rx data slots + 1 */
+
+/* Flags in msgbuf_rx_complete indicating packet framing. */
+#define	BWFM_MSGBUF_PKT_FLAGS_FRAME_MASK	0x07
+#define	BWFM_MSGBUF_PKT_FLAGS_FRAME_802_11	0x02
+
+/* -----------------------------------------------------------------
+ * bcmevent packet layout inside a WL_EVENT buffer (Linux fweh.h):
+ *   [ethhdr] [bwfm_ethhdr] [brcmf_event_msg_be] [event data...]
+ * The header fields are big-endian on the wire.
+ * ----------------------------------------------------------------- */
+#define	BWFM_ETH_TYPE_EVENT		0x886c
+#define	BWFM_BCMILCP_SUBTYPE_VENDOR_LONG	32769
+#define	BWFM_BCM_OUI0			0x00
+#define	BWFM_BCM_OUI1			0x10
+#define	BWFM_BCM_OUI2			0x18
+
+/* bwfm_ethhdr (10 B, all BE; Linux fweh.h struct bwfm_ethhdr). */
+struct bwfm_bcm_ethhdr {
+	uint16_t	subtype;
+	uint16_t	length;
+	uint8_t		version;
+	uint8_t		oui[3];
+	uint16_t	usr_subtype;
+} __packed;
+
+/* brcmf_event_msg_be (48 B, all BE). */
+struct bwfm_bcm_event_msg {
+	uint16_t	version;
+	uint16_t	flags;
+	uint32_t	event_type;
+	uint32_t	status;
+	uint32_t	reason;
+	int32_t		auth_type;
+	uint32_t	datalen;
+	uint8_t		addr[6];
+	char		ifname[16];
+	uint8_t		ifidx;
+	uint8_t		bsscfgidx;
+} __packed;
+
+/* Event codes we care about (Linux fweh.h BRCMF_E_*). */
+#define	BWFM_PCI_E_SET_SSID			0
+#define	BWFM_PCI_E_JOIN			1
+#define	BWFM_PCI_E_START			2
+#define	BWFM_PCI_E_AUTH			3
+#define	BWFM_PCI_E_AUTH_IND			4
+#define	BWFM_PCI_E_DEAUTH			5
+#define	BWFM_PCI_E_DEAUTH_IND		6
+#define	BWFM_PCI_E_ASSOC			7
+#define	BWFM_PCI_E_ASSOC_IND		8
+#define	BWFM_PCI_E_REASSOC			9
+#define	BWFM_PCI_E_REASSOC_IND		10
+#define	BWFM_PCI_E_DISASSOC			11
+#define	BWFM_PCI_E_DISASSOC_IND		12
+#define	BWFM_PCI_E_LINK			16
+#define	BWFM_PCI_E_MIC_ERROR		17
+#define	BWFM_PCI_E_ROAM			19
+#define	BWFM_PCI_E_PMKID_CACHE		21
+#define	BWFM_PCI_E_EAPOL_MSG		25
+#define	BWFM_PCI_E_SCAN_COMPLETE		26
+#define	BWFM_PCI_E_JOIN_START		36
+#define	BWFM_PCI_E_ROAM_START		37
+#define	BWFM_PCI_E_ASSOC_START		38
+#define	BWFM_PCI_E_PSK_SUP			46
+#define	BWFM_PCI_E_COUNTRY_CODE_CHANGED	47
+#define	BWFM_PCI_E_ACTION_FRAME		59
+#define	BWFM_PCI_E_ESCAN_RESULT		69
+#define	BWFM_PCI_E_PROBERESP_MSG		71
+#define	BWFM_PCI_E_FIFO_CREDIT_MAP		74
+#define	BWFM_PCI_E_IF			54
+#define	BWFM_PCI_E_RSSI			56
+#define	BWFM_PCI_E_TRACE		52
+#define	BWFM_PCI_E_BEACON_RX		15
+#define	BWFM_PCI_E_TXFAIL		20
+#define	BWFM_PCI_E_RADIO		40
+#define	BWFM_PCI_E_PSM_WATCHDOG	41
+#define	BWFM_PCI_E_LAST			139
+
+/* Status codes (subset). */
+#define	BWFM_PCI_E_STATUS_SUCCESS		0
+#define	BWFM_PCI_E_STATUS_FAIL		1
+#define	BWFM_PCI_E_STATUS_TIMEOUT		2
+#define	BWFM_PCI_E_STATUS_NO_NETWORKS	3
+#define	BWFM_PCI_E_STATUS_ABORT		4
+#define	BWFM_PCI_E_STATUS_NO_ACK		5
+#define	BWFM_PCI_E_STATUS_UNSOLICITED	6
+#define	BWFM_PCI_E_STATUS_ATTEMPT		7
+#define	BWFM_PCI_E_STATUS_PARTIAL		8
+#define	BWFM_PCI_E_STATUS_NEWSCAN		9
+#define	BWFM_PCI_E_STATUS_NEWASSOC		10
+#define	BWFM_PCI_E_STATUS_ERROR		16
+
+/* Flags in event_msg->flags. */
+#define	BWFM_EVENT_MSG_LINK		0x01
+#define	BWFM_EVENT_MSG_FLUSHTXQ		0x02
+#define	BWFM_EVENT_MSG_GROUP		0x04
+
+/* Offsets inside the raw payload buffer we posted to fw. */
+#define	BWFM_EVT_OFFSET_ETHHDR		0
+#define	BWFM_EVT_OFFSET_BCM_ETHHDR	14	/* eth hdr size */
+#define	BWFM_EVT_OFFSET_MSG		24	/* +bwfm_ethhdr (10) */
+#define	BWFM_EVT_OFFSET_DATA		72	/* +bwfm_event_msg (48) */
+
+/* Flowring IDs — fw sees `local_id + IDSTART`. */
+#define	BWFM_H2D_MSGRING_FLOWRING_IDSTART	2
+
+/* TX_POST flags (Linux msgbuf.c:62-65). */
+#define	BWFM_MSGBUF_PKT_FLAGS_FRAME_802_3	0x01
+#define	BWFM_MSGBUF_PKT_FLAGS_PRIO_SHIFT	5
+
+/* Max concurrent outstanding TX packets — pktid table depth. */
+#define	BWFM_MSGBUF_MAX_PKTID			1024
+
+/* -----------------------------------------------------------------
+ * Ring buffers and msgbuf state.
+ *
+ * Each ring wraps a coherent bus_dma(9) allocation: paddr is the DMA
+ * address handed to the firmware, vaddr the CPU pointer used to
+ * enqueue and dequeue.
+ * ----------------------------------------------------------------- */
+struct bwfm_pci_dma_buf {
+	bus_dma_tag_t	tag;
+	bus_dmamap_t	map;
+	void		*vaddr;
+	bus_addr_t	paddr;
+	size_t		size;
+};
+
+struct bwfm_pci_ring {
+	/* Layout state, in items (protected by lock). */
+	uint16_t	depth;
+	uint16_t	item_len;
+	uint16_t	r_ptr;		/* consumer index, advanced on read */
+	uint16_t	w_ptr;		/* producer index, advanced on write */
+	uint16_t	f_ptr;		/* last fw-visible w_ptr */
+
+	uint8_t		id;
+	bool		inited;
+	bool		was_full;
+
+	struct bwfm_pci_dma_buf	buf;
+
+	/* TCM addresses of ring's r/w indices (fw-side). */
+	uint32_t	w_idx_addr;
+	uint32_t	r_idx_addr;
+
+	struct mtx	lock;
+
+	/* Back pointer for callback context. */
+	struct bwfm_pci_msgbuf	*mb;
+};
+
+/*
+ * A flow ring holds TX descriptors for a single (peer, prio, ifidx)
+ * tuple.  The firmware assigns the ring id when it acks the CREATE.
+ * Unlike Linux there is no per-ring packet queue; net80211 queues at
+ * the ifnet.
+ */
+enum bwfm_pci_flowring_status {
+	BWFM_FLOW_CLOSED = 0,
+	BWFM_FLOW_PENDING = 1,	/* CREATE sent, awaiting CMPLT */
+	BWFM_FLOW_OPEN = 2,
+	BWFM_FLOW_FAILED = 3,	/* unused: a refused create goes back to CLOSED */
+};
+struct bwfm_pci_flowring {
+	struct bwfm_pci_ring	ring;		/* commonring mechanics */
+	uint8_t			da[6];
+	uint8_t			sa[6];
+	uint8_t			prio;
+	uint8_t			tid;
+	uint8_t			ifidx;
+	uint8_t			pad;
+	int			status;		/* bwfm_pci_flowring_status */
+	int16_t			last_create_status;
+};
+
+/*
+ * pktid slot: tracks one outstanding TX mbuf so we can free it when
+ * fw acks via TX_STATUS.  request_id in TX_POST is (idx + 1) so 0 =
+ * "unused" (Linux msgbuf convention).
+ */
+struct bwfm_pci_pktid {
+	struct mbuf	*m;
+	bus_dmamap_t	 map;		/* the slot's own, made at attach */
+	uint16_t	 datalen;
+	uint16_t	 flowid;	/* local id */
+	bool		 inuse;
+	bool		 posted;	/* handed to fw; TX_STATUS may free */
+	bool		 is_eapol;	/* counted in pending_eapol */
+};
+
+/*
+ * RXPOST slot: tracks one host mbuf posted to fw for either an
+ * incoming data frame (via H2D_RXPOST_SUBMIT) or an async event
+ * payload / ioctl response (via H2D_CTRL_SUBMIT).  Fw returns the
+ * pktid in the RX_CMPLT / WL_EVENT / IOCTL_CMPLT descriptor so we
+ * can look up the mbuf.
+ */
+enum bwfm_pci_rxpost_type {
+	BWFM_RXPOST_UNUSED = 0,
+	BWFM_RXPOST_DATA,	/* fw incoming 802.3 / 802.11 frame */
+	BWFM_RXPOST_EVENT,	/* WL_EVENT payload */
+	BWFM_RXPOST_IOCTL,	/* IOCTL response (not yet used) */
+};
+struct bwfm_pci_rxpost {
+	struct mbuf	*m;
+	bus_dmamap_t	 map;		/* the slot's own, made at attach */
+	uint16_t	 buflen;
+	uint8_t		 type;		/* enum bwfm_pci_rxpost_type */
+};
+
+struct bwfm_pci_msgbuf {
+	struct bwfm_pci_softc	*sc;
+	bool			 attached;
+
+	/* Shared-memory state read from TCM after fw boot. */
+	uint32_t		 shared_addr;	/* TCM offset of shared info */
+	uint32_t		 shared_flags;
+	uint8_t			 shared_version;
+	uint32_t		 htod_mb_data_addr;
+	uint32_t		 dtoh_mb_data_addr;
+	uint32_t		 ring_info_addr;
+	uint32_t		 console_addr;
+	uint16_t		 max_rxbufpost;
+	uint32_t		 rx_dataoffset;
+
+	uint16_t		 max_flowrings;
+	uint16_t		 max_submissionrings;
+	uint16_t		 max_completionrings;
+
+	uint32_t		 ringmem_base;
+
+	/* Rate limit for complaints about bad firmware ring indices. */
+	struct timeval		 bad_idx_last;
+	int			 bad_idx_pps;
+
+	/* PCIe2 core BAR0 window base — cached at attach. */
+	uint32_t		 pcie2_base;
+
+	/* Doorbell + interrupt regs (offsets into PCIe2 window). */
+	uint32_t		 intmask;
+	uint32_t		 mailboxint;
+	uint32_t		 mailboxmask;
+	uint32_t		 h2d_mailbox_0;
+
+	/* The 5 fixed common rings. */
+	struct bwfm_pci_ring	 rings[BWFM_NROF_COMMON_MSGRINGS];
+
+	/* Coherent scratch + ringupd (Linux init_scratchbuffers). */
+	struct bwfm_pci_dma_buf	 scratch;
+	struct bwfm_pci_dma_buf	 ringupd;
+
+	/* Coherent IOCTL request buffer (single-outstanding, msgbuf.c). */
+	struct bwfm_pci_dma_buf	 ioctbuf;
+
+	/* IOCTL round-trip completion (single outstanding). */
+	struct sx		 dcmd_sx;
+	struct mtx		 dcmd_mtx;
+	struct cv		 dcmd_cv;
+	bool			 dcmd_completed;
+	bool			 dcmd_waiting;	/* a request is outstanding */
+	/*
+	 * A request timed out and its reply may still land in ioctbuf;
+	 * the next request waits for it (or 1 s) before reusing it.
+	 */
+	bool			 dcmd_stale;
+	uint16_t		 dcmd_reqid;
+	uint32_t		 stat_dcmd_stale;	/* completions not ours */
+	int16_t			 dcmd_resp_status;
+	uint16_t		 dcmd_resp_len;
+
+	/*
+	 * Next free H2D w/r index slot for flowrings, set at commonring
+	 * init to the slot after the two H2D common rings.
+	 */
+	uint32_t		 flow_h2d_w_next;
+	uint32_t		 flow_h2d_r_next;
+	uint32_t		 flow_ringmem_next;	/* per-ring 16B slot */
+
+	/* Flowring array, size = max_flowrings.  Alloc'd at attach. */
+	struct bwfm_pci_flowring *flowrings;
+	struct mtx		 flow_mtx;	/* protects create/status */
+	struct cv		 flow_cv;
+
+	/* Pktid table for TX (dyn-alloc size BWFM_MSGBUF_MAX_PKTID). */
+	struct bwfm_pci_pktid	*pktids;
+	uint32_t		 pktid_maps;	/* slot maps made at attach */
+	struct mtx		 pktid_mtx;
+	uint32_t		 pktid_next_hint;
+	bus_dma_tag_t		 tx_mbuf_tag;
+
+	/*
+	 * Outstanding EAPOL TX pktids: incremented when an ethertype
+	 * 0x888e frame gets a pktid, decremented on its TX_STATUS, and
+	 * the cv is broadcast whenever the count reaches zero.
+	 * bwfm_fmop_set_key waits on it before installing the PTK.
+	 * Otherwise the key DCMD can reach the firmware ahead of M4, M4
+	 * goes out encrypted, and the AP drops it and deauthenticates.
+	 */
+	uint32_t		 pending_eapol;
+	struct cv		 pending_eapol_cv;
+
+	/*
+	 * RXPOST slots + counters.  Pktid space for rxposts is disjoint
+	 * from tx_pktids — separate table + separate hint.  Slot 0 is
+	 * reserved (fw treats request_id 0 as "no id").
+	 */
+	struct bwfm_pci_rxpost	*rxposts;
+	struct mtx		 rxpost_mtx;
+	uint32_t		 rxpost_next_hint;
+	bus_dma_tag_t		 rx_mbuf_tag;
+	uint32_t		 rxpost_maps;	/* slot maps made at attach */
+
+	uint16_t		 cur_eventbuf;
+	uint16_t		 max_eventbuf;
+	/*
+	 * Event slots the firmware holds, under eventbuf_mtx.
+	 * A slot whose repost fails is posted by the next refill.
+	 */
+	uint32_t		 eventbuf_posted;
+	struct mtx		 eventbuf_mtx;
+	uint16_t		 cur_rxbufpost;
+
+	/*
+	 * Retries the RX data refill after the pool drains.
+	 * Runs under the D2H RX_COMPLETE ring lock.
+	 */
+	struct callout		 rxfill_callout;
+	bool			 rxfill_inited;
+	bool			 locks_inited;	/* dcmd/flow/pktid/rxpost/eventbuf */
+	bool			 event_q_inited;
+	bool			 rx_short;	/* fw had under half its rx buffers */
+	uint32_t		 rxpost_batch;	/* refill when this many are missing */
+	uint64_t		 stat_rx_short;	/* times fw ran short of rx buffers */
+
+	/*
+	 * Coherent event buffer pool, BWFM_MSGBUF_MAX_EVENTBUF_POST
+	 * entries allocated once with bus_dmamem_alloc so the physical
+	 * address is guaranteed to satisfy the 32-bit DMA tag.  9KB mbuf
+	 * clusters can land above 4GB without a bounce buffer, which
+	 * leaves no event buffers posted and wedges the firmware on the
+	 * first DCMD.  Slots live as long as the driver; pktid is the
+	 * slot index plus one.
+	 */
+	struct bwfm_pci_dma_buf	 eventbufs[BWFM_MSGBUF_MAX_EVENTBUF_POST];
+
+	/*
+	 * Deferred WL_EVENT queue (see struct bwfm_pci_event).  The
+	 * interrupt path queues here and event_task drains it.
+	 */
+	struct mtx		 event_q_mtx;
+	STAILQ_HEAD(, bwfm_pci_event) event_q;
+	u_int			 event_q_len;	/* under event_q_mtx */
+	uint32_t		 stat_event_drops;
+	struct task		 event_task;
+
+	/* Statistics. */
+	uint64_t		 stat_dcmd_tx;
+	uint64_t		 stat_dcmd_rx;
+	uint64_t		 stat_dcmd_timeout;
+	/*
+	 * Consecutive DCMD timeouts, reset to 0 on any success.  When it
+	 * reaches the softc's sc_crash_recover_threshold (0, i.e. off, by
+	 * default) the firmware is treated as crashed and a task runs
+	 * bwfm_pci_cold_reattach().  It lives here rather than in the
+	 * softc so the DCMD paths can update it directly.
+	 */
+	uint32_t		 stat_dcmd_timeout_consec;
+	uint64_t		 stat_isr_hits;
+	uint64_t		 stat_ctl_msgs;
+	uint64_t		 stat_flow_create_tx;
+	uint64_t		 stat_flow_create_ok;
+	uint64_t		 stat_flow_create_fail;
+	uint64_t		 stat_tx_post;
+	uint64_t		 stat_tx_status_ok;
+	uint64_t		 stat_tx_status_err;
+	uint64_t		 stat_tx_no_pktid;
+	uint64_t		 stat_tx_high;	/* posted above 4 GB */
+	uint64_t		 stat_rx_high;	/* posted above 4 GB */
+	uint64_t		 stat_tx_ring_full;
+	uint64_t		 stat_event_rx;
+	uint64_t		 stat_rx_data;
+	/* Received frames, handed up after the RX ring lock is dropped. */
+	struct mbufq		 rx_upq;
+	uint64_t		 stat_rxpost_refills;
+	struct timeval		 rxpost_err_last;	/* printf rate limit */
+	int			 rxpost_err_pps;
+};
+
+/* -----------------------------------------------------------------
+ * Public entry points (implemented in bwfm_pci_msgbuf.c).
+ * ----------------------------------------------------------------- */
+
+/*
+ * Attach: the firmware must be running (released from reset, with
+ * BAR2[rambase+ramsize-4] non-zero).  Reads the shared info, allocates
+ * the rings, installs the interrupt handler and publishes the rings to
+ * the firmware.  Returns 0 if already attached.
+ */
+int	bwfm_pci_msgbuf_attach(struct bwfm_pci_softc *);
+void	bwfm_pci_maybe_queue_crash_recover(struct bwfm_pci_softc *);
+/* A TX_STATUS freed a slot: restart transmit blocked on a full ring. */
+void	bwfm_pci_tx_resume(struct bwfm_pci_softc *);
+struct sbuf;
+void	bwfm_pci_msgbuf_ring_dump(struct bwfm_pci_msgbuf *, struct sbuf *);
+
+/*
+ * The msgbuf gate (if_bwfm_pci.c).  Everything that uses the rings,
+ * pktid table or dcmd locks enters it; cold_reattach closes it while it
+ * frees and rebuilds them.  Enter fails while the gate is closed, except
+ * on the thread doing the rebuild.
+ */
+bool	bwfm_pci_gate_enter(struct bwfm_pci_softc *);
+void	bwfm_pci_gate_exit(struct bwfm_pci_softc *);
+
+/*
+ * Detach: free all coherent buffers, remove ISR.  Must be called
+ * before device_detach.  Safe to call unattached.
+ */
+void	bwfm_pci_msgbuf_detach(struct bwfm_pci_softc *);
+
+/*
+ * DCMD round trip: send `cmd` with `params_len` bytes, wait up to 2 s
+ * for the reply and copy up to `*resp_lenp` bytes of it into `resp`.
+ * On return *resp_lenp holds the actual reply length and *fwerr the
+ * firmware status.  Returns 0 on success, ETIMEDOUT if there is no
+ * reply, ENXIO if msgbuf is not attached.
+ */
+int	bwfm_pci_msgbuf_dcmd(struct bwfm_pci_softc *, uint32_t cmd,
+	    bool is_set, const void *params, size_t params_len,
+	    void *resp, size_t *resp_lenp, int32_t *fwerr);
+
+/*
+ * Create a flowring for (sa,da,prio) on ifidx.  Synchronous: sends
+ * FLOW_RING_CREATE, waits up to 2 s for FLOW_RING_CREATE_CMPLT.
+ * On success sets *flowid_out to the local flowring id (0-based).
+ * Fw's ring id = flowid_out + BWFM_H2D_MSGRING_FLOWRING_IDSTART.
+ * The TID sent is prio itself (identity map).  Linux differs: it sends
+ * the AC fifo from brcmf_flowring_prio2fifo[] via brcmf_flowring_tid().
+ */
+int	bwfm_pci_msgbuf_flowring_create(struct bwfm_pci_softc *,
+	    const uint8_t sa[6], const uint8_t da[6], uint8_t prio,
+	    uint8_t ifidx, uint16_t *flowid_out);
+
+/*
+ * Submit an mbuf into an OPEN flowring.  Takes ownership of *mp and
+ * sets it to NULL: it is freed when fw acks it via TX_STATUS, or here
+ * on error.  On ENOSPC (ring or pktid table full) *mp is left for the
+ * caller to queue and retry.  ifidx is written into the TX_POST header.
+ * Frame must be 802.3 with a 14-byte Ethernet header at m_data.
+ */
+int	bwfm_pci_msgbuf_txmbuf(struct bwfm_pci_softc *, uint16_t flowid,
+	    struct mbuf **mp, uint8_t ifidx);
+
+/*
+ * DCMD wrappers, equivalent to Linux fwil.c.  All are synchronous and
+ * wait up to 2 s for the reply.
+ */
+int	bwfm_pci_msgbuf_dcmd_set_int(struct bwfm_pci_softc *, uint32_t cmd,
+	    uint32_t val);
+int	bwfm_pci_msgbuf_dcmd_get_int(struct bwfm_pci_softc *, uint32_t cmd,
+	    uint32_t *val);
+int	bwfm_pci_msgbuf_dcmd_set_var(struct bwfm_pci_softc *, const char *name,
+	    const void *data, size_t datalen);
+int	bwfm_pci_msgbuf_dcmd_get_var(struct bwfm_pci_softc *, const char *name,
+	    void *data, size_t *datalenp);
+
+/* Well-known DCMD command numbers (Linux fwil.h). */
+#define	BWFM_C_GET_VERSION	1
+#define	BWFM_C_UP		2
+#define	BWFM_C_DOWN		3
+#define	BWFM_C_GET_INFRA	19
+#define	BWFM_C_SET_INFRA	20
+#define	BWFM_C_GET_SSID		25
+#define	BWFM_C_SET_SSID		26
+#define	BWFM_C_DISASSOC		52
+#define	BWFM_C_SET_COUNTRY	84
+#define	BWFM_C_SET_PM		86
+#define	BWFM_C_GET_WSEC		133
+#define	BWFM_C_SET_WSEC		134
+#define	BWFM_C_GET_BSS_INFO	136
+#define	BWFM_C_GET_VAR		262
+#define	BWFM_C_SET_VAR		263
+
+/*
+ * Interrupt filter, installed with bus_setup_intr as a filter and
+ * ithread pair.  Reads MAILBOXINT, acks the D2H bits and schedules the
+ * ithread.
+ */
+int	bwfm_pci_msgbuf_isr_filter(void *arg);
+
+/* ithread handler: drains the D2H completion rings. */
+void	bwfm_pci_msgbuf_isr_thread(void *arg);
+
+/* -----------------------------------------------------------------
+ * Accessors provided by if_bwfm_pci.c for bwfm_pci_msgbuf.c, so the
+ * msgbuf layer does not depend on the transport softc definition.
+ * ----------------------------------------------------------------- */
+struct bwfm_pci_softc;
+uint32_t	bwfm_pci_msgbuf_pcie2_base(struct bwfm_pci_softc *);
+void		bwfm_pci_msgbuf_set_window(struct bwfm_pci_softc *, uint32_t);
+struct resource *bwfm_pci_msgbuf_bar0(struct bwfm_pci_softc *);
+struct resource *bwfm_pci_msgbuf_bar2(struct bwfm_pci_softc *);
+bus_space_tag_t	bwfm_pci_msgbuf_bar0_tag(struct bwfm_pci_softc *);
+bus_space_handle_t bwfm_pci_msgbuf_bar0_handle(struct bwfm_pci_softc *);
+bus_space_tag_t	bwfm_pci_msgbuf_bar2_tag(struct bwfm_pci_softc *);
+bus_space_handle_t bwfm_pci_msgbuf_bar2_handle(struct bwfm_pci_softc *);
+device_t	bwfm_pci_msgbuf_dev(struct bwfm_pci_softc *);
+int		bwfm_pci_msgbuf_debug(struct bwfm_pci_softc *);
+
+/*
+ * D3/D0 mailbox helpers.  send_mb_data writes htod_val into the TCM
+ * htod slot and rings the SBMBX config-space doorbell; it returns 0 if
+ * the firmware's mailbox was clear or cleared within 1 s.  wait_mb_ack
+ * polls the dtoh slot for `expect` for up to `timeout_ms` ms and
+ * returns 0 on a match, ETIMEDOUT otherwise.
+ */
+int	bwfm_pci_msgbuf_send_mb_data(struct bwfm_pci_softc *,
+	    uint32_t htod_val);
+int	bwfm_pci_msgbuf_wait_mb_ack(struct bwfm_pci_softc *,
+	    uint32_t expect, int timeout_ms);
+
+/*
+ * Block up to timeout_ms until every outstanding EAPOL TX pktid has
+ * had a TX_STATUS.  Returns 0 on drain, ETIMEDOUT if the deadline
+ * passes first.  Used from bwfm_fmop_set_key on PTK install.
+ */
+int	bwfm_pci_msgbuf_wait_eapol_drain(struct bwfm_pci_softc *,
+	    int timeout_ms);
+
+/*
+ * Synchronously send FLOW_RING_DELETE for a given local flowid and
+ * wait up to 2 s for the CMPLT.  On success the slot is marked
+ * CLOSED so it can be reallocated on a subsequent create.  Returns
+ * ETIMEDOUT if fw doesn't ack, ENXIO if msgbuf is down.
+ */
+int	bwfm_pci_msgbuf_flowring_delete(struct bwfm_pci_softc *,
+	    uint16_t local_id);
+
+/*
+ * Iterate every host-side flowring in status BWFM_FLOW_OPEN and
+ * synchronously delete each one (see bwfm_pci_msgbuf_flowring_delete).
+ * Slots are marked CLOSED on success; failures are logged and skipped
+ * so partial success is possible.
+ */
+void	bwfm_pci_msgbuf_flowring_delete_all(struct bwfm_pci_softc *);
+/* Delete every flow ring whose destination is the given address. */
+void	bwfm_pci_msgbuf_flowring_delete_peer(struct bwfm_pci_softc *,
+	    const uint8_t da[6]);
+uint32_t	bwfm_pci_msgbuf_rambase(struct bwfm_pci_softc *);
+uint32_t	bwfm_pci_msgbuf_ramsize(struct bwfm_pci_softc *);
+/* True when [addr, addr + len) is inside the chip's RAM in TCM. */
+bool	bwfm_pci_msgbuf_tcm_ok(struct bwfm_pci_msgbuf *, uint32_t addr,
+	    uint32_t len);
+struct bwfm_pci_msgbuf	*bwfm_pci_msgbuf_state(struct bwfm_pci_softc *);
+/* Attach the filter and ithread to sc_irq; arg is &sc->sc_msgbuf. */
+int	bwfm_pci_msgbuf_bind_intr(struct bwfm_pci_softc *,
+	    driver_filter_t *filter, driver_intr_t *thread, void *arg);
+void	bwfm_pci_msgbuf_unbind_intr(struct bwfm_pci_softc *);
+/*
+ * Deliver a decoded WL_EVENT payload to the bwfm.c FullMAC core.
+ * Implemented in if_bwfm_pci.c so this header stays independent of
+ * bwfmvar.h.
+ */
+void	bwfm_pci_msgbuf_event_up(struct bwfm_pci_softc *,
+	    const uint8_t *payload, size_t len);
+
+/*
+ * Find an OPEN flowring matching dst MAC + prio, or return
+ * (uint16_t)-1 if none.  Used by the txdata path to skip the
+ * create-then-fail cycle when the flow already exists.
+ */
+uint16_t	bwfm_pci_msgbuf_flowring_lookup(struct bwfm_pci_softc *,
+		    const uint8_t da[6], uint8_t prio);
+
+/*
+ * Hand an RX data mbuf to net80211.  The if_bwfm_pci.c side finds the
+ * shared bwfm_softc and delivers the 802.3 frame, EAPOL included, with
+ * ieee80211_fmac_rx.
+ * Always consumes `m`.
+ */
+void	bwfm_pci_msgbuf_rx_starved(struct bwfm_pci_softc *);
+void	bwfm_pci_msgbuf_rx_up(struct bwfm_pci_softc *, struct mbuf *m,
+	    int rssi_dbm);
+
+#endif /* _DEV_BWFM_BWFM_PCI_MSGBUF_H_ */

@@ -1,0 +1,4224 @@
+/*-
+ * SPDX-License-Identifier: BSD-2-Clause
+ *
+ * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
+ *
+ * Broadcom FullMAC PCIe transport glue for bwfm.
+ *
+ * Matches the BCM43602 and the other BCM43xx PCIe parts by ID, maps
+ * BAR0 (the register window) and BAR2 (chip RAM), walks the backplane
+ * cores, downloads the firmware into chip RAM and releases the ARM,
+ * then hands the shared-memory handshake and the MSGBUF rings to
+ * bwfm_pci_msgbuf.c.  The bring-up runs from attach in a kernel thread
+ * (hw.bwfm_pci.autostart).  Only the BCM43602 has the full bring-up;
+ * the other IDs attach for probing only.
+ */
+
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/kernel.h>
+#include <sys/kthread.h>
+#include <sys/kdb.h>
+#include <sys/bus.h>
+#include <sys/endian.h>
+#include <sys/lock.h>
+#include <sys/malloc.h>
+#include <sys/mbuf.h>
+#include <sys/module.h>
+#include <sys/mutex.h>
+#include <sys/priv.h>
+#include <sys/rman.h>
+#include <sys/sbuf.h>
+#include <sys/socket.h>
+#include <sys/sysctl.h>
+#include <sys/taskqueue.h>
+#include <sys/firmware.h>
+
+#include <machine/bus.h>
+#if defined(__amd64__) || defined(__i386__)
+#include <machine/cpufunc.h>	/* inb / outb */
+#endif
+#include <machine/resource.h>
+
+#include <net/if.h>
+#include <net/if_var.h>
+#include <net/if_media.h>
+#include <net/ethernet.h>
+
+#include <net80211/ieee80211_var.h>
+#include <net80211/ieee80211_input.h>
+
+#include <dev/pci/pcireg.h>
+#include <dev/pci/pcivar.h>
+
+#include <contrib/dev/acpica/include/acpi.h>
+#include <dev/acpica/acpivar.h>
+
+#include "bwfmvar.h"
+#include "bwfmreg.h"
+#include "bwfm_pci_msgbuf.h"
+#include <net80211/ieee80211_fullmac.h>
+
+#define	BWFM_PCI_DESC	"Broadcom FullMAC PCIe"
+
+/* Forward declarations. */
+static int bwfm_pci_sysctl_net80211_detach(SYSCTL_HANDLER_ARGS);
+static void bwfm_pci_preinit_dcmds(struct bwfm_pci_softc *sc);
+
+/*
+ * Loader tunables for attach-time behaviour.  Any attach-time chip
+ * operation that could wedge the host belongs behind a tunable, so a
+ * plain reboot (or "set" at the loader prompt) gets the machine back.
+ */
+static int bwfm_pci_attach_appu_warm_dflt = 1;
+SYSCTL_NODE(_hw, OID_AUTO, bwfm_pci, CTLFLAG_RD, 0, "bwfm_pci driver tunables");
+SYSCTL_INT(_hw_bwfm_pci, OID_AUTO, attach_appu_warm, CTLFLAG_RDTUN,
+    &bwfm_pci_attach_appu_warm_dflt, 0,
+    "Run APPU warm sequence at attach.  Default 1 (safe, proven).  "
+    "Set to 0 in loader.conf to disable if it ever regresses.");
+
+/*
+ * Bring the chip all the way up after attach: firmware, msgbuf, WLC_UP and
+ * net80211, so the device shows up in net.wlan.devices like any other wifi
+ * card and userland only has to create wlan0.  0 leaves the chip down.
+ * If it goes wrong at boot, "set hw.bwfm_pci.autostart=0" at the loader
+ * prompt.
+ */
+static int bwfm_pci_autostart_dflt = 1;
+SYSCTL_INT(_hw_bwfm_pci, OID_AUTO, autostart, CTLFLAG_RDTUN,
+    &bwfm_pci_autostart_dflt, 0,
+    "Bring the chip up (firmware, msgbuf, net80211) after attach.  "
+    "0 leaves the chip down.");
+/*
+ * There is deliberately no tunable that forces bring-up from attach
+ * itself: a wedge there combined with a persistent loader.conf setting
+ * would make every boot wedge.  Bring-up runs in the autostart thread.
+ */
+
+/* Vendor IDs. */
+#define	BWFM_PCI_VENDOR_BROADCOM	0x14e4
+
+/*
+ * Device IDs.  Names map to the chip family; some IDs are shared
+ * across multiple silicon revisions and only the chipid register
+ * disambiguates.
+ *
+ * Linux bwfm_hw_ids.h gives BCM4356 0x43ec and BCM4358 0x43e9, not
+ * 0x43a3, and calls 0x4415 BCM43596; both BCM4366 revisions share
+ * 0x43c3 (0x43c4/0x43c5 for the 2G/5G parts).  The names below are
+ * kept as they are, but the BCM4366C label on 0x4415 does not match.
+ */
+#define	BWFM_PCI_DEVICE_BCM4350	0x43a3	/* BCM4350 */
+#define	BWFM_PCI_DEVICE_BCM43602	0x43ba	/* BCM43602 */
+#define	BWFM_PCI_DEVICE_BCM4366C	0x4415	/* Linux: BCM43596 */
+#define	BWFM_PCI_DEVICE_BCM4366B	0x43c3	/* BCM4366b */
+#define	BWFM_PCI_DEVICE_BCM4365	0x43ca	/* BCM4365 */
+#define	BWFM_PCI_DEVICE_BCM4364	0x4464	/* BCM4364 */
+
+struct bwfm_pci_devmatch {
+	uint16_t	devid;
+	const char	*desc;
+};
+
+static const struct bwfm_pci_devmatch bwfm_pci_devs[] = {
+	{ BWFM_PCI_DEVICE_BCM4350,   "Broadcom BCM4350 802.11ac"   },
+	{ BWFM_PCI_DEVICE_BCM43602,  "Broadcom BCM43602 802.11ac"  },
+	{ BWFM_PCI_DEVICE_BCM4366C,  "Broadcom BCM4366c 802.11ac"  },
+	{ BWFM_PCI_DEVICE_BCM4366B,  "Broadcom BCM4366b 802.11ac"  },
+	{ BWFM_PCI_DEVICE_BCM4365,   "Broadcom BCM4365 802.11ac"   },
+	{ BWFM_PCI_DEVICE_BCM4364,   "Broadcom BCM4364 802.11ac"   },
+};
+
+/*
+ * Per-chip parameters.  Bringup / firmware / memory-topology facts that
+ * vary across the Broadcom PCIe family.
+ *
+ * bringup_supported=true means the full bringup chain in
+ * bwfm_pci_bringup_sequence() has been implemented + tested for this
+ * chip.  false means the chip is probed and warmed up but not brought
+ * up (rather than wedge the host trying to run 43602-specific PMU init
+ * on a chip that doesn't have those registers).
+ *
+ * mem_core = ID of the on-chip memory core to power up in
+ * enter_download_state.  43602 has SOCRAM (0x80e).  The other
+ * entries use 0x81a, called BUF_MEM here, but Linux bcma.h names
+ * 0x81a BCMA_CORE_USB20_DEV (memory cores there are INTERNAL_MEM
+ * 0x80e and SYS_MEM 0x849), so that ID is unverified.
+ */
+struct bwfm_pci_chip_info {
+	uint16_t	devid;
+	uint32_t	rambase;	/* TCM base for fw upload */
+	uint16_t	mem_core;	/* SOCRAM / BUF_MEM ID */
+	const char     *fw_name;	/* firmware_get() name */
+	bool		bringup_supported;
+	const char     *notes;
+};
+
+static const struct bwfm_pci_chip_info bwfm_pci_chip_table[] = {
+	/*
+	 * BCM43602 - Apple A1398, MacBookPro 11,3 / 11,4 / 11,5 / 12,1.
+	 * The fully-tested target.
+	 */
+	{ .devid		= BWFM_PCI_DEVICE_BCM43602,
+	  .rambase		= 0x180000,
+	  .mem_core		= 0x80e,	/* BWFM_CORE_SOCRAM */
+	  .fw_name		= "brcmfmac43602_pcie",
+	  .bringup_supported	= true,
+	  .notes		= "43602 - fully supported"
+	},
+
+	/*
+	 * Everything else is probe only.  These entries stop the
+	 * driver attempting to run 43602-specific bringup on the wrong
+	 * chip and wedging the host.  Implementing bringup for any of
+	 * these just means filling in the correct rambase + fw + memcore
+	 * and flipping bringup_supported.
+	 */
+	{ BWFM_PCI_DEVICE_BCM4350,   0x0, 0x81a, "brcmfmac4350_pcie", false,
+	  "4350 - probe only" },
+	{ BWFM_PCI_DEVICE_BCM4366C,  0x0, 0x81a, "brcmfmac4366c_pcie", false,
+	  "4366c - probe only" },
+	{ BWFM_PCI_DEVICE_BCM4366B,  0x0, 0x81a, "brcmfmac4366b_pcie", false,
+	  "4366b - probe only" },
+	{ BWFM_PCI_DEVICE_BCM4365,   0x0, 0x81a, "brcmfmac4365_pcie", false,
+	  "4365 - probe only" },
+	{ BWFM_PCI_DEVICE_BCM4364,   0x0, 0x81a, "brcmfmac4364_pcie", false,
+	  "4364 - probe only" },
+};
+
+/*
+ * Lookup the per-chip info table by device ID.  Returns NULL if the
+ * device ID isn't in the table (probe already rejected it, so this
+ * only happens with a stale sc->sc_devid — treat as fatal).
+ */
+static const struct bwfm_pci_chip_info *
+bwfm_pci_chip_lookup(uint16_t devid)
+{
+	int i;
+	for (i = 0; i < (int)nitems(bwfm_pci_chip_table); i++) {
+		if (bwfm_pci_chip_table[i].devid == devid)
+			return (&bwfm_pci_chip_table[i]);
+	}
+	return (NULL);
+}
+
+/*
+ * BAR layout.  All shipping Broadcom PCIe parts expose two memory
+ * BARs: a small control / register window and a larger chip-RAM /
+ * shared-memory window.  The control window is required for any
+ * register access; the RAM window is required for firmware download
+ * and MSGBUF ring storage.
+ */
+#define	BWFM_PCI_BAR0_RID	PCIR_BAR(0)
+#define	BWFM_PCI_BAR2_RID	PCIR_BAR(2)
+
+/*
+ * BAR0 windowing.  The whole 4 KB BAR0 region is a sliding window onto
+ * the chip-side backplane address space.  The window register is PCI
+ * config-space offset 0x80 (not a BAR0 offset): write the top 20 bits
+ * of the target backplane address there, then read/write at BAR0[low
+ * 12 bits] to reach the desired chip register.
+ *
+ * The PCIe2 core's registers (IRQ mailbox, doorbells) are reached the
+ * same way, by pointing the window at the PCIe2 core, as Linux
+ * brcmf_pcie_select_core() does.
+ */
+#define	BWFM_PCI_BAR0_WINDOW		0x80
+#define	BWFM_PCI_BAR0_WINDOW_MASK	0xfffff000	/* top 20 bits */
+#define	BWFM_PCI_BAR0_WINDOW_OFF_MASK	0x00000fff	/* low 12 bits */
+
+/*
+ * PCI config-space registers of the endpoint (Linux pcie.c
+ * BRCMF_PCIE_REG_LINK_STATUS_CTRL 0xBC, read with
+ * pci_read_config_dword).  Config space is served by the root complex,
+ * so these are not subject to the BAR0 window.
+ */
+#define	BWFM_PCI_PCIE2_LINK_STATUS_CTRL	0xbc
+#define	BWFM_PCI_PCIE2_LINK_UP		0x00000001	/* low bit of link
+							   status word */
+
+/* Backplane core base addresses (AI-style chips). */
+#define	BWFM_BACKPLANE_CHIPCOMMON	0x18000000
+
+/* ChipCommon register layout (offsets within the core). */
+#define	BWFM_CC_REG_CHIPID		0x00
+#define	BWFM_CC_REG_EROMPTR		0xfc
+#define	BWFM_CC_CHIPID_ID_MASK		0x0000ffff
+#define	BWFM_CC_CHIPID_REV_SHIFT	16
+#define	BWFM_CC_CHIPID_REV_MASK		0x000f0000
+#define	BWFM_CC_CHIPID_PKG_SHIFT	20
+#define	BWFM_CC_CHIPID_PKG_MASK		0x00f00000
+#define	BWFM_CC_CHIPID_NCORES_SHIFT	24
+#define	BWFM_CC_CHIPID_NCORES_MASK	0x0f000000
+#define	BWFM_CC_CHIPID_TYPE_SHIFT	28
+#define	BWFM_CC_CHIPID_TYPE_MASK	0xf0000000
+
+/*
+ * EROM (Enumeration ROM) descriptor layout for AI-style chips.
+ * The EROM is a chip-internal table that enumerates every backplane
+ * core: the host walks it (via the SBTOPCI window) to find each
+ * core's ID, revision, and register base.  We read the EROM start
+ * address from ChipCommon[0xfc].
+ *
+ * Each descriptor is a 32-bit word; the low 4 bits identify the
+ * descriptor type.  COMPONENT descriptors come in pairs (id + rev/
+ * port-count); ADDRESS descriptors give a core's base address.  EOT
+ * marks end-of-table.
+ */
+#define	BWFM_EROM_DESC_TYPE_MSK		0x0000000fU
+#define	BWFM_EROM_DESC_VALID		0x00000001U
+#define	BWFM_EROM_DESC_COMPONENT	0x00000001U
+#define	BWFM_EROM_DESC_MASTER_PORT	0x00000003U
+#define	BWFM_EROM_DESC_ADDRESS		0x00000005U
+#define	BWFM_EROM_DESC_ADDRSIZE_GT32	0x00000008U
+#define	BWFM_EROM_DESC_EOT		0x0000000fU
+#define	BWFM_EROM_COMP_PARTNUM		0x000fff00U
+#define	BWFM_EROM_COMP_PARTNUM_S	8
+#define	BWFM_EROM_COMP_REVISION		0xff000000U
+#define	BWFM_EROM_COMP_REVISION_S	24
+#define	BWFM_EROM_SLAVE_ADDR_BASE	0xfffff000U
+#define	BWFM_EROM_SLAVE_SIZE_TYPE	0x00000030U
+#define	BWFM_EROM_SLAVE_SIZE_DESC	3
+#define	BWFM_EROM_SLAVE_TYPE_MASK	0x000000c0U
+#define	BWFM_EROM_SLAVE_TYPE_SHIFT	6
+#define	BWFM_EROM_SLAVE_TYPE_SLAVE	0
+#define	BWFM_EROM_SLAVE_TYPE_BRIDGE	1
+#define	BWFM_EROM_SLAVE_TYPE_SWRAP	2
+#define	BWFM_EROM_SLAVE_TYPE_MWRAP	3
+
+/* BCMA core IDs we'll see on BCM43602. */
+#define	BWFM_CORE_CHIPCOMMON		0x800
+#define	BWFM_CORE_SOCRAM		0x80e
+#define	BWFM_CORE_D11			0x812
+#define	BWFM_CORE_PMU			0x827
+#define	BWFM_CORE_ARM_CM3		0x82a
+#define	BWFM_CORE_PHY_AC		0x83b
+#define	BWFM_CORE_PCIE2			0x83c
+#define	BWFM_CORE_ARM_CR4		0x83e
+#define	BWFM_CORE_GCI			0x840
+
+/*
+ * Cached core info from EROM walk.  Up to 32 cores is more than any
+ * shipping BCM43xx chip has (BCM43602 has ~6); the array doesn't
+ * need to grow.  Populated by bwfm_pci_walk_cores().
+ */
+#define	BWFM_PCI_MAX_CORES	32
+
+struct bwfm_pci_core {
+	uint16_t	id;
+	uint8_t		rev;
+	uint32_t	base;
+	uint32_t	wrap;
+};
+
+/*
+ * Chip IDs as read from the ChipCommon chipid register.  Five-digit
+ * parts store the decimal number (BCM43602 is 0xaa52, i.e. 43602),
+ * four-digit parts read as the hex digits (BCM4366 is 0x4366).  A
+ * BCM43602 rev 1 reads 0x1601aa52: chip 0xaa52, rev 1, 6 cores.
+ */
+#define	BWFM_CHIP_BCM43602		0xaa52
+#define	BWFM_CHIP_BCM4350		0x4350
+#define	BWFM_CHIP_BCM4356		0x4356
+#define	BWFM_CHIP_BCM4358		0x4358
+#define	BWFM_CHIP_BCM4365		0x4365
+#define	BWFM_CHIP_BCM4366		0x4366
+
+/*
+ * Start of BAR0's PCIe2-core fixed-offset region (about 512 bytes at
+ * 0x80..0x2ff on BCM43602).  Below it, 0x0..0x7f is the SBTOPCI-windowed
+ * region, whose contents change as the window register moves.
+ */
+#define	BWFM_PCI_SNAP_BASE	0x80
+
+struct bwfm_pci_softc {
+	struct bwfm_softc	 bus_sc;
+	device_t		 sc_dev;
+
+	struct resource		*sc_bar0;
+	bus_space_tag_t		 sc_bar0_t;
+	bus_space_handle_t	 sc_bar0_h;
+
+	struct resource		*sc_bar2;
+	bus_space_tag_t		 sc_bar2_t;
+	bus_space_handle_t	 sc_bar2_h;
+
+	int			 sc_msix_count;
+	bool			 sc_msi;	/* true: MSI fallback when MSI-X
+						   unavailable; false + count=0
+						   means INTx */
+	struct resource		*sc_irq;
+	int			 sc_irq_rid;
+	void			*sc_irq_handle;
+
+	uint16_t		 sc_devid;
+	uint8_t			 sc_revid;
+	const struct bwfm_pci_chip_info *sc_chip;	/* per-chip params */
+
+	/*
+	 * Chip state.  attach() itself makes no BAR0 access: on Apple
+	 * machines the BCM43602 is held gated until the EC.APWC bit and a
+	 * second step are cleared, and any blind BAR0 read in that state
+	 * master-aborts the host (MCE, then reboot).
+	 */
+	bool			 sc_chip_alive;
+	/*
+	 * Set when bring-up reaches wait_fw_ready, cleared by
+	 * cold_reattach.  Bring-up refuses while it is set: uploading
+	 * over running firmware kills it, and the recovery that follows
+	 * can hang the host.
+	 */
+	bool			 sc_fw_running;
+	/* The autostart thread is running; detach waits for it. */
+	bool			 sc_autostart_running;
+	struct proc		*sc_autostart_proc;
+	/* Firmware image, held from the first upload until detach. */
+	const struct firmware	*sc_fw;
+	/* FW-ready sentinel captured from TCM[ramsize-4] by wait_fw_ready */
+	uint32_t		 sc_fw_sharedram;
+	/*
+	 * RAM size in bytes, captured in bring-up step 4 before firmware is
+	 * loaded.  Later users must use this: bwfm_pci_ramsize_query()
+	 * after firmware boot halts the running CR4.
+	 */
+	uint32_t		 sc_fw_ramsize;
+
+	struct bwfm_pci_core	 sc_cores[BWFM_PCI_MAX_CORES];
+	int			 sc_ncores;
+
+	struct bwfm_pci_msgbuf	 sc_msgbuf;
+
+	/*
+	 * Firmware crash auto-recovery.  The DCMD path bumps
+	 * mb->stat_dcmd_timeout_consec on each timeout and resets it on
+	 * any success.  When it hits sc_crash_recover_threshold we
+	 * enqueue sc_crash_recover_task, which runs bwfm_pci_cold_reattach
+	 * from sc_recover_tq.  Threshold 0 (the default) disables it.
+	 * Timeouts are not proof of a crash: firmware that stops answering
+	 * while being taken down, or after a second upload, looks the same,
+	 * and rebuilding a chip that is still running can hang the host.
+	 * Opt in with the crash_recover_threshold sysctl.
+	 */
+	/*
+	 * Transmit flow rings, made off the transmit path.  net80211 calls
+	 * the transmit routine holding its TX lock, and making a ring means
+	 * waiting for the firmware, so a frame with no ring yet is queued
+	 * here and sc_flow_task makes the ring and sends the queue.  Index
+	 * 0 is data (prio 0), 1 is EAPOL (prio 7).  Sleeping in the transmit
+	 * path would panic with "sleeping thread holds bwfm_pci0_tx_lock".
+	 */
+#define	BWFM_PCI_FLOWQ_LEN	64
+	struct mtx		 sc_flowq_mtx;
+	struct mbufq		 sc_flowq[2];
+	bool			 sc_flowq_busy[2];
+	/* A ring or the pktid table filled; TX_STATUS kicks the flow task. */
+	volatile u_int		 sc_tx_blocked;
+	/* Stations that left our access point, for the flow task. */
+#define	BWFM_PCI_PEER_GONE_MAX	16
+	uint8_t			 sc_peer_gone[BWFM_PCI_PEER_GONE_MAX][6];
+	int			 sc_peer_gone_n;
+	struct task		 sc_flow_task;
+	/*
+	 * The msgbuf gate, under sc_flowq_mtx.  cold_reattach frees the
+	 * rings, the pktid table and the dcmd locks, so it closes the gate,
+	 * waits until no one is inside (sc_gate_busy), and opens it again
+	 * once they are rebuilt.  While it is closed, frames are dropped and
+	 * firmware commands fail with ENXIO, except on the rebuilding thread
+	 * (sc_gate_owner).
+	 */
+	bool			 sc_gate_closed;
+	u_int			 sc_gate_busy;
+	struct thread		*sc_gate_owner;
+	bool			 sc_reattaching;
+
+	/*
+	 * Crash recovery runs on its own thread: cold_reattach drains tasks
+	 * on taskqueue_thread, which would never finish if it ran there.
+	 */
+	struct taskqueue	*sc_recover_tq;
+	struct task		 sc_crash_recover_task;
+	uint32_t		 sc_crash_recover_threshold;
+	uint32_t		 sc_crash_recover_events;   /* triggers */
+	u_int			 sc_crash_recover_pending;
+};
+
+#define	SC_TO_PCI(sc)	__containerof((sc), struct bwfm_pci_softc, bus_sc)
+
+/*
+ * Silent-by-default trace print keyed on the shared bwfm_softc's sc_debug.
+ * Argument is a `struct bwfm_pci_softc *` so callers don't have to spell
+ * out `&sc->bus_sc` at each site.  level==0 fires when sc_debug > 0.
+ */
+#define	PDPRINTF(pci_sc, level, ...)	do {				\
+	if ((pci_sc)->bus_sc.sc_debug > (level))			\
+		device_printf((pci_sc)->sc_dev, __VA_ARGS__);		\
+} while (0)
+
+/* ------------------------------------------------------------------
+ * Apple platform unlock.
+ *
+ * On MacBook Pros with the BCM43602 (A1398 and similar) the chip's
+ * PCIe link is held in a clock-gated / disabled state at boot.  Even
+ * after a move to D0 via PMCSR, BAR0 cycles return 0xffffffff because
+ * the chip's PCIe controller isn't responding.  The DSDT exposes an `APPU`
+ * ("AirPort Power Up") method on the parent root-port bridge that
+ * performs the unlock:
+ *
+ *   - sets the bridge's LDIS bit to 0 (link-disable off)
+ *   - flips \_SB.PCI0.LPCB.EC.APWC = 1 (Embedded Controller's
+ *     AirPort power-control bit)
+ *   - polls LACT == 1 && ARPT vendor-ID != 0xFFFF until link
+ *     trains and the WiFi device answers config-space reads
+ *
+ * Method lives on the bridge's ACPI handle, not on the WiFi
+ * device's.  We walk one step up the ACPI namespace from the
+ * device's handle to reach it.
+ *
+ * Returns 0 if APPU was found and called (regardless of whether
+ * it actually flipped state — its early-return cases are platform
+ * policy).  Returns ENOENT if no APPU method exists, in which
+ * case we're on a non-Apple platform and don't need the unlock.
+ * ------------------------------------------------------------------ */
+
+/*
+ * Apple EC port write.
+ *
+ * On these Apple machines the BCM43602's PCIe memory decoder
+ * is gated until the embedded controller's APWC bit (EC RAM byte
+ * 0x03, bit 0) is set to 1.  The ACPI AML path to that write is
+ * locked behind methods (APPU / _PS0) that also touch the gated
+ * chip and master-abort us before completing.
+ *
+ * Bypass by talking to the EC directly via its standard ACPI I/O
+ * ports: 0x62 (data) + 0x66 (cmd/status).  Protocol:
+ *   - poll status bit IBF (bit 1) until clear
+ *   - command 0x80 (RD_EC) / 0x81 (WR_EC) on port 0x66
+ *   - address byte on port 0x62
+ *   - data byte on port 0x62 (write) or read after OBF (output
+ *     buffer full, bit 0) becomes 1
+ *
+ * Races with FreeBSD's acpi_ec driver are possible in principle,
+ * but at our attach time (kldload of bwfm_pci) no other ACPI
+ * activity is reasonably in flight against the EC.
+ */
+#define	BWFM_EC_DATA	0x62
+#define	BWFM_EC_CMD	0x66
+#define	BWFM_EC_S_OBF	0x01		/* status: output buffer full */
+#define	BWFM_EC_S_IBF	0x02		/* status: input buffer full */
+#define	BWFM_EC_C_RD	0x80		/* command: read EC byte */
+#define	BWFM_EC_C_WR	0x81		/* command: write EC byte */
+
+#define	BWFM_EC_APWC_OFFSET	0x03	/* AirPort Power Control byte */
+#define	BWFM_EC_APWC_BIT	0x01	/* bit 0 */
+
+#if defined(__amd64__) || defined(__i386__)
+static int
+bwfm_pci_ec_wait_ibf(void)
+{
+	int t;
+
+	for (t = 0; t < 10000; t++) {	/* up to 100 ms */
+		if ((inb(BWFM_EC_CMD) & BWFM_EC_S_IBF) == 0)
+			return (0);
+		DELAY(10);
+	}
+	return (ETIMEDOUT);
+}
+
+static int
+bwfm_pci_ec_wait_obf(void)
+{
+	int t;
+
+	for (t = 0; t < 10000; t++) {	/* up to 100 ms */
+		if ((inb(BWFM_EC_CMD) & BWFM_EC_S_OBF) != 0)
+			return (0);
+		DELAY(10);
+	}
+	return (ETIMEDOUT);
+}
+
+static int
+bwfm_pci_ec_read_byte(uint8_t off, uint8_t *out)
+{
+	int error;
+
+	if ((error = bwfm_pci_ec_wait_ibf()) != 0)
+		return (error);
+	outb(BWFM_EC_CMD, BWFM_EC_C_RD);
+	if ((error = bwfm_pci_ec_wait_ibf()) != 0)
+		return (error);
+	outb(BWFM_EC_DATA, off);
+	if ((error = bwfm_pci_ec_wait_obf()) != 0)
+		return (error);
+	*out = inb(BWFM_EC_DATA);
+	return (0);
+}
+
+static int
+bwfm_pci_ec_write_byte(uint8_t off, uint8_t val)
+{
+	int error;
+
+	if ((error = bwfm_pci_ec_wait_ibf()) != 0)
+		return (error);
+	outb(BWFM_EC_CMD, BWFM_EC_C_WR);
+	if ((error = bwfm_pci_ec_wait_ibf()) != 0)
+		return (error);
+	outb(BWFM_EC_DATA, off);
+	if ((error = bwfm_pci_ec_wait_ibf()) != 0)
+		return (error);
+	outb(BWFM_EC_DATA, val);
+	return (bwfm_pci_ec_wait_ibf());
+}
+#else  /* non-x86: no PC EC access */
+static int bwfm_pci_ec_read_byte(uint8_t off __unused,
+    uint8_t *out __unused) { return (ENOTSUP); }
+static int bwfm_pci_ec_write_byte(uint8_t off __unused,
+    uint8_t val __unused) { return (ENOTSUP); }
+#endif
+
+/*
+ * The DSDT APPU method reimplemented in C.
+ *
+ * The DSDT's warm-up path is RP03._PS0 -> ALPR(0) -> APPU().  APPU's
+ * inner loop:
+ *   1. Write \_SB.PCI0.LPCB.EC.APWC = 0x01 (the Apple EC APWC bit).
+ *   2. Sleep 0xFA = 250ms.
+ *   3. Poll for 10s (10 million 100ns Timer ticks / 10ms Sleeps):
+ *        (LACT == 1) && (\_SB.PCI0.RP03.ARPT.AVND != 0xFFFF)
+ *      LACT = Link Active bit on parent bridge's PCIe LinkStatus.
+ *      AVND = chip's PCI vendor ID via ARPT config-space.
+ *   4. If poll fails, write APWC=0, sleep 0x0107=263ms, retry up to
+ *      5 attempts total.
+ *
+ * Doing it in C keeps the 10s poll outside the ACPICA interpreter
+ * mutex; evaluating APPU through AcpiEvaluateObject() holds that lock
+ * long enough to panic with a spin lock held too long.
+ *
+ * On success the ChipID (BAR0[0x00]) goes from 0xffffffff (cold) to
+ * 0xaa52 (BCM43602 warm).
+ */
+#define BWFM_APPU_PERST_SLEEP_US   250000    /* 250 ms after APWC=1 */
+#define BWFM_APPU_POLL_INTERVAL_US 10000     /* 10 ms per iter */
+#define BWFM_APPU_POLL_ITERS       1000      /* 1000 * 10ms = 10s */
+#define BWFM_APPU_OFF_SLEEP_US     263000    /* 263 ms between retries */
+#define BWFM_APPU_MAX_ATTEMPTS     5
+
+static int
+bwfm_pci_apple_appu_warm(struct bwfm_pci_softc *sc)
+{
+	device_t dev = sc->sc_dev;
+	uint8_t b;
+	uint16_t vid;
+	int attempt, iter, error;
+	bool link_up;
+
+	for (attempt = 0; attempt < BWFM_APPU_MAX_ATTEMPTS; attempt++) {
+		device_printf(dev, "APPU: attempt %d/%d - writing APWC=1\n",
+		    attempt + 1, BWFM_APPU_MAX_ATTEMPTS);
+
+		error = bwfm_pci_ec_read_byte(BWFM_EC_APWC_OFFSET, &b);
+		if (error != 0) {
+			device_printf(dev, "APPU: EC read failed rc=%d\n", error);
+			return (error);
+		}
+		error = bwfm_pci_ec_write_byte(BWFM_EC_APWC_OFFSET,
+		    b | BWFM_EC_APWC_BIT);
+		if (error != 0) {
+			device_printf(dev, "APPU: EC write APWC=1 failed rc=%d\n",
+			    error);
+			return (error);
+		}
+
+		/* Step 2: 250ms settle after APWC=1. */
+		DELAY(BWFM_APPU_PERST_SLEEP_US);
+
+		/*
+		 * Step 3: poll chip PCI vendor ID for 10s.  When the chip
+		 * finishes its ROM boot, its PCI config space starts
+		 * answering with the real VID (0x14e4) instead of 0xffff.
+		 * Config-space reads never wedge (they go through the root
+		 * complex, not the chip's memory decoder), so this is safe.
+		 */
+		link_up = false;
+		for (iter = 0; iter < BWFM_APPU_POLL_ITERS; iter++) {
+			vid = pci_read_config(dev, PCIR_VENDOR, 2);
+			if (vid != 0xffff && vid != 0x0000) {
+				link_up = true;
+				break;
+			}
+			DELAY(BWFM_APPU_POLL_INTERVAL_US);
+		}
+
+		if (link_up) {
+			device_printf(dev,
+			    "APPU: link up after %d ms - chip vendor=0x%04x, "
+			    "chip is WARM\n",
+			    (iter + 1) * (BWFM_APPU_POLL_INTERVAL_US / 1000),
+			    vid);
+			return (0);
+		}
+
+		device_printf(dev,
+		    "APPU: attempt %d timed out after 10s - APWC=0 and retry\n",
+		    attempt + 1);
+
+		/* Step 4: retry - APWC=0, sleep 263ms, loop. */
+		error = bwfm_pci_ec_read_byte(BWFM_EC_APWC_OFFSET, &b);
+		if (error == 0) {
+			(void)bwfm_pci_ec_write_byte(BWFM_EC_APWC_OFFSET,
+			    b & ~BWFM_EC_APWC_BIT);
+		}
+		DELAY(BWFM_APPU_OFF_SLEEP_US);
+	}
+
+	device_printf(dev,
+	    "APPU: chip failed to come up after %d attempts - stays cold\n",
+	    BWFM_APPU_MAX_ATTEMPTS);
+	return (ETIMEDOUT);
+}
+
+/* ------------------------------------------------------------------
+ * BAR0 windowing helpers.
+ *
+ * Reads and writes of backplane-side chip registers go through the
+ * sliding window register at PCI config offset 0x80.
+ *
+ * The window register is per-device chip state and no lock guards
+ * it; the interrupt path is meant to use only the PCIe2 fixed offsets
+ * at 0x90 and above, not the windowed 0x0..0x7f region.
+ * ------------------------------------------------------------------ */
+
+static void
+bwfm_pci_set_window(struct bwfm_pci_softc *sc, uint32_t addr)
+{
+	uint32_t want = addr & BWFM_PCI_BAR0_WINDOW_MASK;
+
+	/*
+	 * The window register is at PCI config offset 0x80, not BAR0
+	 * memory offset 0x80; a BAR0 write there does not move the
+	 * window.  The DSDT's WAPS method drives the same register
+	 * through config space.
+	 */
+	pci_write_config(sc->sc_dev, BWFM_PCI_BAR0_WINDOW, want, 4);
+	(void)pci_read_config(sc->sc_dev, BWFM_PCI_BAR0_WINDOW, 4);
+}
+
+static uint32_t
+bwfm_pci_read_core32(struct bwfm_pci_softc *sc, uint32_t backplane_addr)
+{
+	bwfm_pci_set_window(sc, backplane_addr);
+	return (bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    backplane_addr & BWFM_PCI_BAR0_WINDOW_OFF_MASK));
+}
+
+/*
+ * Config-space-only chip-alive test.  It cannot wedge even with a cold
+ * backplane, since config space is served by the root complex, but it
+ * does not prove BAR0 MMIO is safe.
+ */
+static bool
+bwfm_pci_chip_alive_cfg(struct bwfm_pci_softc *sc)
+{
+	device_t dev = sc->sc_dev;
+	uint16_t vid;
+	uint32_t win_readback;
+
+	vid = pci_read_config(dev, PCIR_VENDOR, 2);
+	if (vid == 0xffff) {
+		device_printf(dev,
+		    "chip_alive_cfg: cfg VID=0xffff — PCIe link down or "
+		    "device absent.  Refusing.\n");
+		return (false);
+	}
+
+	pci_write_config(dev, BWFM_PCI_BAR0_WINDOW,
+	    BWFM_BACKPLANE_CHIPCOMMON, 4);
+	win_readback = pci_read_config(dev, BWFM_PCI_BAR0_WINDOW, 4);
+	if (win_readback == 0xffffffffU) {
+		device_printf(dev,
+		    "chip_alive_cfg: cfg BAR0_WIN readback=0xffffffff — "
+		    "RC completion timeout, backplane unreachable.  "
+		    "Refusing.\n");
+		return (false);
+	}
+	if (win_readback != BWFM_BACKPLANE_CHIPCOMMON) {
+		device_printf(dev,
+		    "chip_alive_cfg: cfg BAR0_WIN readback=0x%08x — expected "
+		    "0x%x.  cfg-space write not retained; PCIe fabric "
+		    "unhealthy.  Refusing.\n",
+		    win_readback, BWFM_BACKPLANE_CHIPCOMMON);
+		return (false);
+	}
+
+	/* Backplane data read through the config-space window at 0x1e8. */
+	{
+		uint32_t bp_data;
+
+		bp_data = pci_read_config(dev, 0x1e8, 4);
+		if (bp_data == 0xffffffffU) {
+			device_printf(dev,
+			    "chip_alive_cfg: cfg 0x1e8 backplane read = "
+			    "0xffffffff — backplane clock is OFF.  cfg VID "
+			    "was 0x%04x, BAR0_WIN was 0x%08x, but chip "
+			    "backplane isn't responding to config-space "
+			    "read-through.  Refusing to protect from CPU "
+			    "wedge.\n",
+			    vid, win_readback);
+			return (false);
+		}
+
+		device_printf(dev,
+		    "chip_alive_cfg: cfg VID=0x%04x, BAR0_WIN=0x%08x, "
+		    "backplane data (ChipID via cfg 0x1e8) = 0x%08x — "
+		    "backplane clock is ON.\n",
+		    vid, win_readback, bp_data);
+	}
+	return (true);
+}
+
+/* ------------------------------------------------------------------
+ * EROM (Enumeration ROM) walk.
+ *
+ * Every AI-style Broadcom chip publishes a table of its backplane
+ * cores at the chip-side address held in ChipCommon[0xfc].  Walking
+ * the table tells us where each core's registers live and which
+ * cores exist on this particular silicon — needed for ARM-CR4 reset,
+ * SOCRAM sizing, PCIe2 doorbell setup, and so on.  Without it, the
+ * driver would have to hardcode per-chip base addresses; the EROM
+ * lets one code path serve every chip.
+ *
+ * Walker layout:
+ *
+ *   Each COMPONENT descriptor pair (id + rev/port-counts) is
+ *   followed by zero or more MASTER_PORT descriptors then one or
+ *   more ADDRESS descriptors.  The first ADDRESS for a component
+ *   gives the slave (register) base; we record (id, rev, base) per
+ *   core into sc_cores[].
+ *
+ * Every read goes through the SBTOPCI window, which is slow but only
+ * happens once per bring-up.
+ * ------------------------------------------------------------------ */
+
+static const char *
+bwfm_pci_core_name(uint16_t id)
+{
+	switch (id) {
+	case BWFM_CORE_CHIPCOMMON:	return "ChipCommon";
+	case BWFM_CORE_SOCRAM:		return "SOCRAM";
+	case BWFM_CORE_D11:		return "D11/80211";
+	case BWFM_CORE_PMU:		return "PMU";
+	case BWFM_CORE_ARM_CM3:		return "ARM-CM3";
+	case BWFM_CORE_PHY_AC:		return "PHY-AC";
+	case BWFM_CORE_PCIE2:		return "PCIe2";
+	case BWFM_CORE_ARM_CR4:		return "ARM-CR4";
+	case BWFM_CORE_GCI:		return "GCI";
+	default:			return "?";
+	}
+}
+
+static uint32_t
+bwfm_pci_erom_next(struct bwfm_pci_softc *sc, uint32_t *paddr)
+{
+	uint32_t v;
+
+	v = bwfm_pci_read_core32(sc, *paddr);
+	*paddr += 4;
+	return (v);
+}
+
+static int
+bwfm_pci_walk_cores(struct bwfm_pci_softc *sc)
+{
+	uint32_t eromptr, addr;
+	uint32_t v1, v2, vd;
+	uint16_t id;
+	uint8_t rev, type, sztype;
+	uint32_t base;
+	int i, guard;
+	bool found_addr;
+
+	if (!sc->sc_chip_alive) {
+		device_printf(sc->sc_dev,
+		    "core_walk: refusing — sc_chip_alive is false\n");
+		return (ENXIO);
+	}
+
+	eromptr = bwfm_pci_read_core32(sc,
+	    BWFM_BACKPLANE_CHIPCOMMON + BWFM_CC_REG_EROMPTR);
+	PDPRINTF(sc, 0,
+	    "core_walk: ChipCommon[0xfc] EROM pointer = 0x%08x\n", eromptr);
+	if (eromptr == 0 || eromptr == 0xffffffffU) {
+		device_printf(sc->sc_dev,
+		    "core_walk: EROM pointer looks invalid; aborting\n");
+		return (EIO);
+	}
+
+	addr = eromptr;
+	sc->sc_ncores = 0;
+	guard = 0;
+	while (guard++ < 256) {
+		v1 = bwfm_pci_erom_next(sc, &addr);
+		type = v1 & BWFM_EROM_DESC_TYPE_MSK;
+		if (type == BWFM_EROM_DESC_EOT) {
+			PDPRINTF(sc, 0,
+			    "core_walk: EOT at EROM offset 0x%x\n",
+			    addr - 4 - eromptr);
+			break;
+		}
+		if ((v1 & BWFM_EROM_DESC_VALID) == 0)
+			continue;
+		if (type != BWFM_EROM_DESC_COMPONENT)
+			continue;
+
+		id = (v1 & BWFM_EROM_COMP_PARTNUM) >>
+		    BWFM_EROM_COMP_PARTNUM_S;
+
+		/* Second COMPONENT word — required. */
+		v2 = bwfm_pci_erom_next(sc, &addr);
+		if ((v2 & BWFM_EROM_DESC_TYPE_MSK) !=
+		    BWFM_EROM_DESC_COMPONENT) {
+			device_printf(sc->sc_dev,
+			    "core_walk: malformed component pair "
+			    "(id=0x%03x), second word 0x%08x not "
+			    "COMPONENT — stopping walk\n", id, v2);
+			break;
+		}
+		rev = (v2 & BWFM_EROM_COMP_REVISION) >>
+		    BWFM_EROM_COMP_REVISION_S;
+
+		/*
+		 * Walk ADDRESS descriptors.  Each carries a slave-type
+		 * field (bits 6-7) saying whether the address is the
+		 * core's register window (SLAVE), its slave-side wrapper
+		 * (SWRAP), or master-side wrapper (MWRAP).  We capture
+		 * the first SLAVE-type address as `base` and the first
+		 * SWRAP as `wrap` — wrap is what reset/clock control
+		 * goes through.
+		 */
+		base = 0;
+		uint32_t wrap = 0;
+		(void)found_addr;
+		for (i = 0; i < 32; i++) {	/* bounded per-component */
+			uint32_t v;
+			uint8_t t, stype;
+
+			v = bwfm_pci_erom_next(sc, &addr);
+			t = v & BWFM_EROM_DESC_TYPE_MSK;
+
+			if (t == BWFM_EROM_DESC_EOT) {
+				addr -= 4;
+				goto eot;
+			}
+			if (t == BWFM_EROM_DESC_COMPONENT) {
+				addr -= 4;
+				break;
+			}
+			if (t == BWFM_EROM_DESC_MASTER_PORT)
+				continue;
+			if ((t & ~BWFM_EROM_DESC_ADDRSIZE_GT32) ==
+			    BWFM_EROM_DESC_ADDRESS) {
+				stype = (v & BWFM_EROM_SLAVE_TYPE_MASK) >>
+				    BWFM_EROM_SLAVE_TYPE_SHIFT;
+
+				if (stype == BWFM_EROM_SLAVE_TYPE_SLAVE &&
+				    base == 0)
+					base = v & BWFM_EROM_SLAVE_ADDR_BASE;
+				else if (stype == BWFM_EROM_SLAVE_TYPE_SWRAP &&
+				    wrap == 0)
+					wrap = v & BWFM_EROM_SLAVE_ADDR_BASE;
+				else if (stype == BWFM_EROM_SLAVE_TYPE_MWRAP &&
+				    wrap == 0)
+					wrap = v & BWFM_EROM_SLAVE_ADDR_BASE;
+
+				if (t & BWFM_EROM_DESC_ADDRSIZE_GT32)
+					(void)bwfm_pci_erom_next(sc, &addr);
+				sztype = (v & BWFM_EROM_SLAVE_SIZE_TYPE) >> 4;
+				if (sztype == BWFM_EROM_SLAVE_SIZE_DESC) {
+					vd = bwfm_pci_erom_next(sc, &addr);
+					if (vd & BWFM_EROM_DESC_ADDRSIZE_GT32)
+						(void)bwfm_pci_erom_next(sc,
+						    &addr);
+				}
+				continue;
+			}
+			addr -= 4;
+			break;
+		}
+
+		if (sc->sc_ncores >= BWFM_PCI_MAX_CORES) {
+			device_printf(sc->sc_dev,
+			    "core_walk: hit BWFM_PCI_MAX_CORES (%d); "
+			    "dropping further entries\n",
+			    BWFM_PCI_MAX_CORES);
+			continue;
+		}
+		sc->sc_cores[sc->sc_ncores].id   = id;
+		sc->sc_cores[sc->sc_ncores].rev  = rev;
+		sc->sc_cores[sc->sc_ncores].base = base;
+		sc->sc_cores[sc->sc_ncores].wrap = wrap;
+		sc->sc_ncores++;
+
+		PDPRINTF(sc, 0,
+		    "core_walk: %2d. %-12s id=0x%03x rev=%u "
+		    "base=0x%08x wrap=0x%08x\n",
+		    sc->sc_ncores, bwfm_pci_core_name(id), id, rev,
+		    base, wrap);
+	}
+eot:
+	PDPRINTF(sc, 0,
+	    "core_walk: %d core(s) recorded\n", sc->sc_ncores);
+	return (0);
+}
+
+/* ------------------------------------------------------------------
+ * Firmware upload.
+ *
+ * On BCM43602 the host loads the ARM-CR4 image directly into the
+ * chip's SOCRAM via BAR2.  BAR2 is the "TCM" aperture: a flat
+ * window onto chip-side memory.  The firmware destination within
+ * BAR2 is `rambase`, a per-chip constant (NOT the SOCRAM core's
+ * backplane address).  On BCM43602 rambase = 0x180000; per-chip
+ * table lives in bwfm_pci_chip_table[].
+ *
+ * The firmware image is wrapped as the kld bwfm_pci_fw_43602.  It is
+ * a raw ARM-CR4 image (no ELF or Mach-O header), about 635 KB and
+ * 4-byte aligned, with no relocation table or signature: the loader
+ * is expected to know the chip's rambase.  The ARM-CR4 reset vector
+ * is the first le32 of the image.
+ *
+ * The strings at the tail of the image carry the firmware version and
+ * feature list (e.g. "43602a1-roml/pcie Version: 7.35.177.61 ..."),
+ * and they are logged at upload so dmesg shows which firmware ran.
+ * ------------------------------------------------------------------ */
+
+#define	BWFM_PCI_FW_43602	"brcmfmac43602_pcie"
+#define	BWFM_PCI_RAMBASE_43602	0x180000	/* per-chip TCM base */
+#define	BWFM_PCI_FW_VERSTRING_MAX	256
+
+/*
+ * Minimal synthetic NVRAM for the BCM43602 on Apple A1398.
+ *
+ * No per-board NVRAM file is used.  This is the smallest set of fields
+ * the firmware needs to complete its boot handshake (writing the
+ * shared-memory pointer to BAR2[rambase+ramsize-4]).  Radio
+ * calibration (antenna switch tables, PA cal, BT coex) is omitted, so
+ * the chip falls back to its on-die fuse defaults: the link works but
+ * is not tuned for the board.
+ *
+ * Field choices:
+ *   manfid    = 0x14e4   Broadcom (chip rejects mismatched manfid)
+ *   prodid    = 0xaa52   BCM43602 chip ID
+ *   devid     = 0x43ba   PCI device ID (cfg space matches)
+ *   boardvendor=0x106b   Apple (subv in cfg 0x2C)
+ *   boardtype = 0x0152   Apple A1398 SS-device ID
+ *   boardrev  = 0x1319   Apple A1398 board revision
+ *   sromrev   = 11       SROM v11 format (43602a1 expects this; v12 is
+ *                        4378+)
+ *   boardflags*          Conservative Apple-style flags from a public
+ *                        43602a1 reference NVRAM
+ *   macaddr   = template; firmware overwrites from eFuse on boot
+ *   ccode/regrev         FCC defaults; net80211 sets real cc later
+ *   aa2g / aa5g = 3      Both antenna chains live
+ */
+static const char bwfm_pci_minimal_nvram[] =
+	"manfid=0x14e4\0"
+	"prodid=0xaa52\0"
+	"devid=0x43ba\0"
+	"boardvendor=0x106b\0"
+	"boardtype=0x0152\0"
+	"boardrev=0x1319\0"
+	"sromrev=12\0"
+	"boardflags=0x82482001\0"
+	"boardflags2=0x40000000\0"
+	"boardflags3=0x44004404\0"
+	"macaddr=00:90:4c:c5:43:60\0"
+	"ccode=ALL\0"
+	"regrev=0\0"
+	"aa2g=3\0"
+	"aa5g=3\0"
+	"agbg0=2\0"
+	"agbg1=2\0"
+	"aga0=2\0"
+	"aga1=2\0"
+	"antswitch=0\0"
+	"\0\0";	/* double-NUL terminator */
+
+/* ARM-CR4 core register offsets used during enter_download_state. */
+#define	BWFM_ARMCR4_BANKIDX	0x40
+#define	BWFM_ARMCR4_BANKPDA	0x4c
+
+/*
+ * PCIe2 core "internal config" backdoor: CONFIGADDR is the index
+ * register (which internal config word to access); CONFIGDATA is
+ * read/write to it.  Live at BAR0[0x120] / BAR0[0x124] when the
+ * SBTOPCI window is pointed at the PCIe2 core (chip backplane
+ * 0x18003000).  Used to resize the BAR2 aperture so it maps chip
+ * TCM; without it a single BAR2 write target-aborts the host.
+ */
+#define	BWFM_PCIE2_CONFIGADDR	0x120
+#define	BWFM_PCIE2_CONFIGDATA	0x124
+#define	BWFM_PCIE2_CFG_BAR2RESIZE	0x4e0	/* internal cfg index */
+
+/* ChipCommon clock control and status. */
+#define	BWFM_CC_CLK_CTL_ST		0x1e0
+#define	BWFM_CC_CLK_HAVEHT		0x00020000
+
+/* ChipCommon PMU register block, relative to the ChipCommon base. */
+#define	BWFM_CC_PMU_CTRL		0x600
+#define	BWFM_CC_PMU_CAP			0x604
+#define	BWFM_CC_PMU_STATUS		0x608
+#define	BWFM_CC_PMU_RES_STATE		0x60c
+#define	BWFM_CC_PMU_RES_PENDING		0x610
+#define	BWFM_CC_PMU_TIMER		0x614
+#define	BWFM_CC_PMU_MIN_RES_MASK	0x618
+#define	BWFM_CC_PMU_MAX_RES_MASK	0x61c
+#define	BWFM_CC_PMU_RES_TABLE_SEL	0x620
+#define	BWFM_CC_PMU_RES_DEP_MASK	0x624
+#define	BWFM_CC_PMU_RES_UPDN_TIMER	0x628
+#define	BWFM_CC_PMU_RES_TIMER		0x62c
+#define	BWFM_CC_PMU_CHIPCONTROL_ADDR	0x650
+#define	BWFM_CC_PMU_CHIPCONTROL_DATA	0x654
+#define	BWFM_CC_PMU_REGCONTROL_ADDR	0x658
+#define	BWFM_CC_PMU_REGCONTROL_DATA	0x65c
+#define	BWFM_CC_PMU_PLLCONTROL_ADDR	0x660
+#define	BWFM_CC_PMU_PLLCONTROL_DATA	0x664
+
+/*
+ * BCMA core wrapper registers.  Live at <core->wrap> + offset.
+ * IOCTL gates the core's clock + power; RESET_CTL holds it in or
+ * brings it out of reset.  These are accessible whenever the
+ * backplane interconnect is alive — they're how the host turns
+ * cores on, so they must be reachable even when the core itself
+ * is off.
+ */
+#define	BWFM_BCMA_IOCTL		0x408
+#define	BWFM_BCMA_IOCTL_CLK	0x1
+#define	BWFM_BCMA_IOCTL_FGC	0x2
+#define	BWFM_BCMA_RESET_CTL	0x800
+#define	BWFM_BCMA_RESET_CTL_RESET	0x1
+#define	BWFM_ARMCR4_IOCTL_CPUHALT	0x20
+
+/*
+ * D11 (802.11 MAC) core IOCTL bits.  Used by chip_set_passive to put
+ * D11 into "PHY clock on, PHY reset asserted" before firmware load;
+ * without this the WiFi MAC core can interact with shared
+ * resources in ways that prevent the ARM-CR4 firmware from
+ * completing its early init handshake.
+ */
+#define	BWFM_D11_IOCTL_PHYCLOCKEN	0x4
+#define	BWFM_D11_IOCTL_PHYRESET		0x8
+
+/* ARM-CR4 core registers (offsets within core->base). */
+#define	BWFM_ARMCR4_CAP		0x04
+#define	BWFM_ARMCR4_BANKINFO	0x44	/* paired with BANKIDX at 0x40 */
+#define	BWFM_ARMCR4_TCBANB_MASK	0x0000000fU
+#define	BWFM_ARMCR4_TCBBNB_MASK	0x000000f0U
+#define	BWFM_ARMCR4_TCBBNB_SHIFT	4
+#define	BWFM_ARMCR4_BSZ_MASK	0x0000007fU
+#define	BWFM_ARMCR4_BLK_1K_MASK	0x00000200U
+#define	BWFM_ARMCR4_BSZ_MULT	8192
+
+/*
+ * Take a core out of reset and turn its clock on.  This is the
+ * minimal "enable core" sequence for the common case where the
+ * core is currently held in reset and we want it running with no
+ * special IOCTL flags.
+ *
+ *   poll wrap+RESET_CTL writing 0 until the reset bit clears
+ *   write postreset|CLK to wrap+IOCTL
+ *   read wrap+IOCTL to flush
+ *
+ * Call only once the wrap registers are known to be readable, i.e.
+ * the backplane interconnect is alive.
+ */
+static int
+bwfm_pci_core_enable(struct bwfm_pci_softc *sc, uint16_t coreid,
+    uint32_t postreset)
+{
+	uint32_t wrap = 0;
+	uint32_t v;
+	int i, count;
+
+	for (i = 0; i < sc->sc_ncores; i++) {
+		if (sc->sc_cores[i].id == coreid) {
+			wrap = sc->sc_cores[i].wrap;
+			break;
+		}
+	}
+	if (wrap == 0) {
+		device_printf(sc->sc_dev,
+		    "core_enable: %s (0x%03x) has no wrap base\n",
+		    bwfm_pci_core_name(coreid), coreid);
+		return (ENOENT);
+	}
+
+	bwfm_pci_set_window(sc, wrap);
+
+	/* Poll RESET_CTL — write 0 until bit 0 clears, up to ~2.5 ms. */
+	count = 0;
+	while (((v = bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK)) &
+	    BWFM_BCMA_RESET_CTL_RESET) != 0) {
+		bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
+		    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK, 0);
+		count++;
+		if (count > 50)
+			break;
+		DELAY(50);
+	}
+	PDPRINTF(sc, 0,
+	    "core_enable: %s RESET_CTL = 0x%08x after %d poll(s)\n",
+	    bwfm_pci_core_name(coreid), v, count);
+
+	/* Write IOCTL: postreset | CLK. */
+	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK,
+	    postreset | BWFM_BCMA_IOCTL_CLK);
+	v = bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
+	PDPRINTF(sc, 0,
+	    "core_enable: %s IOCTL after write = 0x%08x\n",
+	    bwfm_pci_core_name(coreid), v);
+
+	return (0);
+}
+
+/*
+ * Release ARM-CR4 from reset, which boots the firmware.
+ *
+ * BCM43602 path:
+ *
+ *   1. Reset vector at TCM[0] (BAR2 + rambase + 0).  Already the
+ *      first dword of the firmware blob from our upload; we read it
+ *      back for logging.
+ *   2. ai_coredisable(ARM_CR4, prereset=CPUHALT, reset=0):
+ *        - if not in reset: IOCTL = CPUHALT|FGC|CLK ; RESET_CTL = 1 ;
+ *          poll until RESET_CTL reads back 1
+ *        - in-reset configure: IOCTL = FGC|CLK (no CPUHALT)
+ *   3. Poll RESET_CTL writing 0 until reset bit clears.
+ *   4. Postreset: IOCTL = CLK only; the CPU starts at rstvec.
+ *
+ * Once the firmware is up it writes its pciedev_shared_t pointer to
+ * BAR2[rambase + ramsize - 4], which the caller polls.
+ */
+static int
+bwfm_pci_armcr4_release(struct bwfm_pci_softc *sc)
+{
+	uint32_t wrap = 0;
+	uint32_t rstvec, ioctl, reset;
+	int i, count;
+
+	for (i = 0; i < sc->sc_ncores; i++) {
+		if (sc->sc_cores[i].id == BWFM_CORE_ARM_CR4) {
+			wrap = sc->sc_cores[i].wrap;
+			break;
+		}
+	}
+	if (wrap == 0) {
+		device_printf(sc->sc_dev,
+		    "armcr4_release: ARM-CR4 wrap base unknown\n");
+		return (ENOENT);
+	}
+	if (sc->sc_bar2 == NULL) {
+		device_printf(sc->sc_dev,
+		    "armcr4_release: BAR2 not allocated\n");
+		return (ENXIO);
+	}
+
+	/*
+	 * Rstvec is the first 4 bytes of the firmware image, a Thumb-2
+	 * B.W instruction that branches to the real entry point.
+	 * load_firmware already put it at BAR2[rambase], so read it back
+	 * from there to log and validate it.
+	 */
+	{
+	uint32_t rambase = sc->sc_chip ? sc->sc_chip->rambase :
+	    BWFM_PCI_RAMBASE_43602;
+	rstvec = bus_space_read_4(sc->sc_bar2_t, sc->sc_bar2_h, rambase);
+	PDPRINTF(sc, 0,
+	    "armcr4_release: firmware[0] (rstvec value) = 0x%08x "
+	    "(rambase=0x%x)\n", rstvec, rambase);
+	}
+	if (rstvec == 0 || rstvec == 0xffffffffU) {
+		device_printf(sc->sc_dev,
+		    "armcr4_release: reset vector looks invalid; "
+		    "skip (run load_fw first)\n");
+		return (ENXIO);
+	}
+
+	/*
+	 * Write rstvec at BAR2[0] (chip address 0), where the CR4 fetches
+	 * its first instruction on reset release.  That is a different
+	 * location from BAR2[rambase], where the image was loaded; with
+	 * it uninitialised the CPU fetches garbage and halts.  Linux
+	 * likewise writes the image at tcm + rambase and the reset vector
+	 * at tcm + 0 (brcmf_pcie_buscore_activate).
+	 */
+	bus_space_write_4(sc->sc_bar2_t, sc->sc_bar2_h, 0, rstvec);
+	(void)bus_space_read_4(sc->sc_bar2_t, sc->sc_bar2_h, 0);
+
+	bwfm_pci_set_window(sc, wrap);
+
+	/*
+	 * Full ai_resetcore(CR4, CPUHALT, 0, 0).  Toggling CPUHALT alone
+	 * is not enough: without asserting RESET_CTL the CR4 resumes
+	 * from wherever it was (firmware macOS left running, or
+	 * a halted state) instead of starting the new image.
+	 *
+	 *   1. IOCTL = CPUHALT | FGC | CLK    (halt CPU, force clock)
+	 *   2. RESET_CTL = 1                  (assert reset), short delay
+	 *   3. IOCTL = FGC | CLK              (in-reset config)
+	 *   4. RESET_CTL = 0                  (deassert), short delay
+	 *   5. IOCTL = CLK only               (running)
+	 */
+
+	/* 1. Halt CPU + gate clock (pre-reset). */
+	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK,
+	    BWFM_ARMCR4_IOCTL_CPUHALT | BWFM_BCMA_IOCTL_FGC |
+	    BWFM_BCMA_IOCTL_CLK);
+	(void)bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
+
+	/* 2. Assert reset. */
+	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK,
+	    BWFM_BCMA_RESET_CTL_RESET);
+	(void)bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
+	DELAY(20);
+
+	/* 3. In-reset config; dropping CPUHALT clears it while in reset. */
+	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK,
+	    BWFM_BCMA_IOCTL_FGC | BWFM_BCMA_IOCTL_CLK);
+	(void)bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
+
+	/* 4. Deassert reset; the CR4 starts executing. */
+	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK, 0);
+	(void)bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
+	DELAY(2);
+
+	/* 5. Postreset: drop FGC so clock runs normally. */
+	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK,
+	    BWFM_BCMA_IOCTL_CLK);
+	(void)bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
+	(void)count;
+
+	/* Read final state for the log. */
+	ioctl = bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
+	reset = bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
+	PDPRINTF(sc, 0,
+	    "armcr4_release: ARM-CR4 running.  IOCTL=0x%08x RESET_CTL=0x%08x "
+	    "rstvec=0x%08x\n", ioctl, reset, rstvec);
+	return (0);
+}
+
+/*
+ * Compute total TCM (chip RAM) size from ARM-CR4 CAP + per-bank
+ * BANKINFO registers.  Returns 0 on success and fills *ramsize_p.
+ */
+static int
+bwfm_pci_ramsize_query(struct bwfm_pci_softc *sc, uint32_t *ramsize_p)
+{
+	uint32_t cr4_base = 0;
+	uint32_t cap, info, blksize;
+	uint32_t totb, nab, nbb;
+	uint32_t memsize = 0, idx;
+	int i, rc;
+
+	for (i = 0; i < sc->sc_ncores; i++) {
+		if (sc->sc_cores[i].id == BWFM_CORE_ARM_CR4) {
+			cr4_base = sc->sc_cores[i].base;
+			break;
+		}
+	}
+	if (cr4_base == 0)
+		return (ENOENT);
+
+	/* CAP + BANKIDX/BANKINFO reads require ARM-CR4 clock on. */
+	rc = bwfm_pci_core_enable(sc, BWFM_CORE_ARM_CR4,
+	    BWFM_ARMCR4_IOCTL_CPUHALT);
+	if (rc != 0)
+		return (rc);
+
+	bwfm_pci_set_window(sc, cr4_base);
+	cap = bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_ARMCR4_CAP & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
+	nab = cap & BWFM_ARMCR4_TCBANB_MASK;
+	nbb = (cap & BWFM_ARMCR4_TCBBNB_MASK) >> BWFM_ARMCR4_TCBBNB_SHIFT;
+	totb = nab + nbb;
+	PDPRINTF(sc, 0,
+	    "ramsize_query: ARM-CR4 CAP=0x%08x A-banks=%u B-banks=%u total=%u\n",
+	    cap, nab, nbb, totb);
+
+	for (idx = 0; idx < totb; idx++) {
+		bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
+		    BWFM_ARMCR4_BANKIDX & BWFM_PCI_BAR0_WINDOW_OFF_MASK,
+		    idx);
+		info = bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
+		    BWFM_ARMCR4_BANKINFO & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
+		blksize = (info & BWFM_ARMCR4_BLK_1K_MASK) ?
+		    1024 : BWFM_ARMCR4_BSZ_MULT;
+		memsize += ((info & BWFM_ARMCR4_BSZ_MASK) + 1) * blksize;
+		PDPRINTF(sc, 0,
+		    "ramsize_query:   bank %u INFO=0x%08x blk=%u "
+		    "size=%u running total=%u\n",
+		    idx, info, blksize,
+		    ((info & BWFM_ARMCR4_BSZ_MASK) + 1) * blksize, memsize);
+	}
+	/* All of RAM must lie inside the BAR2 window. */
+	if (memsize == 0 || sc->sc_bar2 == NULL ||
+	    (uint64_t)bwfm_pci_msgbuf_rambase(sc) + memsize >
+	    rman_get_size(sc->sc_bar2)) {
+		device_printf(sc->sc_dev,
+		    "ramsize_query: RAM size 0x%x does not fit BAR2\n",
+		    memsize);
+		return (EIO);
+	}
+	*ramsize_p = memsize;
+	PDPRINTF(sc, 0,
+	    "ramsize_query: total RAM = %u bytes (0x%x)\n",
+	    memsize, memsize);
+	return (0);
+}
+
+/*
+ * Upload the minimal synthetic NVRAM to chip TCM and append the trailer
+ * firmware uses to find it:
+ *
+ *   TCM[rambase + ramsize - nvram_len_padded - 4] = NVRAM bytes
+ *   TCM[rambase + ramsize - 4]                    = trailer dword
+ *
+ *   trailer = (~len_low16) << 16 | (len/4) & 0xffff
+ *
+ * After ARM release, firmware walks down from TCM end, reads the
+ * trailer, validates the inverted-length checksum, then parses the
+ * NVRAM bytes preceding it.  The trailer doubles as the handshake
+ * cell: firmware overwrites it with its shared-memory structure
+ * pointer once init completes, which is what wait_fw_ready polls for.
+ *
+ * Returns 0 on success.  Run after load_fw and before armcr4_release.
+ */
+/*
+ * Random-seed prelude, as Linux brcmfmac writes it: 256 bytes of random data
+ * followed by an 8-byte {length, magic} footer just below the NVRAM.
+ * Off by default (dev.bwfm_pci_nvram_seed_enable): with it on, the
+ * BCM43602 firmware never writes sharedram_addr, and the right
+ * condition and format for the seed are not known.
+ */
+#define	BWFM_PCI_RANDOM_SEED_LENGTH	0x100u
+#define	BWFM_PCI_RANDOM_SEED_MAGIC	0xfeedc0deu
+
+static int bwfm_pci_nvram_seed_enable = 0;
+SYSCTL_INT(_dev, OID_AUTO, bwfm_pci_nvram_seed_enable, CTLFLAG_RWTUN,
+    &bwfm_pci_nvram_seed_enable, 0,
+    "Emit random-seed prelude in nvram_inject (0=off, 1=on).");
+
+static int
+bwfm_pci_nvram_inject(struct bwfm_pci_softc *sc)
+{
+	device_t dev = sc->sc_dev;
+	uint32_t ramsize, off, trailer;
+	uint32_t nvram_len, nvram_len_padded;
+	uint32_t seed_footer_off, seed_bytes_off;
+	uint8_t randbuf[BWFM_PCI_RANDOM_SEED_LENGTH];
+	size_t i;
+	int error;
+	bool use_seed = (bwfm_pci_nvram_seed_enable != 0);
+
+	error = bwfm_pci_ramsize_query(sc, &ramsize);
+	if (error != 0)
+		return (error);
+
+	/*
+	 * Compute padded length.  The blob is built as a series of
+	 * NUL-terminated key=value pairs followed by an extra NUL;
+	 * brcmf treats the final \0\0 as the terminator.  Strip the
+	 * compiler's automatic trailing \0 from sizeof to match.
+	 */
+	nvram_len = (uint32_t)(sizeof(bwfm_pci_minimal_nvram) - 1);
+	nvram_len_padded = (nvram_len + 3) & ~3U;
+
+	{
+		uint32_t need = nvram_len_padded + 4;
+		if (use_seed)
+			need += 8 + BWFM_PCI_RANDOM_SEED_LENGTH;
+		if (need > ramsize) {
+			device_printf(dev,
+			    "nvram_inject: needed %u > ramsize %u\n",
+			    need, ramsize);
+			return (EFBIG);
+		}
+	}
+
+	{
+	uint32_t rambase = sc->sc_chip ? sc->sc_chip->rambase :
+	    BWFM_PCI_RAMBASE_43602;
+	off = rambase + ramsize - nvram_len_padded - 4;
+	seed_footer_off = off - 8;
+	seed_bytes_off = seed_footer_off - BWFM_PCI_RANDOM_SEED_LENGTH;
+
+	if (use_seed) {
+		PDPRINTF(sc, 0,
+		    "nvram_inject: nvram=%u@BAR2+0x%x trailer@BAR2+0x%x "
+		    "seed_footer@BAR2+0x%x seed_bytes(256)@BAR2+0x%x\n",
+		    nvram_len, off, rambase + ramsize - 4,
+		    seed_footer_off, seed_bytes_off);
+	} else {
+		PDPRINTF(sc, 0,
+		    "nvram_inject: writing %u bytes (padded %u) at BAR2+0x%x; "
+		    "trailer at BAR2+0x%x\n",
+		    nvram_len, nvram_len_padded, off,
+		    rambase + ramsize - 4);
+	}
+	}
+
+	/* Byte-by-byte write of the NVRAM body. */
+	for (i = 0; i < nvram_len; i++) {
+		bus_space_write_1(sc->sc_bar2_t, sc->sc_bar2_h, off + i,
+		    (uint8_t)bwfm_pci_minimal_nvram[i]);
+	}
+	/* Zero-pad the tail to 4-byte alignment. */
+	for (i = nvram_len; i < nvram_len_padded; i++) {
+		bus_space_write_1(sc->sc_bar2_t, sc->sc_bar2_h, off + i, 0);
+	}
+
+	if (use_seed) {
+		/*
+		 * Random-seed footer + entropy layout:
+		 *   [seed_bytes_off .. +0x100) 256 bytes entropy
+		 *   [seed_footer_off .. +8)    {length=0x100, magic=0xfeedc0de}
+		 *   [nvram_off .. +nvram)      key=value\0 pairs
+		 *   [ramsize-4]                NVRAM trailer / handshake cell
+		 */
+		arc4random_buf(randbuf, sizeof(randbuf));
+		for (i = 0; i < sizeof(randbuf); i++) {
+			bus_space_write_1(sc->sc_bar2_t, sc->sc_bar2_h,
+			    seed_bytes_off + i, randbuf[i]);
+		}
+		bus_space_write_4(sc->sc_bar2_t, sc->sc_bar2_h,
+		    seed_footer_off + 0,
+		    htole32(BWFM_PCI_RANDOM_SEED_LENGTH));
+		bus_space_write_4(sc->sc_bar2_t, sc->sc_bar2_h,
+		    seed_footer_off + 4,
+		    htole32(BWFM_PCI_RANDOM_SEED_MAGIC));
+	}
+
+	/*
+	 * Trailer dword:
+	 *   low16  = dword count of the padded nvram payload
+	 *   high16 = ones' complement of low16
+	 * Firmware reads the trailer, validates ~low16 == high16, and
+	 * trusts the low16 as the dword count to scan back through.
+	 */
+	{
+		uint16_t dwords = (uint16_t)(nvram_len_padded / 4);
+		uint16_t inv = (uint16_t)~dwords;
+
+		uint32_t rambase = sc->sc_chip ? sc->sc_chip->rambase :
+		    BWFM_PCI_RAMBASE_43602;
+		trailer = ((uint32_t)inv << 16) | dwords;
+		bus_space_write_4(sc->sc_bar2_t, sc->sc_bar2_h,
+		    rambase + ramsize - 4, trailer);
+	}
+	return (0);
+}
+
+/*
+ * Full reset cycle on SOCRAM, specific to the BCM43602.
+ *
+ * The 43602's SOCRAM controller caches bus state that goes stale
+ * once the firmware has been copied to TCM; without this reset the
+ * ARM-CR4 fetches garbage on its first instruction load and faults
+ * immediately (the ARM runs but makes no memory writes).
+ *
+ * Equivalent to brcmf_chip_resetcore(SOCRAM, 0, 0, 0):
+ *   1. ai_coredisable: force into reset (IOCTL = FGC|CLK, RESET_CTL=1)
+ *   2. in-reset configure (IOCTL = FGC|CLK with reset=0 fields)
+ *   3. poll RESET_CTL writing 0 until clear
+ *   4. final IOCTL = CLK only
+ *
+ * bwfm_pci_bringup_sequence calls it as step 5, before
+ * load_firmware, and skips the post-upload step 7.  That differs
+ * from Linux, which runs this same resetcore on 43602 after the
+ * upload, in brcmf_pcie_exit_download_state.
+ */
+static int
+bwfm_pci_exit_download_state(struct bwfm_pci_softc *sc)
+{
+	uint32_t wrap = 0;
+	uint32_t v;
+	int i, count;
+
+	if (!sc->sc_chip_alive)
+		return (ENXIO);
+
+	for (i = 0; i < sc->sc_ncores; i++) {
+		if (sc->sc_cores[i].id == BWFM_CORE_SOCRAM) {
+			wrap = sc->sc_cores[i].wrap;
+			break;
+		}
+	}
+	if (wrap == 0) {
+		device_printf(sc->sc_dev,
+		    "exit_download_state: no SOCRAM core wrap; skipping\n");
+		return (ENOENT);
+	}
+
+	bwfm_pci_set_window(sc, wrap);
+
+	/* 1. Pre-reset IOCTL = 0 | FGC | CLK. */
+	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK,
+	    BWFM_BCMA_IOCTL_FGC | BWFM_BCMA_IOCTL_CLK);
+	(void)bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
+
+	/* 2. Put in reset. */
+	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK,
+	    BWFM_BCMA_RESET_CTL_RESET);
+	DELAY(20);
+
+	/* 3. Spin until RESET_CTL reads back as 1. */
+	count = 0;
+	while ((bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK) &
+	    BWFM_BCMA_RESET_CTL_RESET) == 0) {
+		if (++count > 300)
+			break;
+		DELAY(10);
+	}
+
+	/* 4. In-reset configure: IOCTL = FGC|CLK (reset field is 0). */
+	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK,
+	    BWFM_BCMA_IOCTL_FGC | BWFM_BCMA_IOCTL_CLK);
+	(void)bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
+
+	/* 5. Release reset — poll writing 0. */
+	count = 0;
+	while ((bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK) &
+	    BWFM_BCMA_RESET_CTL_RESET) != 0) {
+		bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
+		    BWFM_BCMA_RESET_CTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK, 0);
+		if (++count > 50)
+			break;
+		DELAY(50);
+	}
+
+	/* 6. Postreset: IOCTL = CLK only. */
+	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK,
+	    BWFM_BCMA_IOCTL_CLK);
+	v = bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_BCMA_IOCTL & BWFM_PCI_BAR0_WINDOW_OFF_MASK);
+
+	PDPRINTF(sc, 0,
+	    "exit_download_state: SOCRAM resetcore complete (IOCTL=0x%08x)\n",
+	    v);
+	return (0);
+}
+
+/*
+ * BCM43602 PMU init tables.  The values are Broadcom's
+ * bcm43602_res_updown, bcm43602_res_depend and bcm43602_res_pciewar
+ * from hndpmu.c (ISC licence, as shipped in the asuswrt-merlin.ng and
+ * FreshTomato router sources), stored here as little-endian bytes.
+ *
+ * Broadcom's si_pmu_res_init walks each table backwards, with a
+ * per-chip entry count:
+ *   updown: count=3   (the last 8 B entry is a zeroed sentinel)
+ *   depend: count=4
+ *   pciewar: count=8
+ *
+ * res_updown entry layout (8 B):
+ *   +0..3: u32 resnum       (only low byte used as resource index)
+ *   +4..7: u32 updn_val     (written to RES_UPDN_TIMER 0x628)
+ *
+ * res_depend / res_pciewar entry layout (24 B each):
+ *   +0..3:  u32 res_mask    (bitmap of resources to touch)
+ *   +4..7:  u32 action      (0=SET, 1=ADD, 0xff=REMOVE)
+ *   +8..11: u32 dep_mask    (dependency bits to apply)
+ *   +12..23: padding (zeros)
+ *
+ * For each entry the walker does, per bit set in res_mask:
+ *   RES_TABLE_SEL (0x620) = res_index
+ *   read RES_DEP_MASK (0x624) -> cur
+ *   apply action(cur, dep_mask) -> new
+ *   RES_DEP_MASK (0x624) = new
+ *
+ * pciewar is applied after depend through the same code path; it
+ * adds PCIe-related dependencies on top of the base graph.
+ */
+
+static const uint8_t bcm43602_res_updown[32] = {
+	0x0d, 0x00, 0x00, 0x00, 0x19, 0x00, 0x19, 0x00,
+	0x0a, 0x00, 0x00, 0x00, 0x02, 0x00, 0x28, 0x00,
+	0x15, 0x00, 0x00, 0x00, 0x05, 0x00, 0x43, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+static const uint8_t bcm43602_res_depend[96] = {
+	0x00, 0xf2, 0xef, 0x01, 0x01, 0x00, 0x00, 0x00,
+	0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x80, 0x73, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00,
+	0x10, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x08, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+	0x80, 0x33, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0xe8, 0x01, 0xff, 0x00, 0x00, 0x00,
+	0x00, 0x80, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+static const uint8_t bcm43602_res_pciewar[192] = {
+	0x00, 0x08, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+	0x16, 0x04, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00,
+	0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+	0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00,
+	0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00,
+	0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x40, 0x00, 0x01, 0x00, 0x00, 0x00,
+	0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x80, 0x00, 0x01, 0x00, 0x00, 0x00,
+	0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00,
+	0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+static inline uint32_t
+bwfm_pci_pmu_read(struct bwfm_pci_softc *sc, uint32_t off)
+{
+	return (bus_space_read_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    off & BWFM_PCI_BAR0_WINDOW_OFF_MASK));
+}
+
+static inline void
+bwfm_pci_pmu_write(struct bwfm_pci_softc *sc, uint32_t off, uint32_t val)
+{
+	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    off & BWFM_PCI_BAR0_WINDOW_OFF_MASK, val);
+}
+
+/*
+ * Apply one dep-table entry: for each bit set in res_mask, select the
+ * resource via RES_TABLE_SEL then RMW its RES_DEP_MASK per action.
+ * Actions, as in Broadcom's si_pmu_resdeptbl_upd:
+ *   0    = SET    (replace deps)
+ *   1    = ADD    (OR in deps)
+ *   0xff = REMOVE (clear deps; -1 in Broadcom's int8 field)
+ * Only the first nres resources exist on the chip.
+ */
+static void
+bwfm_pci_pmu_dep_apply(struct bwfm_pci_softc *sc, const char *tag,
+    int idx, uint32_t res_mask, uint32_t action, uint32_t dep_mask,
+    int nres)
+{
+	uint32_t cur, new;
+	int bit;
+
+	if (res_mask == 0)
+		return;
+	PDPRINTF(sc, 0,
+	    "pmu_init: %s[%d] res_mask=0x%08x action=%u dep_mask=0x%08x\n",
+	    tag, idx, res_mask, action, dep_mask);
+	for (bit = 0; bit < nres && bit < 32; bit++) {
+		if ((res_mask & (1u << bit)) == 0)
+			continue;
+		bwfm_pci_pmu_write(sc, BWFM_CC_PMU_RES_TABLE_SEL, bit);
+		cur = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_RES_DEP_MASK);
+		switch (action & 0xff) {
+		case 0x00: new = dep_mask; break;
+		case 0x01: new = cur | dep_mask; break;
+		case 0xff: new = cur & ~dep_mask; break;
+		default:   new = cur; break;
+		}
+		bwfm_pci_pmu_write(sc, BWFM_CC_PMU_RES_DEP_MASK, new);
+		PDPRINTF(sc, 0,
+		    "pmu_init: %s[%d] res %2d: DEP 0x%08x -> 0x%08x\n",
+		    tag, idx, bit, cur, new);
+	}
+}
+
+/*
+ * BCM43602 PMU init, after si_pmu_res_init in Broadcom's hndpmu.c.
+ * On cold silicon this must run before firmware
+ * upload so the PMU resource-dependency graph and up/down timers match
+ * what the firmware's PA init assumes.
+ */
+static int
+bwfm_pci_pmu_init_43602(struct bwfm_pci_softc *sc)
+{
+	uint32_t cc_base = 0;
+	uint32_t reg, val, res_mask, action, dep_mask, updn;
+	uint8_t resnum;
+	const uint8_t *e;
+	int i, nres;
+
+	for (i = 0; i < sc->sc_ncores; i++) {
+		if (sc->sc_cores[i].id == BWFM_CORE_CHIPCOMMON) {
+			cc_base = sc->sc_cores[i].base;
+			break;
+		}
+	}
+	if (cc_base == 0) {
+		device_printf(sc->sc_dev,
+		    "pmu_init: ChipCommon base unknown; run core_walk first\n");
+		return (ENOENT);
+	}
+	if (!sc->sc_chip_alive)
+		return (ENXIO);
+
+	bwfm_pci_set_window(sc, cc_base);
+
+	reg = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_CAP);
+	nres = (reg >> 8) & 0x1f;
+	PDPRINTF(sc, 0,
+	    "pmu_init: pmucap=0x%08x pmurev=%u num_res=%d\n",
+	    reg, reg & 0xff, nres);
+	reg = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_MIN_RES_MASK);
+	val = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_MAX_RES_MASK);
+	PDPRINTF(sc, 0,
+	    "pmu_init: min_res_mask=0x%08x max_res_mask=0x%08x (before)\n",
+	    reg, val);
+
+	/* res_updown: 3 entries + 1 sentinel; skip resnum == 0. */
+	for (i = 0; i < 3; i++) {
+		e = bcm43602_res_updown + i * 8;
+		resnum = e[0];
+		updn = e[4] | (e[5] << 8) | (e[6] << 16) | (e[7] << 24);
+		if (resnum == 0)
+			continue;
+		PDPRINTF(sc, 0,
+		    "pmu_init: updown[%d] res %u updn=0x%08x\n",
+		    i, resnum, updn);
+		bwfm_pci_pmu_write(sc, BWFM_CC_PMU_RES_TABLE_SEL, resnum);
+		bwfm_pci_pmu_write(sc, BWFM_CC_PMU_RES_UPDN_TIMER, updn);
+	}
+
+	/* res_depend: 4 entries × 24 B, last first as Broadcom does. */
+	for (i = 3; i >= 0; i--) {
+		e = bcm43602_res_depend + i * 24;
+		res_mask = e[0] | (e[1] << 8) | (e[2] << 16) | (e[3] << 24);
+		action   = e[4] | (e[5] << 8) | (e[6] << 16) | (e[7] << 24);
+		dep_mask = e[8] | (e[9] << 8) | (e[10] << 16) | (e[11] << 24);
+		bwfm_pci_pmu_dep_apply(sc, "depend", i, res_mask, action,
+		    dep_mask, nres);
+	}
+
+	/* res_pciewar: 8 entries × 24 B, same walker as depend. */
+	for (i = 7; i >= 0; i--) {
+		e = bcm43602_res_pciewar + i * 24;
+		res_mask = e[0] | (e[1] << 8) | (e[2] << 16) | (e[3] << 24);
+		action   = e[4] | (e[5] << 8) | (e[6] << 16) | (e[7] << 24);
+		dep_mask = e[8] | (e[9] << 8) | (e[10] << 16) | (e[11] << 24);
+		bwfm_pci_pmu_dep_apply(sc, "pciewar", i, res_mask, action,
+		    dep_mask, nres);
+	}
+
+	DELAY(1000);
+
+	reg = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_MIN_RES_MASK);
+	val = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_MAX_RES_MASK);
+	PDPRINTF(sc, 0,
+	    "pmu_init: min_res_mask=0x%08x max_res_mask=0x%08x (after)\n",
+	    reg, val);
+	reg = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_RES_STATE);
+	PDPRINTF(sc, 0,
+	    "pmu_init: res_state=0x%08x (after)\n", reg);
+
+	return (0);
+}
+
+/*
+ * BCM43602 PLL setup, as Broadcom's hndpmu.c does it with
+ * si_set_bb_vcofreq_frac(sih, osh, 960, 98, 40): a 960 MHz VCO from
+ * the 40 MHz crystal.
+ *   PLL_CNTRL_ADDR2 = 24 << 7 | 3 << 4 | 1   = 0x00000c31
+ *   PLL_CNTRL_ADDR3 = (98 << 24) / 400000    = 0x0000100e
+ *
+ * This runs before firmware upload.
+ *
+ * Access pattern is standard Broadcom PMU indirect:
+ *   PLLCONTROL_ADDR (cc+0x660) = plli index
+ *   PLLCONTROL_DATA (cc+0x664) = value
+ * A dummy read of ADDR barriers the index write.
+ */
+static int
+bwfm_pci_pll_init_43602(struct bwfm_pci_softc *sc)
+{
+	static const struct { uint32_t idx; uint32_t val; } pll_writes[] = {
+		{ 2, 0x00000c31 },   /* PLL_CNTRL_ADDR2 */
+		{ 3, 0x0000100e },   /* PLL_CNTRL_ADDR3 (Fractional) */
+	};
+	uint32_t cc_base = 0, readback;
+	int i;
+
+	for (i = 0; i < sc->sc_ncores; i++) {
+		if (sc->sc_cores[i].id == BWFM_CORE_CHIPCOMMON) {
+			cc_base = sc->sc_cores[i].base;
+			break;
+		}
+	}
+	if (cc_base == 0) {
+		device_printf(sc->sc_dev,
+		    "pll_init: ChipCommon base unknown\n");
+		return (ENOENT);
+	}
+	if (!sc->sc_chip_alive)
+		return (ENXIO);
+
+	bwfm_pci_set_window(sc, cc_base);
+
+	/* Broadcom leaves the PLL alone once the HT clock is up. */
+	if (bwfm_pci_pmu_read(sc, BWFM_CC_CLK_CTL_ST) & BWFM_CC_CLK_HAVEHT) {
+		PDPRINTF(sc, 0, "pll_init: HT clock up, PLL left as is\n");
+		return (0);
+	}
+
+	for (i = 0; i < (int)nitems(pll_writes); i++) {
+		bwfm_pci_pmu_write(sc, BWFM_CC_PMU_PLLCONTROL_ADDR,
+		    pll_writes[i].idx);
+		(void)bwfm_pci_pmu_read(sc, BWFM_CC_PMU_PLLCONTROL_ADDR);
+		bwfm_pci_pmu_write(sc, BWFM_CC_PMU_PLLCONTROL_DATA,
+		    pll_writes[i].val);
+		/* Read back for logging: re-select, then read data. */
+		bwfm_pci_pmu_write(sc, BWFM_CC_PMU_PLLCONTROL_ADDR,
+		    pll_writes[i].idx);
+		(void)bwfm_pci_pmu_read(sc, BWFM_CC_PMU_PLLCONTROL_ADDR);
+		readback = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_PLLCONTROL_DATA);
+		PDPRINTF(sc, 0,
+		    "pll_init: PLLCONTROL[%u] wrote 0x%08x, readback 0x%08x\n",
+		    pll_writes[i].idx, pll_writes[i].val, readback);
+	}
+
+	/*
+	 * PLL update: set PMU_CTL bit 0x400 (PCTL_PLL_PLLCTL_UPD, as in
+	 * Broadcom's si_pmu_pllupd) after the PLLCTL writes, which makes
+	 * the PLL adopt the new values.  Without it the
+	 * PLLCTL registers hold the values but the running PLL keeps
+	 * its previous programming.
+	 */
+	{
+		uint32_t pmu_ctl = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_CTRL);
+		PDPRINTF(sc, 0,
+		    "pll_init: PMU_CTL before = 0x%08x\n", pmu_ctl);
+		bwfm_pci_pmu_write(sc, BWFM_CC_PMU_CTRL, pmu_ctl | 0x400);
+		(void)bwfm_pci_pmu_read(sc, BWFM_CC_PMU_CTRL);
+		DELAY(100);
+		readback = bwfm_pci_pmu_read(sc, BWFM_CC_PMU_CTRL);
+		PDPRINTF(sc, 0,
+		    "pll_init: PMU_CTL after |= 0x400 = 0x%08x (self-clears)\n",
+		    readback);
+	}
+	return (0);
+}
+
+/* Defined later, called from bwfm_pci_bringup_sequence(). */
+static int bwfm_pci_enter_download_state(struct bwfm_pci_softc *sc);
+static int bwfm_pci_enter_download_state_generic(struct bwfm_pci_softc *sc);
+static int bwfm_pci_load_firmware(struct bwfm_pci_softc *sc);
+
+/*
+ * Poll TCM[ramsize - 4] for the FW-ready sentinel.  Firmware writes
+ * the shared-RAM address there once initialized.  Poll loop is
+ * 5s / 50ms.
+ *
+ * Returns 0 on success (and stashes sentinel in sc->sc_fw_sharedram),
+ * ETIMEDOUT if the sentinel stays 0 after `timeout_ms`.
+ */
+static int
+bwfm_pci_wait_fw_ready(struct bwfm_pci_softc *sc, uint32_t ramsize,
+    int timeout_ms)
+{
+	uint32_t sharedram_addr;
+	uint32_t rambase = sc->sc_chip ? sc->sc_chip->rambase :
+	    BWFM_PCI_RAMBASE_43602;
+	int i, iters = timeout_ms / 50;
+
+	for (i = 0; i < iters; i++) {
+		DELAY(50000);	/* 50 ms */
+		sharedram_addr = bus_space_read_4(sc->sc_bar2_t, sc->sc_bar2_h,
+		    rambase + ramsize - 4);
+		/*
+		 * Non-zero alone is insufficient: nvram_inject just wrote a
+		 * trailer there and FW hasn't overwritten yet.  Require
+		 * the value to be a TCM address inside
+		 * [rambase, rambase+ramsize).  For rambase=0 chips
+		 * this permits any low address as a valid sentinel.
+		 */
+		if (sharedram_addr >= rambase &&
+		    sharedram_addr < rambase + ramsize) {
+			PDPRINTF(sc, 0,
+			    "wait_fw_ready: FW alive after %d ms, "
+			    "sharedram_addr=0x%08x\n",
+			    (i + 1) * 50, sharedram_addr);
+			sc->sc_fw_sharedram = sharedram_addr;
+			return (0);
+		}
+	}
+	device_printf(sc->sc_dev,
+	    "wait_fw_ready: FW failed to initialize (sentinel still 0 "
+	    "after %d ms)\n",
+	    timeout_ms);
+	return (ETIMEDOUT);
+}
+
+/*
+ * Chip bring-up, run by the autostart thread.
+ *
+ * With debug output on, each step logs "STARTING" and "DONE", so if a
+ * step wedges the machine the last STARTING line names it.
+ *
+ * Steps:
+ *   1. no chip reset; see below
+ *   2. core_walk, which populates sc_cores[]
+ *   3. (none)
+ *   4. PMU and PLL init (chip specific), then ramsize_query
+ *   5. enter_download_state (BANKPDA 5,7 cleared), plus the SOCRAM
+ *      reset on the 43602
+ *   6. load_firmware, the image to TCM
+ *   7. exit_download_state; skipped, see below
+ *   8. nvram_inject, NVRAM to high TCM
+ *   9. armcr4_release, reset vector written and CPUHALT off
+ *  10. wait_fw_ready, polling the ramsize-4 sentinel (5s)
+ */
+static int
+bwfm_pci_bringup_sequence(struct bwfm_pci_softc *sc)
+{
+	device_t dev = sc->sc_dev;
+	uint32_t ramsize = 0;
+	int rc;
+
+	/*
+	 * Per-chip gate.  Bring-up is implemented only for the BCM43602;
+	 * running the 43602-specific PMU init, PLL init and SOCRAM bank
+	 * power-up on other chip families wedges the backplane, so refuse
+	 * early.  The bwfm_pci_chip_table comments say what each chip
+	 * needs before bringup_supported can be set.
+	 */
+	if (sc->sc_chip == NULL || !sc->sc_chip->bringup_supported) {
+		device_printf(dev,
+		    "bringup: refusing - chip devid 0x%04x %s.  "
+		    "See bwfm_pci_chip_table in if_bwfm_pci.c for what to "
+		    "implement to enable this chip.\n",
+		    sc->sc_devid,
+		    sc->sc_chip ? sc->sc_chip->notes : "unknown");
+		return (EOPNOTSUPP);
+	}
+
+/*
+ * One bring-up step: log it, run it, stop the sequence on failure.  The
+ * quarter-second pauses either side are settle time for the chip.
+ */
+#define BRINGUP_STEP(n, name, expr) do {                                  \
+	PDPRINTF(sc, 0, "bringup: step %d " name " STARTING\n", (n));      \
+	pause("bringup", hz / 4);                                         \
+	rc = (expr);                                                      \
+	if (rc != 0) {                                                    \
+		device_printf(dev,                                        \
+		    "bringup: step %d " name " FAILED rc=%d\n", (n), rc); \
+		goto fail;                                                \
+	}                                                                 \
+	PDPRINTF(sc, 0, "bringup: step %d " name " DONE\n", (n));          \
+	pause("bringup", hz / 4);                                         \
+} while (0)
+
+	/*
+	 * Cold-chip pre-flight before any step.  Use the config-space
+	 * test: a BAR0-based check itself wedges on a cold backplane,
+	 * while config space is served by the root complex and always
+	 * returns.
+	 */
+	if (!bwfm_pci_chip_alive_cfg(sc)) {
+		device_printf(dev,
+		    "bringup: refusing - PCIe cfg-space says chip is absent "
+		    "or link is down.\n");
+		return (ENXIO);
+	}
+
+	/*
+	 * Mark the chip alive for the bring-up; on failure we clear it
+	 * so later steps don't blindly touch BAR0.
+	 */
+	sc->sc_chip_alive = true;
+
+	/*
+	 * No chip reset here: once the config-space check passes the chip
+	 * is warm, and a watchdog reset wedged the bus on real hardware.
+	 */
+	BRINGUP_STEP(2, "core_walk (EROM)", bwfm_pci_walk_cores(sc));
+
+	if (sc->sc_devid == BWFM_PCI_DEVICE_BCM43602) {
+		/*
+		 * PMU init: Broadcom's resource-dependency and up/down timer
+		 * tables for the BCM43602.  Must happen before firmware
+		 * upload; the firmware's PA init assumes it.
+		 */
+		BRINGUP_STEP(4, "pmu_init_43602 (PMU tables)",
+		    bwfm_pci_pmu_init_43602(sc));
+		/* PLL setup, as Broadcom's si_set_bb_vcofreq_frac. */
+		BRINGUP_STEP(4, "pll_init_43602 (PLL setup)",
+		    bwfm_pci_pll_init_43602(sc));
+	} else {
+		/*
+		 * Other chip families: skip PMU + PLL init entirely.
+		 * Chip defaults are expected to be usable.
+		 */
+		PDPRINTF(sc, 0,
+		    "bringup: step 4 pmu_init + pll_init SKIPPED "
+		    "(no chip-specific tables ported)\n");
+	}
+
+	BRINGUP_STEP(4, "ramsize_query", bwfm_pci_ramsize_query(sc, &ramsize));
+	sc->sc_fw_ramsize = ramsize;
+	PDPRINTF(sc, 0, "bringup: TCM ramsize=0x%x (cached)\n", ramsize);
+
+	if (sc->sc_devid == BWFM_PCI_DEVICE_BCM43602) {
+		BRINGUP_STEP(5, "enter_download_state (BANKIDX 5,7 zero)",
+		    bwfm_pci_enter_download_state(sc));
+		/*
+		 * SOCRAM reset before firmware upload.  Linux brcmfmac
+		 * resets it after the copy instead; here that wipes TCM
+		 * (see step 7).
+		 */
+		BRINGUP_STEP(5, "sysmem_reset_pre (SOCRAM resetcore)",
+		    bwfm_pci_exit_download_state(sc));
+	} else {
+		/*
+		 * Generic download-state entry: enable the chip's memory
+		 * core (BUF_MEM 0x81a) and halt the ARM CR4.  No
+		 * SOCRAM bank power-up or sysmem reset; both are 43602
+		 * specific.
+		 */
+		BRINGUP_STEP(5, "enter_download_state_generic",
+		    bwfm_pci_enter_download_state_generic(sc));
+	}
+
+	BRINGUP_STEP(6, "load_firmware", bwfm_pci_load_firmware(sc));
+	/*
+	 * Step 7 exit_download_state is omitted: SOCRAM RESET_CTL=1 after
+	 * the upload can wipe TCM on some 43602 silicon revisions.
+	 * armcr4_release rewrites only TCM[0] (rstvec), so the ARM
+	 * branches into zeroed memory, hard-faults and spins in its
+	 * exception handler (IOCTL=0x1, no TCM writes, the sentinel never
+	 * changes).  sysmem_reset_pre in step 5 already does the SOCRAM
+	 * resetcore, before the copy.
+	 */
+	PDPRINTF(sc, 0, "bringup: step 7 exit_download_state SKIPPED "
+	    "(post-fw SOCRAM reset destroys TCM contents)\n");
+	BRINGUP_STEP(8, "nvram_inject", bwfm_pci_nvram_inject(sc));
+	/* cold_reattach turns bus mastering off; the firmware needs it. */
+	pci_enable_busmaster(dev);
+	BRINGUP_STEP(9, "armcr4_release (CPUHALT off)",
+	    bwfm_pci_armcr4_release(sc));
+	BRINGUP_STEP(10, "wait_fw_ready (poll TCM[ramsize-4])",
+	    bwfm_pci_wait_fw_ready(sc, ramsize, 5000));
+
+#undef BRINGUP_STEP
+
+	atomic_store_bool(&sc->sc_fw_running, true);
+	PDPRINTF(sc, 0, "bringup: SUCCESS - chip warm, FW alive\n");
+	return (0);
+
+fail:
+	device_printf(dev,
+	    "bringup: FAILED rc=%d.  Chip may be in partial state; "
+	    "set dev.bwfm_pci.%d.debug=1 and reload to see each step.\n",
+	    rc, device_get_unit(dev));
+	sc->sc_chip_alive = false;
+	return (rc);
+}
+
+/* An int knob read locklessly elsewhere: store it atomically. */
+static int
+bwfm_pci_sysctl_int_atomic(SYSCTL_HANDLER_ARGS)
+{
+	volatile u_int *p = arg1;
+	int error, v;
+
+	v = (int)atomic_load_int(p);
+	error = sysctl_handle_int(oidp, &v, 0, req);
+	if (error != 0 || req->newptr == NULL)
+		return (error);
+	atomic_store_int(p, (u_int)v);
+	return (0);
+}
+
+/*
+ * BCM43602 pre-upload step.  Before writing the firmware to BAR2 we
+ * must clear the Power-Down-Aware bit on SOCRAM banks 5 and 7,
+ * otherwise those banks stay powered off and any BAR2 write that
+ * targets them generates a chip-side Target Abort which propagates
+ * back to the host PCIe bridge and hangs the bus.
+ *
+ * The mechanism is per-bank: BANKIDX selects bank, BANKPDA = 0
+ * disables PDA gating.
+ */
+static int
+bwfm_pci_enter_download_state(struct bwfm_pci_softc *sc)
+{
+	uint32_t cr4_base = 0;
+	int i, rc;
+
+	for (i = 0; i < sc->sc_ncores; i++) {
+		if (sc->sc_cores[i].id == BWFM_CORE_ARM_CR4) {
+			cr4_base = sc->sc_cores[i].base;
+			break;
+		}
+	}
+	if (cr4_base == 0) {
+		device_printf(sc->sc_dev,
+		    "enter_download: ARM-CR4 core base unknown; "
+		    "run core_walk first\n");
+		return (ENOENT);
+	}
+
+	/*
+	 * Each core's IOCTL.CLK must be on before touching its registers,
+	 * or the backplane routes the transactions nowhere.  SOCRAM for
+	 * the TCM writes; ARM-CR4 halted so BANKIDX/BANKPDA are reachable.
+	 */
+	rc = bwfm_pci_core_enable(sc, BWFM_CORE_SOCRAM, 0);
+	if (rc != 0) {
+		device_printf(sc->sc_dev,
+		    "enter_download: SOCRAM core_enable failed rc=%d\n", rc);
+		return (rc);
+	}
+	rc = bwfm_pci_core_enable(sc, BWFM_CORE_ARM_CR4,
+	    BWFM_ARMCR4_IOCTL_CPUHALT);
+	if (rc != 0) {
+		device_printf(sc->sc_dev,
+		    "enter_download: ARM-CR4 core_enable(halted) failed rc=%d\n",
+		    rc);
+		return (rc);
+	}
+
+	/* Bank 5: clear PDA. */
+	bwfm_pci_set_window(sc, cr4_base);
+	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_ARMCR4_BANKIDX & BWFM_PCI_BAR0_WINDOW_OFF_MASK, 5);
+	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_ARMCR4_BANKPDA & BWFM_PCI_BAR0_WINDOW_OFF_MASK, 0);
+
+	/* Bank 7: clear PDA. */
+	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_ARMCR4_BANKIDX & BWFM_PCI_BAR0_WINDOW_OFF_MASK, 7);
+	bus_space_write_4(sc->sc_bar0_t, sc->sc_bar0_h,
+	    BWFM_ARMCR4_BANKPDA & BWFM_PCI_BAR0_WINDOW_OFF_MASK, 0);
+
+	PDPRINTF(sc, 0,
+	    "enter_download: SOCRAM+ARM-CR4 clocks on; banks 5,7 powered up "
+	    "(BANKIDX/BANKPDA via ARM-CR4 @0x%08x)\n", cr4_base);
+	return (0);
+}
+
+/*
+ * Generic version of enter_download_state for chips that use BUF_MEM
+ * (0x81a; see the chip table note, bcma.h calls it USB20_DEV) instead
+ * of SOCRAM.  A single BUF_MEM aperture is assumed, so no
+ * bank power-up is needed: enable the clock and halt the CPU so the
+ * upload sees stable TCM.
+ *
+ * Uses sc->sc_chip->mem_core for the memory core ID.
+ */
+static int
+bwfm_pci_enter_download_state_generic(struct bwfm_pci_softc *sc)
+{
+	int rc;
+
+	if (sc->sc_chip == NULL) {
+		device_printf(sc->sc_dev,
+		    "enter_download_generic: sc_chip NULL\n");
+		return (ENXIO);
+	}
+
+	rc = bwfm_pci_core_enable(sc, sc->sc_chip->mem_core, 0);
+	if (rc != 0) {
+		device_printf(sc->sc_dev,
+		    "enter_download_generic: mem_core 0x%03x enable "
+		    "failed rc=%d\n", sc->sc_chip->mem_core, rc);
+		return (rc);
+	}
+	rc = bwfm_pci_core_enable(sc, BWFM_CORE_ARM_CR4,
+	    BWFM_ARMCR4_IOCTL_CPUHALT);
+	if (rc != 0) {
+		device_printf(sc->sc_dev,
+		    "enter_download_generic: ARM-CR4 halted enable "
+		    "failed rc=%d\n", rc);
+		return (rc);
+	}
+	PDPRINTF(sc, 0,
+	    "enter_download_generic: mem_core 0x%03x + ARM-CR4 halted OK\n",
+	    sc->sc_chip->mem_core);
+	return (0);
+}
+
+static int
+bwfm_pci_load_firmware(struct bwfm_pci_softc *sc)
+{
+	const struct firmware *fw;
+	const uint32_t *src;
+	size_t nwords, i;
+	uint32_t verify, resetintr;
+	int mismatches;
+	uint32_t dst_off;
+	bus_size_t bar2_size;
+	char verstr[BWFM_PCI_FW_VERSTRING_MAX];
+	const uint8_t *p;
+	size_t vs_off, vs_len;
+
+	if (sc->sc_bar2 == NULL) {
+		device_printf(sc->sc_dev,
+		    "load_fw: BAR2 not allocated; cannot upload\n");
+		return (ENXIO);
+	}
+	if (!sc->sc_chip_alive) {
+		device_printf(sc->sc_dev,
+		    "load_fw: refusing — sc_chip_alive is false\n");
+		return (ENXIO);
+	}
+
+	{
+		const char *fwname = (sc->sc_chip && sc->sc_chip->fw_name) ?
+		    sc->sc_chip->fw_name : BWFM_PCI_FW_43602;
+		/*
+		 * Keep the image from the first upload until detach, so a
+		 * later re-upload never goes back to firmware(9), which may
+		 * have to load the module from disk.
+		 */
+		if (sc->sc_fw == NULL)
+			sc->sc_fw = firmware_get(fwname);
+		fw = sc->sc_fw;
+		if (fw == NULL) {
+			device_printf(sc->sc_dev,
+			    "load_fw: firmware_get(\"%s\") failed; "
+			    "kldload the corresponding bwfm_pci_fw_* module\n",
+			    fwname);
+			return (ENOENT);
+		}
+	}
+	/*
+	 * Firmware images are not always a multiple of 4 bytes (635449
+	 * bytes for v7.35.177.61, one byte past the last dword).  The
+	 * ARM-CR4 never fetches past the last symbol, so the tail word is
+	 * zero-padded and the whole upload is done in dwords.
+	 */
+
+	bar2_size = rman_get_size(sc->sc_bar2);
+	dst_off = sc->sc_chip ? sc->sc_chip->rambase : BWFM_PCI_RAMBASE_43602;
+	PDPRINTF(sc, 0,
+	    "load_fw: BAR2=%ju bytes, rambase=0x%x, fw datasize=%zu\n",
+	    (uintmax_t)bar2_size, dst_off, fw->datasize);
+	if (dst_off + fw->datasize > bar2_size) {
+		device_printf(sc->sc_dev,
+		    "load_fw: dst 0x%x + size %zu > BAR2 size %ju\n",
+		    dst_off, fw->datasize, (uintmax_t)bar2_size);
+		return (EFBIG);
+	}
+
+	/*
+	 * Power up TCM before writing.  On 43602 this powers up SOCRAM
+	 * banks 5+7; on generic chips it just enables the
+	 * BUF_MEM aperture.  Skipping means BAR2 writes hit unpowered
+	 * mem and the chip Target-Aborts, hanging host PCIe.
+	 *
+	 * Bring-up step 5 already ran the same helper, but calling it
+	 * again is harmless (core_enable polls RESET_CTL until 0, then
+	 * sets IOCTL).
+	 */
+	{
+		int (*enter_fn)(struct bwfm_pci_softc *) =
+		    (sc->sc_devid == BWFM_PCI_DEVICE_BCM43602) ?
+		    bwfm_pci_enter_download_state :
+		    bwfm_pci_enter_download_state_generic;
+		if (enter_fn(sc) != 0)
+			return (EIO);
+	}
+
+	/*
+	 * Log what is about to be uploaded.  The reset vector
+	 * (first 4 bytes) is the Thumb-2 branch the ARM-CR4 takes on
+	 * release.  Version string is at the tail.
+	 */
+	resetintr = le32toh(((const uint32_t *)fw->data)[0]);
+	memset(verstr, 0, sizeof(verstr));
+	vs_off = fw->datasize > sizeof(verstr) ?
+	    fw->datasize - sizeof(verstr) : 0;
+	vs_len = fw->datasize - vs_off;
+	p = (const uint8_t *)fw->data + vs_off;
+	for (i = 0; i < vs_len && i < sizeof(verstr) - 1; i++) {
+		uint8_t c = p[i];
+		verstr[i] = (c >= 0x20 && c < 0x7f) ? c : '.';
+	}
+	PDPRINTF(sc, 0,
+	    "load_fw: blob %zu bytes, reset vector 0x%08x, dst BAR2+0x%x\n",
+	    fw->datasize, resetintr, dst_off);
+	PDPRINTF(sc, 0,
+	    "load_fw: tail strings: %s\n", verstr);
+
+	src = (const uint32_t *)fw->data;
+	nwords = fw->datasize / 4;
+	for (i = 0; i < nwords; i++) {
+		bus_space_write_4(sc->sc_bar2_t, sc->sc_bar2_h,
+		    dst_off + i * 4, le32toh(src[i]));
+	}
+	/*
+	 * Tail word: copy the unaligned trailing bytes into a zero-
+	 * initialized stack word, write as one 32-bit BAR2 store.
+	 */
+	if (fw->datasize & 3) {
+		uint32_t tail = 0;
+		const uint8_t *tail_src = (const uint8_t *)fw->data +
+		    nwords * 4;
+
+		memcpy(&tail, tail_src, fw->datasize & 3);
+		bus_space_write_4(sc->sc_bar2_t, sc->sc_bar2_h,
+		    dst_off + nwords * 4, le32toh(tail));
+		nwords++;
+	}
+
+	/* Flush the host's posted writes before the chip reads the image. */
+	bus_space_barrier(sc->sc_bar2_t, sc->sc_bar2_h,
+	    dst_off, nwords * 4, BUS_SPACE_BARRIER_WRITE);
+
+	/*
+	 * Spot-check the upload: verify first, middle, and last
+	 * dwords survived the write.  BAR2 is one big aperture; a
+	 * silent drop usually affects the whole window, so the spot
+	 * check catches the common failure mode.
+	 */
+	mismatches = 0;
+	{
+		size_t probes[3];
+
+		probes[0] = 0;
+		probes[1] = nwords / 2;
+		probes[2] = nwords - 1;
+		for (i = 0; i < 3; i++) {
+			verify = bus_space_read_4(sc->sc_bar2_t,
+			    sc->sc_bar2_h, dst_off + probes[i] * 4);
+			if (verify != le32toh(src[probes[i]])) {
+				device_printf(sc->sc_dev,
+				    "load_fw: mismatch at word %zu: "
+				    "wrote 0x%08x read 0x%08x\n",
+				    probes[i], le32toh(src[probes[i]]),
+				    verify);
+				mismatches++;
+			}
+		}
+	}
+
+	PDPRINTF(sc, 0,
+	    "load_fw: %s (%d spot-check mismatch(es))\n",
+	    mismatches == 0 ? "upload verified" : "upload FAILED",
+	    mismatches);
+
+	return (mismatches == 0 ? 0 : EIO);
+}
+
+/* ------------------------------------------------------------------
+ * Recovery paths.
+ *
+ * On Apple machines the BCM43602's PCIe memory decoder stays gated
+ * until the platform unlock above completes, and any BAR0 read while
+ * it is gated triggers a Master Abort and a Machine Check,
+ * which on x86 is an instant reboot with no panic message.  Chip-side
+ * operations are therefore explicit steps that check for a live chip
+ * first.  They all log through device_printf so the trail lands in
+ * dmesg.
+ * ------------------------------------------------------------------ */
+
+/*
+ * PCIe D-state transition: D0 -> D3hot -> D0.
+ *
+ * This hangs the kernel on a cold BCM43602 backplane: the D3hot
+ * transition or the D0 restore starts PCIe retraining that never
+ * completes on cold silicon, blocking config-space access
+ * indefinitely.  Only use it once the chip is known to be warm.
+ *
+ * PCIe PM spec:
+ *   D3hot: main power off, aux power on.  Config-space and PCIe
+ *          link only.  Chip's internal state may reset.
+ *   D0:    full power, chip runs normally.
+ *
+ * It does not warm a cold chip.
+ */
+static int
+bwfm_pci_apple_dstate_cycle(struct bwfm_pci_softc *sc)
+{
+	int pm_cap;
+	uint16_t pmcsr;
+
+	if (pci_find_cap(sc->sc_dev, PCIY_PMG, &pm_cap) != 0) {
+		device_printf(sc->sc_dev,
+		    "dstate_cycle: no PMG capability\n");
+		return (ENOENT);
+	}
+
+	pmcsr = pci_read_config(sc->sc_dev, pm_cap + PCIR_POWER_STATUS, 2);
+	device_printf(sc->sc_dev,
+	    "dstate_cycle: PMCSR before = 0x%04x (state=D%d)\n",
+	    pmcsr, pmcsr & PCIM_PSTAT_DMASK);
+
+	/* Enter D3hot: main power off, keep aux power. */
+	pci_write_config(sc->sc_dev, pm_cap + PCIR_POWER_STATUS,
+	    (pmcsr & ~PCIM_PSTAT_DMASK) | 0x3, 2);
+	DELAY(100000);  /* 100ms dwell in D3hot (spec min 10ms) */
+	pmcsr = pci_read_config(sc->sc_dev, pm_cap + PCIR_POWER_STATUS, 2);
+	device_printf(sc->sc_dev,
+	    "dstate_cycle: PMCSR in D3 = 0x%04x (state=D%d)\n",
+	    pmcsr, pmcsr & PCIM_PSTAT_DMASK);
+
+	/* Return to D0. */
+	pci_write_config(sc->sc_dev, pm_cap + PCIR_POWER_STATUS,
+	    pmcsr & ~PCIM_PSTAT_DMASK, 2);
+	DELAY(10000);  /* 10ms recovery */
+	pmcsr = pci_read_config(sc->sc_dev, pm_cap + PCIR_POWER_STATUS, 2);
+	device_printf(sc->sc_dev,
+	    "dstate_cycle: PMCSR after = 0x%04x (state=D%d)\n",
+	    pmcsr, pmcsr & PCIM_PSTAT_DMASK);
+	return (0);
+}
+
+/*
+ * Cold-resume path: after S3 removes power to the chip the fw is dead
+ * and every DCMD hangs.  Rebuild the whole stack in-kernel:
+ *   1. Tear the stale msgbuf state down (DMA rings, ISR, mbufs).
+ *   2. DSDT APPU warm sequence via EC APWC (safe on cold chip).
+ *   3. PCIe D0 -> D3 -> D0 nudge.
+ *   4. Verify chip cfg-space liveness.
+ *   5. Re-point BAR0_WIN1 at CHIPCOMMON.
+ *   6. Full bring-up: core_walk, PMU, PLL, ramsize, firmware upload,
+ *      NVRAM, armcr4 release and wait_fw_ready.
+ *   7. msgbuf_attach: fresh DMA rings, rebind ISR, post rx buffers.
+ *   8. WLC_UP.
+ *   9. preinit dcmds: event_msgs, mpc, scan timers, txbf.
+ *
+ * net80211 is intentionally not torn down.  wlan0 stays present as an
+ * ifnet, sc_ic_attached stays true; wpa_supplicant's SIOCS80211 fd
+ * survives.  The VAP's next iv_op after resume will find sc_wlc_up
+ * true again, the fw ready to accept SET_SSID, and re-associate
+ * naturally without needing userland to re-create the interface.
+ */
+static int	bwfm_pci_cold_rebuild(struct bwfm_pci_softc *);
+static void	bwfm_pci_gate_close(struct bwfm_pci_softc *);
+static void	bwfm_pci_gate_open(struct bwfm_pci_softc *);
+
+static int
+bwfm_pci_cold_reattach(struct bwfm_pci_softc *sc)
+{
+	device_t dev = sc->sc_dev;
+	int rc;
+
+	mtx_lock(&sc->sc_flowq_mtx);
+	if (sc->sc_reattaching || BWFM_DYING(&sc->bus_sc) ||
+	    atomic_load_bool(&sc->sc_autostart_running)) {
+		mtx_unlock(&sc->sc_flowq_mtx);
+		return (EBUSY);
+	}
+	sc->sc_reattaching = true;
+	mtx_unlock(&sc->sc_flowq_mtx);
+
+	device_printf(dev, "cold_reattach: starting full chip rebuild\n");
+
+	/*
+	 * Keep transmit out of the rings and pktid table while they are
+	 * freed and rebuilt.  The gate stays closed if the rebuild fails.
+	 */
+	bwfm_pci_gate_close(sc);
+	rc = bwfm_pci_cold_rebuild(sc);
+	if (rc == 0)
+		bwfm_pci_gate_open(sc);
+
+	mtx_lock(&sc->sc_flowq_mtx);
+	sc->sc_reattaching = false;
+	mtx_unlock(&sc->sc_flowq_mtx);
+	return (rc);
+}
+
+static int
+bwfm_pci_cold_rebuild(struct bwfm_pci_softc *sc)
+{
+	device_t dev = sc->sc_dev;
+	int rc;
+
+	/*
+	 * The firmware may still be running: a hung dcmd does not mean a
+	 * dead ARM, and D3hot does not reset this chip (PMCSR
+	 * No_Soft_Reset is set).  Stop it mastering the bus before its
+	 * rings are freed, or it keeps writing into memory the kernel
+	 * has handed back.  bringup_sequence turns mastering back on
+	 * once the ARM is halted and the new image is in place.
+	 */
+	pci_disable_busmaster(dev);
+	bwfm_pci_msgbuf_detach(sc);
+	atomic_store_bool(&sc->bus_sc.sc_wlc_up, false);
+	sc->sc_chip_alive = false;
+	atomic_store_bool(&sc->sc_fw_running, false);
+
+	rc = bwfm_pci_apple_appu_warm(sc);
+	if (rc != 0) {
+		device_printf(dev,
+		    "cold_reattach: APPU warm failed rc=%d\n", rc);
+		return (rc);
+	}
+
+	(void)bwfm_pci_apple_dstate_cycle(sc);
+
+	if (!bwfm_pci_chip_alive_cfg(sc)) {
+		device_printf(dev,
+		    "cold_reattach: chip still absent from cfg-space "
+		    "after APPU + dstate_cycle\n");
+		return (ENXIO);
+	}
+	sc->sc_chip_alive = true;
+
+	pci_write_config(dev, BWFM_PCI_BAR0_WINDOW, 0x18000000, 4);
+	(void)pci_read_config(dev, BWFM_PCI_BAR0_WINDOW, 4);
+
+	rc = bwfm_pci_bringup_sequence(sc);
+	if (rc != 0) {
+		device_printf(dev,
+		    "cold_reattach: bringup_sequence rc=%d\n", rc);
+		return (rc);
+	}
+
+	rc = bwfm_pci_msgbuf_attach(sc);
+	if (rc != 0) {
+		device_printf(dev,
+		    "cold_reattach: msgbuf_attach rc=%d\n", rc);
+		return (rc);
+	}
+
+	rc = bwfm_pci_msgbuf_dcmd_set_int(sc, BWFM_C_UP, 0);
+	if (rc != 0) {
+		device_printf(dev,
+		    "cold_reattach: WLC_UP rc=%d\n", rc);
+		return (rc);
+	}
+	atomic_store_bool(&sc->bus_sc.sc_wlc_up, true);
+
+	bwfm_pci_preinit_dcmds(sc);
+
+	/*
+	 * Chip is fully back but net80211's VAP still believes it's in
+	 * whatever state it was before the tear-down.  Force each vap to
+	 * INIT so the next userland scan/assoc request walks the state
+	 * machine cleanly against the fresh fw.  wpa_supplicant sees
+	 * SIOCG80211(SSID) come back empty, treats it as a link drop, and
+	 * reissues its own re-association without needing to be restarted.
+	 */
+	if (BWFM_IC_UP(&sc->bus_sc)) {
+		struct ieee80211vap *vap;
+		TAILQ_FOREACH(vap, &sc->bus_sc.sc_ic.ic_vaps, iv_next)
+			(void)ieee80211_new_state(vap, IEEE80211_S_INIT, -1);
+	}
+
+	device_printf(dev, "cold_reattach: SUCCESS\n");
+	return (0);
+}
+
+/*
+ * Queue crash recovery.  Detach sets sc_dying and takes the queue away
+ * under sc_flowq_mtx, so nothing can be queued on a queue being freed.
+ */
+static void
+bwfm_pci_queue_recover(struct bwfm_pci_softc *sc)
+{
+	if (!mtx_initialized(&sc->sc_flowq_mtx))
+		return;
+	mtx_lock(&sc->sc_flowq_mtx);
+	if (sc->sc_recover_tq != NULL && !BWFM_DYING(&sc->bus_sc))
+		taskqueue_enqueue(sc->sc_recover_tq,
+		    &sc->sc_crash_recover_task);
+	mtx_unlock(&sc->sc_flowq_mtx);
+}
+
+/*
+ * Called from msgbuf.c on every DCMD timeout after it bumps
+ * mb->stat_dcmd_timeout_consec.  Checks the softc-level threshold
+ * and enqueues the crash-recover task at most once per burst.
+ * Idempotent: task body clears sc_crash_recover_pending on exit so a
+ * subsequent burst re-arms.
+ */
+void
+bwfm_pci_maybe_queue_crash_recover(struct bwfm_pci_softc *sc)
+{
+	uint32_t thresh = sc->sc_crash_recover_threshold;
+	uint32_t consec = sc->sc_msgbuf.stat_dcmd_timeout_consec;
+
+	if (thresh == 0 || consec < thresh ||
+	    !atomic_cmpset_int(&sc->sc_crash_recover_pending, 0, 1))
+		return;
+	atomic_add_32(&sc->sc_crash_recover_events, 1);
+	device_printf(sc->sc_dev,
+	    "fw crash detected (dcmd timeout consec=%u >= %u); "
+	    "queueing cold_reattach (event #%u)\n",
+	    consec, thresh, sc->sc_crash_recover_events);
+	bwfm_pci_queue_recover(sc);
+}
+
+/*
+ * Firmware crash auto-recovery taskqueue callback.  Runs on
+ * sc_recover_tq after the DCMD timeout path bumps
+ * mb->stat_dcmd_timeout_consec past sc_crash_recover_threshold.  Body
+ * runs bwfm_pci_cold_reattach; the pending flag is
+ * flipped back to false so a subsequent crash burst re-arms.
+ */
+static void
+bwfm_pci_crash_recover_task(void *ctx, int pending __unused)
+{
+	struct bwfm_pci_softc *sc = ctx;
+	int rc;
+
+	device_printf(sc->sc_dev,
+	    "crash_recover_task: running cold_reattach (event #%u)\n",
+	    sc->sc_crash_recover_events);
+	rc = bwfm_pci_cold_reattach(sc);
+	device_printf(sc->sc_dev,
+	    "crash_recover_task: cold_reattach rc=%d\n", rc);
+	atomic_store_rel_int(&sc->sc_crash_recover_pending, 0);
+}
+
+static void
+bwfm_pci_attach_sysctls(struct bwfm_pci_softc *sc)
+{
+	struct sysctl_ctx_list *ctx = device_get_sysctl_ctx(sc->sc_dev);
+	struct sysctl_oid *tree = device_get_sysctl_tree(sc->sc_dev);
+	struct sysctl_oid_list *list = SYSCTL_CHILDREN(tree);
+
+	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "debug",
+	    CTLTYPE_INT | CTLFLAG_RWTUN | CTLFLAG_MPSAFE, &sc->bus_sc.sc_debug, 0,
+	    bwfm_pci_sysctl_int_atomic, "I",
+	    "Verbosity level for DPRINTF chatter (0=silent, 1=attach info, "
+	    "2=proto trace, 3=data-path, 4=register poke).");
+	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "net80211_detach",
+	    CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_MPSAFE, sc, 0,
+	    bwfm_pci_sysctl_net80211_detach, "I",
+	    "Write 1 to detach the ieee80211com (undo net80211_attach).");
+	SYSCTL_ADD_PROC(ctx, list, OID_AUTO, "crash_recover_threshold",
+	    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+	    &sc->sc_crash_recover_threshold, 0,
+	    bwfm_pci_sysctl_int_atomic, "IU",
+	    "Consecutive DCMD-timeout count that triggers automatic "
+	    "cold_reattach.  Default 0 (off): a timeout does not prove "
+	    "the firmware crashed, and rebuilding a running chip can "
+	    "hang the host.");
+}
+
+/* ------------------------------------------------------------------
+ * Newbus glue
+ * ------------------------------------------------------------------ */
+
+static const struct bwfm_pci_devmatch *
+bwfm_pci_lookup(device_t dev)
+{
+	const struct bwfm_pci_devmatch *m;
+	uint16_t vendor, devid;
+
+	vendor = pci_get_vendor(dev);
+	if (vendor != BWFM_PCI_VENDOR_BROADCOM)
+		return (NULL);
+	devid = pci_get_device(dev);
+	for (m = bwfm_pci_devs; m->desc != NULL; m++)
+		if (m->devid == devid)
+			return (m);
+	return (NULL);
+}
+
+static int
+bwfm_pci_probe(device_t dev)
+{
+	const struct bwfm_pci_devmatch *m;
+
+	m = bwfm_pci_lookup(dev);
+	if (m == NULL)
+		return (ENXIO);
+	device_set_desc(dev, m->desc);
+	return (BUS_PROBE_DEFAULT);
+}
+
+static int
+bwfm_pci_alloc_bars(struct bwfm_pci_softc *sc)
+{
+	int rid;
+
+	rid = BWFM_PCI_BAR0_RID;
+	sc->sc_bar0 = bus_alloc_resource_any(sc->sc_dev, SYS_RES_MEMORY,
+	    &rid, RF_ACTIVE);
+	if (sc->sc_bar0 == NULL) {
+		device_printf(sc->sc_dev, "BAR0 alloc failed\n");
+		return (ENXIO);
+	}
+	sc->sc_bar0_t = rman_get_bustag(sc->sc_bar0);
+	sc->sc_bar0_h = rman_get_bushandle(sc->sc_bar0);
+
+	rid = BWFM_PCI_BAR2_RID;
+	sc->sc_bar2 = bus_alloc_resource_any(sc->sc_dev, SYS_RES_MEMORY,
+	    &rid, RF_ACTIVE);
+	if (sc->sc_bar2 == NULL) {
+		device_printf(sc->sc_dev,
+		    "BAR2 alloc failed (chip-RAM window); firmware "
+		    "download will be unavailable until this is wired\n");
+		/* Not fatal here; bring-up checks for BAR2 itself. */
+	} else {
+		sc->sc_bar2_t = rman_get_bustag(sc->sc_bar2);
+		sc->sc_bar2_h = rman_get_bushandle(sc->sc_bar2);
+	}
+	return (0);
+}
+
+static void
+bwfm_pci_free_bars(struct bwfm_pci_softc *sc)
+{
+	if (sc->sc_bar2 != NULL) {
+		bus_release_resource(sc->sc_dev, SYS_RES_MEMORY,
+		    BWFM_PCI_BAR2_RID, sc->sc_bar2);
+		sc->sc_bar2 = NULL;
+	}
+	if (sc->sc_bar0 != NULL) {
+		bus_release_resource(sc->sc_dev, SYS_RES_MEMORY,
+		    BWFM_PCI_BAR0_RID, sc->sc_bar0);
+		sc->sc_bar0 = NULL;
+	}
+}
+
+static int
+bwfm_pci_alloc_irq(struct bwfm_pci_softc *sc)
+{
+	int count;
+
+	count = 1;
+	if (pci_alloc_msix(sc->sc_dev, &count) == 0 && count >= 1) {
+		sc->sc_msix_count = count;
+		sc->sc_msi = false;
+		sc->sc_irq_rid = 1;	/* MSI-X starts at RID 1. */
+	} else if (pci_alloc_msi(sc->sc_dev, &count) == 0 && count >= 1) {
+		sc->sc_msix_count = 0;
+		sc->sc_msi = true;
+		sc->sc_irq_rid = 1;
+	} else {
+		/* Legacy INTx — usable; some platforms can't route MSI. */
+		sc->sc_msix_count = 0;
+		sc->sc_msi = false;
+		sc->sc_irq_rid = 0;
+	}
+	sc->sc_irq = bus_alloc_resource_any(sc->sc_dev, SYS_RES_IRQ,
+	    &sc->sc_irq_rid, RF_ACTIVE | RF_SHAREABLE);
+	if (sc->sc_irq == NULL) {
+		device_printf(sc->sc_dev, "IRQ alloc failed\n");
+		return (ENXIO);
+	}
+	return (0);
+}
+
+static void
+bwfm_pci_free_irq(struct bwfm_pci_softc *sc)
+{
+	if (sc->sc_irq_handle != NULL) {
+		bus_teardown_intr(sc->sc_dev, sc->sc_irq, sc->sc_irq_handle);
+		sc->sc_irq_handle = NULL;
+	}
+	if (sc->sc_irq != NULL) {
+		bus_release_resource(sc->sc_dev, SYS_RES_IRQ,
+		    sc->sc_irq_rid, sc->sc_irq);
+		sc->sc_irq = NULL;
+	}
+	if (sc->sc_msix_count > 0 || sc->sc_msi)
+		pci_release_msi(sc->sc_dev);
+	sc->sc_msix_count = 0;
+	sc->sc_msi = false;
+}
+
+/* -----------------------------------------------------------------
+ * Bus ops for bwfm.c integration.  bwfm.c (the FullMAC core shared
+ * with the SDIO and USB transports) calls these wrappers; PCIe uses
+ * msgbuf DCMDs instead of BCDC, so txctl/rxctl are BCDC-only and
+ * return ENXIO.  txdata goes out through the msgbuf flow rings.
+ * ----------------------------------------------------------------- */
+static int
+bwfm_pci_bs_txctl(struct bwfm_softc *bsc __unused, const void *buf __unused,
+    size_t len __unused)
+{
+	/* BCDC-specific control path.  Msgbuf uses DCMD ring instead. */
+	return (ENXIO);
+}
+
+static int
+bwfm_pci_bs_rxctl(struct bwfm_softc *bsc __unused, void *buf __unused,
+    size_t *lenp __unused, int timeout_ms __unused)
+{
+	return (ENXIO);
+}
+
+/*
+ * The flow ring a frame goes out on: its destination and priority.
+ *
+ * A station sends everything to its access point, whatever the 802.3
+ * destination, so it keys every ring on the AP alone, one per priority.
+ * For broadcast and multicast this matters: with ff:ff:ff:ff:ff:ff as
+ * the peer the chip finds no SCB, skips the PTK, sends the frame in the
+ * clear, and the AP deauthenticates us with reason 6 ("class 2 frame
+ * from nonauthenticated STA").  Linux brcmfmac's indirect address mode
+ * also ignores the destination, but keys one ring per AC fifo
+ * (prio2fifo), not per priority.
+ *
+ * An access point keys unicast on the station it is for, and sends all
+ * broadcast and multicast on one broadcast ring at priority 0, as Linux
+ * does in direct address mode.
+ *
+ * EAPOL (ethertype 0x888e) rides a ring of its own at priority 7
+ * (voice / TID 7).  After bwfm_set_key installs the PTK the chip
+ * encrypts the peer's data ring; a handshake frame queued on it would
+ * go out encrypted and the other side would keep replaying message 3.
+ * The TID-7 ring is this driver's choice (Linux brcmfmac classifies
+ * EAPOL as priority 0 and instead waits for it to drain before
+ * installing keys); the firmware is believed to treat it as an EAPOL
+ * bypass path, sent unencrypted whatever the key state, which is what
+ * 802.11i requires for messages 2 and 4.
+ */
+static void
+bwfm_pci_tx_key(struct bwfm_softc *bsc, const uint8_t *eh, uint8_t key[6],
+    uint8_t *prio)
+{
+	struct ieee80211vap *vap;
+	uint16_t etype = ((uint16_t)eh[12] << 8) | eh[13];
+
+	memcpy(key, eh, 6);
+	*prio = etype == 0x888e ? 7 : 0;
+	vap = BWFM_IC_UP(bsc) ? TAILQ_FIRST(&bsc->sc_ic.ic_vaps) : NULL;
+	if (vap == NULL)
+		return;
+	if (vap->iv_opmode == IEEE80211_M_HOSTAP) {
+		if ((key[0] & 0x01) != 0) {
+			memset(key, 0xff, 6);
+			*prio = 0;
+		}
+	} else if (vap->iv_bss != NULL)
+		memcpy(key, vap->iv_bss->ni_bssid, 6);
+}
+
+/*
+ * Enter and leave the msgbuf gate.  A caller that cannot enter drops its
+ * frame or fails its command.
+ */
+bool
+bwfm_pci_gate_enter(struct bwfm_pci_softc *sc)
+{
+	bool ok;
+
+	mtx_lock(&sc->sc_flowq_mtx);
+	ok = !sc->sc_gate_closed || sc->sc_gate_owner == curthread;
+	if (ok)
+		sc->sc_gate_busy++;
+	mtx_unlock(&sc->sc_flowq_mtx);
+	return (ok);
+}
+
+void
+bwfm_pci_gate_exit(struct bwfm_pci_softc *sc)
+{
+
+	mtx_lock(&sc->sc_flowq_mtx);
+	if (--sc->sc_gate_busy == 0 && sc->sc_gate_closed)
+		wakeup(&sc->sc_gate_busy);
+	mtx_unlock(&sc->sc_flowq_mtx);
+}
+
+/*
+ * Close the gate and wait until no one is inside, then drop the frames
+ * still queued for the flow task: the rings they wait for are about to
+ * go.  The calling thread keeps passing the gate, so the rebuild can
+ * send its own firmware commands.  Must not run on taskqueue_thread,
+ * because it drains sc_flow_task there.
+ */
+static void
+bwfm_pci_gate_close(struct bwfm_pci_softc *sc)
+{
+
+	mtx_lock(&sc->sc_flowq_mtx);
+	sc->sc_gate_closed = true;
+	sc->sc_gate_owner = curthread;
+	while (sc->sc_gate_busy != 0)
+		(void)mtx_sleep(&sc->sc_gate_busy, &sc->sc_flowq_mtx, 0,
+		    "bwfmgate", 0);
+	mtx_unlock(&sc->sc_flowq_mtx);
+
+	/* A flow task queued before the close finds it shut and returns. */
+	taskqueue_drain(taskqueue_thread, &sc->sc_flow_task);
+
+	mtx_lock(&sc->sc_flowq_mtx);
+	mbufq_drain(&sc->sc_flowq[0]);
+	mbufq_drain(&sc->sc_flowq[1]);
+	sc->sc_flowq_busy[0] = sc->sc_flowq_busy[1] = false;
+	sc->sc_peer_gone_n = 0;
+	atomic_store_rel_int(&sc->sc_tx_blocked, 0);
+	mtx_unlock(&sc->sc_flowq_mtx);
+}
+
+static void
+bwfm_pci_gate_open(struct bwfm_pci_softc *sc)
+{
+
+	mtx_lock(&sc->sc_flowq_mtx);
+	sc->sc_gate_closed = false;
+	sc->sc_gate_owner = NULL;
+	mtx_unlock(&sc->sc_flowq_mtx);
+}
+
+/*
+ * Delete the rings of stations that have left, then make the rings
+ * queued frames are waiting for and send them, each on its own ring.
+ * Runs on taskqueue_thread, where waiting for the firmware is allowed.
+ * A frame whose ring cannot be made is dropped.
+ */
+static void
+bwfm_pci_flow_task(void *arg, int pending __unused)
+{
+	struct bwfm_pci_softc *sc = arg;
+	uint8_t key[6], gone[BWFM_PCI_PEER_GONE_MAX][6];
+	uint16_t flowid;
+	struct mbuf *m;
+	uint8_t prio;
+	int q, n, i, error;
+
+	if (!bwfm_pci_gate_enter(sc))
+		return;
+
+	mtx_lock(&sc->sc_flowq_mtx);
+	n = sc->sc_peer_gone_n;
+	memcpy(gone, sc->sc_peer_gone, sizeof(gone));
+	sc->sc_peer_gone_n = 0;
+	mtx_unlock(&sc->sc_flowq_mtx);
+	for (i = 0; i < n; i++)
+		bwfm_pci_msgbuf_flowring_delete_peer(sc, gone[i]);
+
+	for (q = 0; q < 2; q++) {
+		for (;;) {
+			mtx_lock(&sc->sc_flowq_mtx);
+			if ((m = mbufq_dequeue(&sc->sc_flowq[q])) == NULL) {
+				sc->sc_flowq_busy[q] = false;
+				mtx_unlock(&sc->sc_flowq_mtx);
+				break;
+			}
+			mtx_unlock(&sc->sc_flowq_mtx);
+
+			bwfm_pci_tx_key(&sc->bus_sc, mtod(m, const uint8_t *),
+			    key, &prio);
+			error = 0;
+			flowid = bwfm_pci_msgbuf_flowring_lookup(sc, key, prio);
+			if (flowid == (uint16_t)-1) {
+				error = bwfm_pci_msgbuf_flowring_create(sc,
+				    mtod(m, const uint8_t *) + 6, key, prio, 0,
+				    &flowid);
+				if (error != 0)
+					device_printf(sc->sc_dev, "flow ring "
+					    "for %6D prio %u: %d; dropping the "
+					    "frame\n", key, ":", prio, error);
+			}
+			if (error != 0) {
+				m_freem(m);
+				continue;
+			}
+			error = bwfm_pci_msgbuf_txmbuf(sc, flowid, &m, 0);
+			if (error == ENOSPC) {
+				/* Wait at the head, busy, for a TX_STATUS. */
+				mtx_lock(&sc->sc_flowq_mtx);
+				mbufq_prepend(&sc->sc_flowq[q], m);
+				atomic_store_rel_int(&sc->sc_tx_blocked, 1);
+				mtx_unlock(&sc->sc_flowq_mtx);
+				break;
+			}
+		}
+	}
+	bwfm_pci_gate_exit(sc);
+}
+
+void
+bwfm_pci_tx_resume(struct bwfm_pci_softc *sc)
+{
+
+	if (atomic_load_acq_int(&sc->sc_tx_blocked) == 0)
+		return;
+	if (atomic_cmpset_int(&sc->sc_tx_blocked, 1, 0))
+		taskqueue_enqueue(taskqueue_thread, &sc->sc_flow_task);
+}
+
+/*
+ * A station left our access point: delete its rings.  Event context may
+ * not sleep, so queue the address for the flow task.
+ */
+static void
+bwfm_pci_bs_peer_gone(struct bwfm_softc *bsc, const uint8_t mac[6])
+{
+	struct bwfm_pci_softc *sc = SC_TO_PCI(bsc);
+
+	mtx_lock(&sc->sc_flowq_mtx);
+	if (sc->sc_peer_gone_n < BWFM_PCI_PEER_GONE_MAX)
+		memcpy(sc->sc_peer_gone[sc->sc_peer_gone_n++], mac, 6);
+	mtx_unlock(&sc->sc_flowq_mtx);
+	taskqueue_enqueue(taskqueue_thread, &sc->sc_flow_task);
+}
+
+static int
+bwfm_pci_bs_txdata(struct bwfm_softc *bsc, struct mbuf *m)
+{
+	struct bwfm_pci_softc *sc = SC_TO_PCI(bsc);
+	uint8_t da[6];
+	uint16_t flowid;
+	uint8_t prio, ifidx;
+	int error, q;
+
+	if (m == NULL)
+		return (EINVAL);
+
+	/* Convert net80211's 802.11-encapsulated frame back to 802.3. */
+	{
+		int dr = bwfm_deencap_80211(&m);
+		if (dr != 0) {
+			if (m != NULL)
+				m_freem(m);
+			/* EAGAIN == host mgmt/ctl frame: drop, report sent. */
+			return (dr == EAGAIN ? 0 : dr);
+		}
+	}
+	if (m->m_pkthdr.len < ETHER_HDR_LEN) {
+		m_freem(m);
+		return (EINVAL);
+	}
+	if (m->m_len < ETHER_HDR_LEN) {
+		m = m_pullup(m, ETHER_HDR_LEN);
+		if (m == NULL)
+			return (ENOMEM);
+	}
+	bwfm_pci_tx_key(bsc, mtod(m, const uint8_t *), da, &prio);
+	ifidx = 0;
+	q = prio == 7 ? 1 : 0;
+
+	{
+		bool kick = false;
+
+		/*
+		 * Frames wait in order behind a ring that is being made, so
+		 * while the queue is busy every frame of its priority joins
+		 * it, whatever its destination; the task sends each to its
+		 * own ring.
+		 */
+		mtx_lock(&sc->sc_flowq_mtx);
+		if (sc->sc_gate_closed) {
+			mtx_unlock(&sc->sc_flowq_mtx);
+			m_freem(m);
+			return (ENETDOWN);
+		}
+		flowid = sc->sc_flowq_busy[q] ? (uint16_t)-1 :
+		    bwfm_pci_msgbuf_flowring_lookup(sc, da, prio);
+		if (flowid == (uint16_t)-1) {
+			if (mbufq_enqueue(&sc->sc_flowq[q], m) != 0) {
+				mtx_unlock(&sc->sc_flowq_mtx);
+				m_freem(m);
+				return (ENOBUFS);
+			}
+			if (!sc->sc_flowq_busy[q]) {
+				sc->sc_flowq_busy[q] = true;
+				kick = true;
+			}
+			mtx_unlock(&sc->sc_flowq_mtx);
+			if (kick)
+				taskqueue_enqueue(taskqueue_thread,
+				    &sc->sc_flow_task);
+			return (0);
+		}
+		sc->sc_gate_busy++;
+		mtx_unlock(&sc->sc_flowq_mtx);
+	}
+	error = bwfm_pci_msgbuf_txmbuf(sc, flowid, &m, ifidx);
+	if (error == ENOSPC) {
+		/* Ring full: queue behind it until a TX_STATUS frees a slot. */
+		mtx_lock(&sc->sc_flowq_mtx);
+		if (mbufq_enqueue(&sc->sc_flowq[q], m) != 0) {
+			m_freem(m);
+			error = ENOBUFS;
+		} else {
+			sc->sc_flowq_busy[q] = true;
+			atomic_store_rel_int(&sc->sc_tx_blocked, 1);
+			error = 0;
+		}
+		mtx_unlock(&sc->sc_flowq_mtx);
+	}
+	bwfm_pci_gate_exit(sc);
+	return (error);
+}
+
+static void
+bwfm_pci_bs_stop(struct bwfm_softc *bsc __unused)
+{
+}
+
+static int
+bwfm_pci_bs_dcmd_get(struct bwfm_softc *bsc, uint32_t cmd, void *buf,
+    size_t *lenp)
+{
+	struct bwfm_pci_softc *sc = SC_TO_PCI(bsc);
+	int32_t fwerr = 0;
+	int error;
+
+	error = bwfm_pci_msgbuf_dcmd(sc, cmd, false, buf, *lenp,
+	    buf, lenp, &fwerr);
+	if (error == 0 && fwerr != 0)
+		error = EIO;
+	return (error);
+}
+
+static int
+bwfm_pci_bs_dcmd_set(struct bwfm_softc *bsc, uint32_t cmd, const void *buf,
+    size_t len)
+{
+	struct bwfm_pci_softc *sc = SC_TO_PCI(bsc);
+	size_t rlen = 0;
+	int32_t fwerr = 0;
+	int error;
+
+	error = bwfm_pci_msgbuf_dcmd(sc, cmd, true, buf, len,
+	    NULL, &rlen, &fwerr);
+	if (error == 0 && fwerr != 0)
+		error = EIO;
+	return (error);
+}
+
+static int
+bwfm_pci_bs_iovar_get(struct bwfm_softc *bsc, const char *name, void *buf,
+    size_t *lenp)
+{
+	struct bwfm_pci_softc *sc = SC_TO_PCI(bsc);
+
+	return (bwfm_pci_msgbuf_dcmd_get_var(sc, name, buf, lenp));
+}
+
+static int
+bwfm_pci_bs_iovar_set(struct bwfm_softc *bsc, const char *name,
+    const void *buf, size_t len)
+{
+	struct bwfm_pci_softc *sc = SC_TO_PCI(bsc);
+
+	return (bwfm_pci_msgbuf_dcmd_set_var(sc, name, buf, len));
+}
+
+static void
+bwfm_pci_bs_flowring_purge(struct bwfm_softc *bsc)
+{
+	struct bwfm_pci_softc *sc = SC_TO_PCI(bsc);
+
+	if (!bwfm_pci_gate_enter(sc))
+		return;
+	bwfm_pci_msgbuf_flowring_delete_all(sc);
+	bwfm_pci_gate_exit(sc);
+}
+
+static int
+bwfm_pci_bs_wait_eapol_drain(struct bwfm_softc *bsc, int timeout_ms)
+{
+	struct bwfm_pci_softc *sc = SC_TO_PCI(bsc);
+	int error;
+
+	if (!bwfm_pci_gate_enter(sc))
+		return (ENXIO);
+	error = bwfm_pci_msgbuf_wait_eapol_drain(sc, timeout_ms);
+	bwfm_pci_gate_exit(sc);
+	return (error);
+}
+
+static const struct bwfm_bus_ops bwfm_pci_bus_ops = {
+	.bs_txctl	= bwfm_pci_bs_txctl,
+	.bs_rxctl	= bwfm_pci_bs_rxctl,
+	.bs_txdata	= bwfm_pci_bs_txdata,
+	.bs_stop	= bwfm_pci_bs_stop,
+	.bs_dcmd_get	= bwfm_pci_bs_dcmd_get,
+	.bs_dcmd_set	= bwfm_pci_bs_dcmd_set,
+	.bs_iovar_get	= bwfm_pci_bs_iovar_get,
+	.bs_iovar_set	= bwfm_pci_bs_iovar_set,
+	.bs_flowring_purge = bwfm_pci_bs_flowring_purge,
+	.bs_peer_gone	= bwfm_pci_bs_peer_gone,
+	.bs_wait_eapol_drain = bwfm_pci_bs_wait_eapol_drain,
+	/* No bs_pump_rx: the msgbuf ISR delivers asynchronously. */
+};
+
+static void	bwfm_pci_autostart(void *);
+
+static int
+bwfm_pci_attach(device_t dev)
+{
+	struct bwfm_pci_softc *sc = device_get_softc(dev);
+	int error;
+
+	sc->sc_dev = dev;
+	sc->sc_devid = pci_get_device(dev);
+	sc->sc_revid = pci_get_revid(dev);
+	sc->sc_chip = bwfm_pci_chip_lookup(sc->sc_devid);
+	if (sc->sc_chip == NULL) {
+		device_printf(dev,
+		    "attach: no chip-info entry for devid 0x%04x — "
+		    "bringup will be refused\n", sc->sc_devid);
+	} else {
+		device_printf(dev, "attach: chip %s (rambase=0x%x, fw=%s%s)\n",
+		    sc->sc_chip->notes, sc->sc_chip->rambase,
+		    sc->sc_chip->fw_name,
+		    sc->sc_chip->bringup_supported ? "" :
+		    ", bring-up not implemented for this chip");
+	}
+
+	/*
+	 * Prepare the shared bwfm_softc so bwfm_attach() can run later,
+	 * once the firmware is running and msgbuf is up.  bwfm.c expects
+	 * the transport to initialise these mutexes; they survive attach
+	 * failures and are used by any ctlrx thread bwfm.c starts.
+	 */
+	sc->bus_sc.sc_dev = dev;
+	sc->bus_sc.sc_bus_ops = &bwfm_pci_bus_ops;
+	mtx_init(&sc->bus_sc.sc_mtx, device_get_nameunit(dev), NULL, MTX_DEF);
+	mtx_init(&sc->bus_sc.sc_ctl_mtx, "bwfm_pci ctl", NULL, MTX_DEF);
+	TAILQ_INIT(&sc->bus_sc.sc_ctl_pending);
+
+	/*
+	 * Transition to D0 before any device-side access.  On Apple
+	 * machines the EFI handoff parks the BCM43602 in D3-cold; without
+	 * this the very first BAR0 register write faults the host CPU
+	 * before any error-recovery layer can catch it.
+	 *
+	 * pci_set_powerstate goes through config space (PMCSR), which is
+	 * always reachable regardless of device state.  After the write
+	 * the PCI spec mandates up to a 10ms settle window for D3hot->D0;
+	 * 10ms covers both the spec-mandated path and the D3cold case.
+	 */
+	{
+		int pstate_before = pci_get_powerstate(dev);
+
+		if (pstate_before != PCI_POWERSTATE_D0) {
+			pci_set_powerstate(dev, PCI_POWERSTATE_D0);
+			DELAY(10000);
+			PDPRINTF(sc, 0,
+			    "power state: %s -> D0 (%s)\n",
+			    pstate_before == PCI_POWERSTATE_D1 ? "D1" :
+			    pstate_before == PCI_POWERSTATE_D2 ? "D2" :
+			    pstate_before == PCI_POWERSTATE_D3 ? "D3" :
+			    "unknown",
+			    pci_get_powerstate(dev) == PCI_POWERSTATE_D0 ?
+			        "ok" : "FAILED");
+		}
+	}
+
+	pci_enable_busmaster(dev);
+	/*
+	 * Explicitly enable memory-space decoding in the PCI Command
+	 * register.  bus_alloc_resource_any(SYS_RES_MEMORY) is meant
+	 * to do this implicitly via the platform's resource-activation
+	 * path, but behind the Apple A1398 PCH bridges it does not get
+	 * set, and every BAR0 read returns 0xffffffff (the device replies
+	 * "Unsupported Request" because its memory decoder is off).
+	 */
+	pci_enable_io(dev, SYS_RES_MEMORY);
+	{
+		uint16_t cmd = pci_read_config(dev, PCIR_COMMAND, 2);
+		PDPRINTF(sc, 0,
+		    "PCI command 0x%04x (busmaster=%d, mem=%d, io=%d)\n",
+		    cmd,
+		    (cmd & PCIM_CMD_BUSMASTEREN) ? 1 : 0,
+		    (cmd & PCIM_CMD_MEMEN)       ? 1 : 0,
+		    (cmd & PCIM_CMD_PORTEN)      ? 1 : 0);
+	}
+
+	error = bwfm_pci_alloc_bars(sc);
+	if (error != 0)
+		goto fail;
+	error = bwfm_pci_alloc_irq(sc);
+	if (error != 0)
+		goto fail;
+
+	/*
+	 * The Apple AML methods (APPU, the bridge's _PS0, ARPT._PS0) are
+	 * never evaluated: they poll a hardware bit (LACT, link active)
+	 * for up to 10 seconds under the ACPICA interpreter mutex, past
+	 * FreeBSD's spin-lock-held-too-long limit.  Apple's AML assumes
+	 * Darwin's more permissive interpreter locking.  The APPU warm
+	 * sequence below is a C reimplementation instead.
+	 *
+	 * Until then the BAR0 window may not reach chip registers, so log
+	 * only what config space says, plus the BAR sizes.
+	 */
+	{
+		const char *irqkind = sc->sc_msix_count > 0 ? "MSI-X" :
+		    sc->sc_msi ? "MSI" : "INTx";
+
+		device_printf(dev,
+		    "PCI %04x:%04x rev=0x%02x bar0=%#jx/%ju bar2=%#jx/%ju "
+		    "irq=%s(%d)\n",
+		    BWFM_PCI_VENDOR_BROADCOM, sc->sc_devid, sc->sc_revid,
+		    (uintmax_t)rman_get_start(sc->sc_bar0),
+		    (uintmax_t)rman_get_size(sc->sc_bar0),
+		    sc->sc_bar2 != NULL ?
+		        (uintmax_t)rman_get_start(sc->sc_bar2) : (uintmax_t)0,
+		    sc->sc_bar2 != NULL ?
+		        (uintmax_t)rman_get_size(sc->sc_bar2) : (uintmax_t)0,
+		    irqkind,
+		    sc->sc_msix_count > 0 ? sc->sc_msix_count : 1);
+	}
+
+	/*
+	 * No BAR0 register access from attach().  On Apple machines the
+	 * BCM43602's PCIe memory decoder stays gated after EC.APWC=1
+	 * alone, and any blind bus_space_read_4 on BAR0 master-aborts
+	 * the host (MCE, then an immediate reboot with no panic message).
+	 *
+	 * Everything chip-side waits until the warm sequence below has
+	 * run; the rest of the bring-up then happens in the autostart
+	 * thread started at the end of attach, so kldload always finishes
+	 * cleanly.
+	 */
+	/*
+	 * Firmware crash-recovery task.  Off by default (threshold 0); see
+	 * sc_crash_recover_threshold.
+	 */
+	TASK_INIT(&sc->sc_crash_recover_task, 0,
+	    bwfm_pci_crash_recover_task, sc);
+	sc->sc_recover_tq = taskqueue_create("bwfm_pci_recover", M_WAITOK,
+	    taskqueue_thread_enqueue, &sc->sc_recover_tq);
+	taskqueue_start_threads(&sc->sc_recover_tq, 1, PI_NET, "%s recover",
+	    device_get_nameunit(dev));
+	mtx_init(&sc->sc_flowq_mtx, "bwfm_pci flowq", NULL, MTX_DEF);
+	mbufq_init(&sc->sc_flowq[0], BWFM_PCI_FLOWQ_LEN);
+	mbufq_init(&sc->sc_flowq[1], BWFM_PCI_FLOWQ_LEN);
+	TASK_INIT(&sc->sc_flow_task, 0, bwfm_pci_flow_task, sc);
+	sc->sc_crash_recover_threshold = 0;
+
+	/* After the gate's mutex: sysctl handlers send firmware commands. */
+	bwfm_pci_attach_sysctls(sc);
+
+	/*
+	 * Run the APPU warm sequence now, before anything touches BAR0.
+	 * After a normal EFI boot the chip is already warm and this
+	 * returns on the first ~10ms poll; a cold chip (after a wedge, or
+	 * a deep S5 wake) gets up to 5 attempts of 10s each.
+	 *
+	 * APPU is EC port I/O and a config-space poll only, with no BAR0
+	 * writes, so unlike a watchdog reset it cannot wedge a
+	 * cold chip.
+	 *
+	 * If APPU fails after all retries, attach still succeeds; the chip
+	 * just is not usable until something else warms it (a macOS boot,
+	 * a power cycle).
+	 */
+	{
+		int do_appu = bwfm_pci_attach_appu_warm_dflt;
+		int rc;
+
+		if (!do_appu) {
+			device_printf(dev,
+			    "attach: hw.bwfm_pci.attach_appu_warm=0 - "
+			    "skipping APPU (opt-out).\n");
+		} else {
+			rc = bwfm_pci_apple_appu_warm(sc);
+			if (rc != 0) {
+				device_printf(dev,
+				    "attach: APPU warm failed rc=%d - chip "
+				    "likely unusable this session.\n",
+				    rc);
+				goto attach_done;
+			}
+			device_printf(dev, "attach: APPU warm succeeded.\n");
+		}
+
+		/* Then dstate_cycle and chip_probe, both config space only. */
+		rc = bwfm_pci_apple_dstate_cycle(sc);
+		if (rc != 0) {
+			device_printf(dev,
+			    "attach: dstate_cycle failed rc=%d - "
+			    "continuing.\n",
+			    rc);
+		}
+
+		{
+			uint16_t vid, did, cmd;
+
+			vid = pci_read_config(dev, PCIR_VENDOR, 2);
+			did = pci_read_config(dev, PCIR_DEVICE, 2);
+			cmd = pci_read_config(dev, PCIR_COMMAND, 2);
+			device_printf(dev,
+			    "attach: chip_probe vid=0x%04x did=0x%04x "
+			    "cmd=0x%04x memen=%d bme=%d\n",
+			    vid, did, cmd,
+			    (cmd & PCIM_CMD_MEMEN) ? 1 : 0,
+			    (cmd & PCIM_CMD_BUSMASTEREN) ? 1 : 0);
+			sc->sc_chip_alive = (vid != 0xffff &&
+			    (cmd & PCIM_CMD_MEMEN) != 0);
+		}
+
+		PDPRINTF(sc, 0,
+		    "attach: warm sequence complete (APPU + dstate_cycle + "
+		    "chip_probe).\n");
+	}
+
+	/*
+	 * Point BAR0_WIN1 (PCI cfg 0x80) at CHIPCOMMON (0x18000000) so
+	 * BAR0[0..0x1000) MMIO reads land on ChipCommon registers (CHIPID
+	 * at BAR0[0], CAPS at BAR0[4], and so on), which later code
+	 * assumes.  Otherwise BAR0 shows whatever the firmware or previous
+	 * OS left in WIN1, typically 0x18003000 (the PCIe2 core), whose
+	 * offset 0 reads 0xffffffff and looks like a cold chip.
+	 *
+	 * The config-space write is safe even with BAR0 cold, since config
+	 * space is served by the root complex, not the chip.
+	 */
+	pci_write_config(dev, BWFM_PCI_BAR0_WINDOW, 0x18000000, 4);
+	(void)pci_read_config(dev, BWFM_PCI_BAR0_WINDOW, 4);
+	device_printf(dev,
+	    "attach: BAR0_WIN1 (cfg 0x%02x) = 0x18000000 (CHIPCOMMON)\n",
+	    BWFM_PCI_BAR0_WINDOW);
+
+attach_done:
+
+	sc->bus_sc.sc_dev = dev;
+	sc->bus_sc.sc_bus_ops = &bwfm_pci_bus_ops;
+
+	if (bwfm_pci_autostart_dflt && sc->sc_chip_alive &&
+	    sc->sc_chip != NULL && sc->sc_chip->bringup_supported) {
+		char name[MAXCOMLEN + 1];
+
+		atomic_store_bool(&sc->sc_autostart_running, true);
+		snprintf(name, sizeof(name), "%s start",
+		    device_get_nameunit(dev));
+		if (bwfm_kproc_start(bwfm_pci_autostart, sc,
+		    &sc->sc_autostart_proc, name) != 0) {
+			atomic_store_bool(&sc->sc_autostart_running, false);
+			device_printf(dev, "attach: could not start the "
+			    "autostart thread\n");
+		}
+	}
+	return (0);
+
+fail:
+	bwfm_pci_free_irq(sc);
+	bwfm_pci_free_bars(sc);
+	pci_disable_busmaster(dev);
+	return (error);
+}
+
+static int
+bwfm_pci_detach(device_t dev)
+{
+	struct bwfm_pci_softc *sc = device_get_softc(dev);
+	struct bwfm_softc *bsc = &sc->bus_sc;
+
+	/*
+	 * Refuse detach while net80211 still holds callbacks into our module
+	 * text.  Mirrors SDIO/USB transports: `ifconfig wlan0 destroy` must
+	 * happen first, then `sysctl dev.bwfm_pci.N.net80211_detach=1`, only
+	 * then `kldunload bwfm_pci` (or `devctl detach`).  Without this the
+	 * next iv_op after our text vanishes panics the box.
+	 */
+	if (BWFM_IC_UP(bsc)) {
+		device_printf(dev,
+		    "detach refused: net80211 still attached "
+		    "(sysctl dev.bwfm_pci.%d.net80211_detach=1 first, "
+		    "after `ifconfig wlan0 destroy`)\n", device_get_unit(dev));
+		return (EBUSY);
+	}
+
+	/*
+	 * Mark dying and take the recovery queue away in one step,
+	 * then let a running recovery finish.
+	 */
+	{
+		struct taskqueue *tq = NULL;
+
+		if (mtx_initialized(&sc->sc_flowq_mtx)) {
+			mtx_lock(&sc->sc_flowq_mtx);
+			atomic_store_bool(&bsc->sc_dying, true);
+			tq = sc->sc_recover_tq;
+			sc->sc_recover_tq = NULL;
+			mtx_unlock(&sc->sc_flowq_mtx);
+		} else
+			atomic_store_bool(&bsc->sc_dying, true);
+		if (tq != NULL) {
+			taskqueue_drain(tq, &sc->sc_crash_recover_task);
+			taskqueue_free(tq);
+		}
+	}
+
+	/*
+	 * Teardown ordering (reverse of attach — LIFO):
+	 *
+	 *   1. Set sc_dying + wake in-flight DCMD sleepers so any caller
+	 *      currently blocked in a DCMD bails through the
+	 *      sc_dying check before we destroy the mutex it sleeps on.
+	 *   2. If chip is up, send WLC_DOWN so fw stops autonomous DMA
+	 *      (event bursts, scan results) before we tear the ISR down.
+	 *   3. msgbuf_detach — masks chip interrupt, unbinds ISR, drains
+	 *      event task, reclaims RX/TX/event/flow DMA rings + mbufs,
+	 *      destroys msgbuf-internal mutexes/cv/sx.
+	 *   4. Drain the bwfm.c taskqueue tasks (scan_done, link, assoc,
+	 *      disassoc, post_assoc) and our flow task.  They fire from the
+	 *      msgbuf ISR path via bwfm_handle_event, and the ISR is now
+	 *      unbound.  Drain unconditionally: the task structs live in
+	 *      the zeroed softc, so draining one never initialised or
+	 *      never queued is a no-op.
+	 *   5. Free IRQ and BARs (msgbuf_unbind_intr already tore down the
+	 *      handler; free_irq just releases SYS_RES_IRQ and the MSI/MSI-X
+	 *      vectors).
+	 *   6. Destroy the sc_ctl_mtx / sc_mtx pair from attach.  Must come
+	 *      after step 1 (no sleepers left).
+	 *   7. pci_disable_busmaster (config space only, safe after the BARs
+	 *      are released; no chip MMIO past this point).
+	 */
+
+	atomic_store_bool(&bsc->sc_dying, true);
+	if (mtx_initialized(&bsc->sc_ctl_mtx)) {
+		struct bwfm_ctl_req *r;
+
+		mtx_lock(&bsc->sc_ctl_mtx);
+		TAILQ_FOREACH(r, &bsc->sc_ctl_pending, link)
+			wakeup(r);
+		/*
+		 * Wait for any caller blocked in a dcmd to bail
+		 * through the sc_dying check before we destroy the mutex
+		 * they sleep on.  Each wakeup (or the 1s timeout) rechecks
+		 * sc_dying, so the wait is bounded.
+		 */
+		while (bsc->sc_in_flight_dcmd != 0)
+			(void)mtx_sleep(&bsc->sc_in_flight_dcmd,
+			    &bsc->sc_ctl_mtx, 0, "bwfmdcd", hz);
+		mtx_unlock(&bsc->sc_ctl_mtx);
+	}
+	/* Let a bring-up in progress stop at its next step. */
+	bwfm_kproc_wait(&sc->sc_autostart_proc);
+
+	/*
+	 * Best-effort chip quiesce: WLC_DOWN before killing the ISR so fw
+	 * stops autonomous DMA (event bursts, scan results, per-flowring
+	 * beacon delivery) that would otherwise hit a torn-down landing
+	 * zone.  Skip if bringup never fired — no chip context to quiesce
+	 * and the DCMD would just error.  Ignore return: chip may already
+	 * be halted, and by this point the alternative is limping past.
+	 *
+	 * Note: sc_wlc_up mirrors fw pub->up state (set by the autostart
+	 * thread and bwfm.c's post-WLC_UP paths).
+	 */
+	if (BWFM_WLC_UP(bsc)) {
+		(void)bwfm_pci_msgbuf_dcmd_set_int(sc, BWFM_C_DOWN, 0);
+		atomic_store_bool(&bsc->sc_wlc_up, false);
+	}
+
+	/*
+	 * The flow task sends queued frames through the msgbuf rings and
+	 * pktid table, so shut transmit out before they are freed.
+	 */
+	if (mtx_initialized(&sc->sc_flowq_mtx))
+		bwfm_pci_gate_close(sc);
+
+	/*
+	 * WLC_DOWN does not stop the firmware writing completions and RX
+	 * data into host memory.  Stop it mastering the bus before the
+	 * rings and posted mbufs are freed, as cold_reattach does.
+	 */
+	pci_disable_busmaster(dev);
+
+	/*
+	 * msgbuf teardown.  Idempotent — safe to call even if
+	 * msgbuf_attach was never fired (mb->attached is false in a
+	 * freshly zeroed softc; detach short-circuits).
+	 */
+	bwfm_pci_msgbuf_detach(sc);
+
+	/*
+	 * Drain bwfm.c's task queue callbacks.  bwfm_detach (called by
+	 * the user via net80211_detach sysctl before us) tore down the
+	 * ieee80211com but did NOT drain these tasks — that's our job on
+	 * the transport side (mirrors USB's bwfm_usb_teardown).  ISR is
+	 * unbound at this point (msgbuf_detach did it), so no new
+	 * enqueues can happen from the interrupt path.
+	 */
+	bwfm_rx_close(bsc);
+	bwfm_drain_tasks(bsc);
+	if (bsc->sc_tasks_inited) {
+		mtx_destroy(&bsc->sc_key_mtx);
+		bsc->sc_tasks_inited = false;
+	}
+	taskqueue_drain(taskqueue_thread, &sc->sc_flow_task);
+	if (mtx_initialized(&sc->sc_flowq_mtx)) {
+		mbufq_drain(&sc->sc_flowq[0]);
+		mbufq_drain(&sc->sc_flowq[1]);
+		mtx_destroy(&sc->sc_flowq_mtx);
+	}
+
+	bwfm_pci_free_irq(sc);
+	bwfm_pci_free_bars(sc);
+
+	if (sc->sc_fw != NULL) {
+		firmware_put(sc->sc_fw, FIRMWARE_UNLOAD);
+		sc->sc_fw = NULL;
+	}
+
+	/*
+	 * Destroy the transport-owned mutexes last.  bwfm.c documents
+	 * that these are the transport's responsibility (see the comment
+	 * on bwfm_softc.sc_mtx / sc_ctl_mtx).  All in-flight sleepers
+	 * bailed in step 1; no other codepath can touch these now.
+	 */
+	if (mtx_initialized(&bsc->sc_ctl_mtx))
+		mtx_destroy(&bsc->sc_ctl_mtx);
+	if (mtx_initialized(&bsc->sc_mtx))
+		mtx_destroy(&bsc->sc_mtx);
+	bsc->sc_bus_ops = NULL;
+	return (0);
+}
+
+/* ------------------------------------------------------------------
+ * MSGBUF accessors — bridge functions consumed by bwfm_pci_msgbuf.c.
+ * Kept here so that file needs no visibility into bwfm_pci_softc.
+ * ------------------------------------------------------------------ */
+uint32_t
+bwfm_pci_msgbuf_pcie2_base(struct bwfm_pci_softc *sc)
+{
+	int i;
+
+	for (i = 0; i < sc->sc_ncores; i++)
+		if (sc->sc_cores[i].id == BWFM_CORE_PCIE2)
+			return (sc->sc_cores[i].base);
+	return (0);
+}
+
+void
+bwfm_pci_msgbuf_set_window(struct bwfm_pci_softc *sc, uint32_t addr)
+{
+	bwfm_pci_set_window(sc, addr);
+}
+
+struct resource *
+bwfm_pci_msgbuf_bar0(struct bwfm_pci_softc *sc)		{ return (sc->sc_bar0); }
+struct resource *
+bwfm_pci_msgbuf_bar2(struct bwfm_pci_softc *sc)		{ return (sc->sc_bar2); }
+bus_space_tag_t
+bwfm_pci_msgbuf_bar0_tag(struct bwfm_pci_softc *sc)	{ return (sc->sc_bar0_t); }
+bus_space_handle_t
+bwfm_pci_msgbuf_bar0_handle(struct bwfm_pci_softc *sc)	{ return (sc->sc_bar0_h); }
+bus_space_tag_t
+bwfm_pci_msgbuf_bar2_tag(struct bwfm_pci_softc *sc)	{ return (sc->sc_bar2_t); }
+bus_space_handle_t
+bwfm_pci_msgbuf_bar2_handle(struct bwfm_pci_softc *sc)	{ return (sc->sc_bar2_h); }
+device_t
+bwfm_pci_msgbuf_dev(struct bwfm_pci_softc *sc)		{ return (sc->sc_dev); }
+int
+bwfm_pci_msgbuf_debug(struct bwfm_pci_softc *sc)	{ return (sc->bus_sc.sc_debug); }
+uint32_t
+bwfm_pci_msgbuf_rambase(struct bwfm_pci_softc *sc __unused)
+{
+	return (BWFM_PCI_RAMBASE_43602);
+}
+uint32_t
+bwfm_pci_msgbuf_ramsize(struct bwfm_pci_softc *sc)
+{
+	/*
+	 * Return the cached value.  bwfm_pci_ramsize_query halts the
+	 * ARM CR4 (BWFM_ARMCR4_IOCTL_CPUHALT) to read the TCM BANKINFO;
+	 * after bring-up that would kill the running firmware and hang
+	 * the host on the next TCM access.
+	 */
+	if (sc->sc_fw_ramsize != 0)
+		return (sc->sc_fw_ramsize);
+	/* Before bring-up has cached it. */
+	{
+		uint32_t sz = 0;
+		(void)bwfm_pci_ramsize_query(sc, &sz);
+		return (sz);
+	}
+}
+struct bwfm_pci_msgbuf *
+bwfm_pci_msgbuf_state(struct bwfm_pci_softc *sc)
+{
+	return (&sc->sc_msgbuf);
+}
+
+int
+bwfm_pci_msgbuf_bind_intr(struct bwfm_pci_softc *sc,
+    driver_filter_t *filter, driver_intr_t *thread, void *arg)
+{
+	int error;
+
+	if (sc->sc_irq == NULL)
+		return (ENXIO);
+	if (sc->sc_irq_handle != NULL)
+		return (EBUSY);
+	error = bus_setup_intr(sc->sc_dev, sc->sc_irq,
+	    INTR_TYPE_NET | INTR_MPSAFE, filter, thread, arg,
+	    &sc->sc_irq_handle);
+	if (error != 0) {
+		device_printf(sc->sc_dev,
+		    "msgbuf: bus_setup_intr failed: %d\n", error);
+		sc->sc_irq_handle = NULL;
+	}
+	return (error);
+}
+
+void
+bwfm_pci_msgbuf_event_up(struct bwfm_pci_softc *sc, const uint8_t *payload,
+    size_t len)
+{
+	if (!BWFM_IC_UP(&sc->bus_sc))
+		return;
+	/*
+	 * Msgbuf event buffer layout: 14 B Ethernet header + 10 B
+	 * bwfm_ethhdr + 48 B bwfm_event_msg + data.  bwfm_handle_event
+	 * expects `evpos` = offset of the event_msg = 24.  Events come
+	 * only on the firmware's event ring; data frames never get here.
+	 */
+	if (!bwfm_is_event_frame(payload, len) || !bwfm_rx_enter(&sc->bus_sc))
+		return;
+	bwfm_handle_event(&sc->bus_sc, payload, len, 24);
+	bwfm_rx_exit(&sc->bus_sc);
+}
+
+void
+bwfm_pci_msgbuf_rx_up(struct bwfm_pci_softc *sc, struct mbuf *m, int rssi_dbm)
+{
+	if (!BWFM_IC_UP(&sc->bus_sc) || m == NULL) {
+		if (m != NULL)
+			m_freem(m);
+		return;
+	}
+	(void)rssi_dbm;
+#ifdef BWFM_PCI_PROBE_ONLY
+	m_freem(m);
+#else
+	/* Data and EAPOL alike: the framework delivers to the vap. */
+	if (!bwfm_rx_enter(&sc->bus_sc)) {
+		m_freem(m);
+		return;
+	}
+	bwfm_rx_data(&sc->bus_sc, m);
+	bwfm_rx_exit(&sc->bus_sc);
+#endif
+}
+
+/* The msgbuf layer's rx buffer pool is whole again after a shortage. */
+void
+bwfm_pci_msgbuf_rx_starved(struct bwfm_pci_softc *sc)
+{
+#ifndef BWFM_PCI_PROBE_ONLY
+	if (BWFM_IC_UP(&sc->bus_sc))
+		bwfm_rx_starved(&sc->bus_sc);
+#else
+	(void)sc;
+#endif
+}
+
+void
+bwfm_pci_msgbuf_unbind_intr(struct bwfm_pci_softc *sc)
+{
+	if (sc->sc_irq_handle == NULL)
+		return;
+	bus_teardown_intr(sc->sc_dev, sc->sc_irq, sc->sc_irq_handle);
+	sc->sc_irq_handle = NULL;
+}
+
+/* WLC_GET_VAR */
+#define	BWFM_DCMD_GET_VAR	262
+
+/* Firmware setup run before net80211 attach and after a cold reattach. */
+static void
+bwfm_pci_preinit_dcmds(struct bwfm_pci_softc *sc)
+{
+	uint8_t evmask[BWFM_EVENT_MASK_LEN];
+	uint8_t buf[128];
+	size_t rlen;
+	uint32_t v;
+	int error;
+
+	/* GET revinfo (informational). */
+	error = bwfm_pci_msgbuf_dcmd_get_int(sc, BWFM_C_GET_REVINFO, &v);
+	device_printf(sc->sc_dev,
+	    "preinit: GET revinfo=0x%08x (err=%d)\n", v, error);
+
+	/* GET ver (informational). */
+	memset(buf, 0, sizeof(buf));
+	rlen = sizeof(buf);
+	error = bwfm_pci_msgbuf_dcmd_get_var(sc, "ver", buf, &rlen);
+	if (error == 0 && rlen > 0) {
+		buf[sizeof(buf) - 1] = 0;
+		device_printf(sc->sc_dev,
+		    "preinit: GET ver=\"%s\"\n", (char *)buf);
+	}
+
+	/* SET mpc=1. */
+	v = htole32(1);
+	error = bwfm_pci_msgbuf_dcmd_set_var(sc, "mpc", &v, sizeof(v));
+	device_printf(sc->sc_dev,
+	    "preinit: SET mpc=1 (err=%d)\n", error);
+
+	/*
+	 * GET current event_msgs, add the events we handle, SET back.
+	 * Add the same set the SDIO path uses: the 43602 firmware's
+	 * defaults do not include ESCAN_RESULT, so adding only E_IF
+	 * leaves scans silent.
+	 */
+	memset(evmask, 0, sizeof(evmask));
+	rlen = sizeof(evmask);
+	error = bwfm_pci_msgbuf_dcmd_get_var(sc, "event_msgs", evmask,
+	    &rlen);
+	device_printf(sc->sc_dev,
+	    "preinit: GET event_msgs (err=%d)\n", error);
+#define	SETBIT(m, b)	((m)[(b) / 8] |= 1u << ((b) % 8))
+	SETBIT(evmask, BWFM_E_IF);
+	SETBIT(evmask, BWFM_E_TYPE_ESCAN_RESULT);
+	SETBIT(evmask, BWFM_E_TYPE_LINK);
+	SETBIT(evmask, BWFM_E_TYPE_AUTH);
+	SETBIT(evmask, BWFM_E_TYPE_ASSOC);
+	SETBIT(evmask, BWFM_E_TYPE_DISASSOC);
+	SETBIT(evmask, BWFM_E_DEAUTH);
+	SETBIT(evmask, BWFM_E_TYPE_SET_SSID);
+	SETBIT(evmask, BWFM_E_TYPE_JOIN);
+	SETBIT(evmask, BWFM_E_AUTH_IND);	/* access point stations */
+	SETBIT(evmask, BWFM_E_DEAUTH_IND);
+	SETBIT(evmask, BWFM_E_ASSOC_IND);
+	SETBIT(evmask, BWFM_E_REASSOC_IND);
+	SETBIT(evmask, BWFM_E_DISASSOC_IND);
+	SETBIT(evmask, BWFM_E_ROAM);
+#undef	SETBIT
+	error = bwfm_pci_msgbuf_dcmd_set_var(sc, "event_msgs", evmask,
+	    sizeof(evmask));
+	device_printf(sc->sc_dev,
+	    "preinit: SET event_msgs (err=%d)\n", error);
+
+	/* SET SCAN_CHANNEL_TIME=40. */
+	error = bwfm_pci_msgbuf_dcmd_set_int(sc,
+	    BWFM_C_SET_SCAN_CHANNEL_TIME, 40);
+	device_printf(sc->sc_dev,
+	    "preinit: SET SCAN_CHANNEL_TIME=40 (err=%d)\n", error);
+
+	/* SET SCAN_UNASSOC_TIME=40. */
+	error = bwfm_pci_msgbuf_dcmd_set_int(sc,
+	    BWFM_C_SET_SCAN_UNASSOC_TIME, 40);
+	device_printf(sc->sc_dev,
+	    "preinit: SET SCAN_UNASSOC_TIME=40 (err=%d)\n", error);
+
+	/* SET txbf=1 (best-effort). */
+	v = htole32(1);
+	error = bwfm_pci_msgbuf_dcmd_set_var(sc, "txbf", &v, sizeof(v));
+	device_printf(sc->sc_dev,
+	    "preinit: SET txbf=1 (err=%d)\n", error);
+}
+
+/*
+ * Bring up the net80211 attachment.  Reads the chip's MAC via
+ * GET_VAR("cur_etheraddr"), populates the shared bwfm_softc, runs
+ * the preinit DCMD chain, and calls bwfm_attach() to expose the
+ * driver as wlan0.  Idempotent — subsequent writes with sc_ic
+ * already attached return 0 without side effects.
+ */
+static int
+bwfm_pci_net80211_attach(struct bwfm_pci_softc *sc)
+{
+	struct bwfm_softc *bsc = &sc->bus_sc;
+	uint8_t mac[6] = { 0 };
+	size_t rlen = sizeof(mac);
+	int error;
+
+	if (BWFM_IC_UP(bsc)) {
+		device_printf(sc->sc_dev,
+		    "net80211_attach: already attached\n");
+		return (0);
+	}
+	error = bwfm_pci_msgbuf_dcmd_get_var(sc, "cur_etheraddr", mac, &rlen);
+	if (error != 0 || rlen != sizeof(mac)) {
+		device_printf(sc->sc_dev,
+		    "net80211_attach: cur_etheraddr get failed (err=%d "
+		    "rlen=%zu) — did you run msgbuf_attach first?\n",
+		    error, rlen);
+		return (error != 0 ? error : EIO);
+	}
+	memcpy(bsc->sc_macaddr, mac, sizeof(mac));
+	device_printf(sc->sc_dev,
+	    "net80211_attach: chip MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
+	    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+	/*
+	 * Run the preinit DCMDs before net80211 attach so the chip is
+	 * configured by the time any scan or join request can arrive
+	 * from userland.
+	 */
+	bwfm_pci_preinit_dcmds(sc);
+
+	error = bwfm_attach(bsc);
+	if (error != 0) {
+		device_printf(sc->sc_dev,
+		    "net80211_attach: bwfm_attach failed %d\n", error);
+		return (error);
+	}
+	/*
+	 * Leave sup_wpa unset at attach — the join dispatch chooses the
+	 * mode later.  bwfm_join_wpa2 sets sup_wpa=1 (fw supplicant, PSK
+	 * offload, Linux brcmfmac parity — needed for the fw to actually
+	 * encrypt post-4-way data with the correct PTK); bwfm_join_wpa2_
+	 * host_eapol sets sup_wpa=0 (userspace wpa_supplicant runs 4-way,
+	 * wsec_key installs the PTK we derived).  Forcing sup_wpa=0 here
+	 * would break the firmware-supplicant mode: the chip would not
+	 * transmit data, since the wsec_key path is not running.
+	 */
+	device_printf(sc->sc_dev,
+	    "net80211_attach: OK — create wlan0 with "
+	    "`ifconfig wlan0 create wlandev %s`\n",
+	    device_get_nameunit(sc->sc_dev));
+	return (0);
+}
+
+/*
+ * The whole bring-up, with pauses between steps: firmware (unless it is
+ * already running), msgbuf, WLC_UP, net80211.  Runs in its own thread so
+ * kldload returns at once, and stops between steps if the device is
+ * detaching.
+ */
+static void
+bwfm_pci_autostart(void *arg)
+{
+	struct bwfm_pci_softc *sc = arg;
+	struct bwfm_softc *bsc = &sc->bus_sc;
+	const char *step = "firmware";
+	int error = 0;
+
+	device_printf(sc->sc_dev, "autostart: bringing the chip up\n");
+	if (!atomic_load_bool(&sc->sc_fw_running) &&
+	    (error = bwfm_pci_bringup_sequence(sc)) != 0)
+		goto out;
+	if (BWFM_DYING(bsc))
+		goto out;
+	step = "msgbuf";
+	if ((error = bwfm_pci_msgbuf_attach(sc)) != 0)
+		goto out;
+	pause("bwfmup", 2 * hz);
+	if (BWFM_DYING(bsc))
+		goto out;
+	step = "WLC_UP";
+	if ((error = bwfm_pci_msgbuf_dcmd_set_int(sc, BWFM_C_UP, 0)) != 0)
+		goto out;
+	atomic_store_bool(&bsc->sc_wlc_up, true);
+	pause("bwfmup", hz);
+	if (BWFM_DYING(bsc))
+		goto out;
+	step = "net80211";
+	error = bwfm_pci_net80211_attach(sc);
+out:
+	if (BWFM_DYING(bsc))
+		device_printf(sc->sc_dev, "autostart: stopped at %s for "
+		    "detach\n", step);
+	else if (error != 0)
+		device_printf(sc->sc_dev, "autostart: %s failed (%d)\n",
+		    step, error);
+	else
+		device_printf(sc->sc_dev, "autostart: up; %s is in "
+		    "net.wlan.devices\n", device_get_nameunit(sc->sc_dev));
+	atomic_thread_fence_rel();
+	atomic_store_bool(&sc->sc_autostart_running, false);
+	kproc_exit(0);
+}
+
+/* Sysctl: detach net80211 (undo net80211_attach). */
+static int
+bwfm_pci_sysctl_net80211_detach(SYSCTL_HANDLER_ARGS)
+{
+	struct bwfm_pci_softc *sc = arg1;
+	struct bwfm_softc *bsc = &sc->bus_sc;
+	int trig = 0, error;
+
+	error = sysctl_handle_int(oidp, &trig, 0, req);
+	if (error != 0 || req->newptr == NULL || trig == 0)
+		return (error);
+
+	if (!BWFM_IC_UP(bsc)) {
+		device_printf(sc->sc_dev,
+		    "net80211_detach: not attached\n");
+		return (0);
+	}
+	bwfm_detach(bsc);
+	device_printf(sc->sc_dev, "net80211_detach: OK\n");
+	return (0);
+}
+
+/*
+ * ACPI S3 / D3 suspend/resume.  Refused by default (opt in with
+ * hw.bwfm_pci.pm_supported=1).  Warm resume works when the platform
+ * keeps aux power to the chip; after a cold resume (chip power off)
+ * resume falls back to bwfm_pci_cold_reattach, and if that fails the
+ * module has to be reloaded.
+ *
+ *   - Suspend: brings VAPs to INIT, sends WLC_DOWN, then the mbdata
+ *     D3 handshake (H2D_HOST_D3_INFORM + wait for D2H_DEV_D3_ACK,
+ *     2 s timeout).  If the fw acks, DMA is quiesced before ACPI
+ *     removes power.
+ *   - Resume: sends H2D_HOST_D0_INFORM (the firmware does not ack
+ *     D0), then re-issues WLC_UP.  If WLC_UP succeeds the chip was
+ *     warm and net80211 is usable again; otherwise the chip is
+ *     treated as cold and rebuilt.
+ */
+static int bwfm_pci_pm_supported = 0;
+SYSCTL_INT(_hw_bwfm_pci, OID_AUTO, pm_supported, CTLFLAG_RDTUN,
+    &bwfm_pci_pm_supported, 0,
+    "Allow S3/D3 suspend/resume attempts.  Default 0 = refuse suspend "
+    "(safe).  Set to 1 in loader.conf for best-effort warm-resume; "
+    "cold resume still requires kldunload+kldload.");
+
+static int
+bwfm_pci_suspend(device_t dev)
+{
+	struct bwfm_pci_softc *sc = device_get_softc(dev);
+	struct bwfm_softc *bsc = &sc->bus_sc;
+	struct ieee80211vap *vap;
+	uint32_t v;
+
+	if (!bwfm_pci_pm_supported) {
+		device_printf(dev,
+		    "suspend refused (hw.bwfm_pci.pm_supported=0); "
+		    "set to 1 in loader.conf to opt into best-effort PM\n");
+		return (EOPNOTSUPP);
+	}
+
+	/*
+	 * Best-effort suspend: bring each vap back to INIT so net80211
+	 * flushes state cleanly, then send WLC_DOWN so the fw stops
+	 * autonomous DMA before the bus takes the chip's power away.
+	 */
+	if (BWFM_IC_UP(bsc)) {
+		vap = TAILQ_FIRST(&bsc->sc_ic.ic_vaps);
+		if (vap != NULL)
+			(void)ieee80211_new_state(vap, IEEE80211_S_INIT, -1);
+	}
+	if (BWFM_WLC_UP(bsc)) {
+		v = htole32(0);
+		(void)bwfm_dcmd_set(bsc, BWFM_C_DOWN, &v, sizeof(v));
+		atomic_store_bool(&bsc->sc_wlc_up, false);
+	}
+
+	/*
+	 * D3 mailbox handshake: send H2D_HOST_D3_INFORM and wait up to
+	 * 2 s for the fw to reply with D2H_DEV_D3_ACK.  Ack means fw has
+	 * quiesced its DMA and is ready for the bus to remove power;
+	 * silence past the timeout is not fatal, and resume copes with
+	 * whatever state the chip is left in.
+	 */
+	{
+		int rc = bwfm_pci_msgbuf_send_mb_data(sc,
+		    BWFM_H2D_HOST_D3_INFORM);
+		if (rc == 0) {
+			rc = bwfm_pci_msgbuf_wait_mb_ack(sc,
+			    BWFM_D2H_DEV_D3_ACK, 2000);
+			device_printf(dev,
+			    "suspend: D3_INFORM sent, D3_ACK rc=%d\n", rc);
+		} else {
+			device_printf(dev,
+			    "suspend: D3_INFORM send rc=%d — proceeding "
+			    "without ack\n", rc);
+		}
+	}
+	device_printf(dev, "suspend: WLC_DOWN + D3, awaiting resume\n");
+	return (0);
+}
+
+static int
+bwfm_pci_resume(device_t dev)
+{
+	struct bwfm_pci_softc *sc = device_get_softc(dev);
+	struct bwfm_softc *bsc = &sc->bus_sc;
+	uint32_t v;
+
+	if (!bwfm_pci_pm_supported)
+		return (0);
+
+	/*
+	 * D0 mailbox notify: after ACPI has restored bus power the
+	 * fw expects H2D_HOST_D0_INFORM before it will accept any
+	 * DMA / DCMD traffic again.  The firmware does not ack D0 the
+	 * way it acks D3.  If the D3 side never reached the firmware the
+	 * message is meaningless but harmless.
+	 */
+	(void)bwfm_pci_msgbuf_send_mb_data(sc, BWFM_H2D_HOST_D0_INFORM);
+
+	/*
+	 * Warm resume: if config space still reads the chip's vendor ID
+	 * the PCIe link is up and the firmware is likely alive, so
+	 * re-issuing WLC_UP is all that is needed.  Config space is
+	 * served by the root complex, so the probe is safe even on a cold
+	 * chip; it just returns 0xffff and we take the cold path.
+	 */
+	if (bwfm_pci_chip_alive_cfg(sc)) {
+		v = htole32(1);
+		if (bwfm_dcmd_set(bsc, BWFM_C_UP, &v, sizeof(v)) == 0) {
+			atomic_store_bool(&bsc->sc_wlc_up, true);
+			device_printf(dev,
+			    "resume: warm ok (chip retained)\n");
+			return (0);
+		}
+		device_printf(dev,
+		    "resume: warm WLC_UP failed — falling back to cold\n");
+	} else {
+		device_printf(dev,
+		    "resume: chip cfg absent — cold reattach\n");
+	}
+
+	/*
+	 * Cold resume: the firmware is gone, so rebuild everything (see
+	 * bwfm_pci_cold_reattach).  net80211 stays attached and the VAP
+	 * re-associates once the firmware is up.
+	 */
+	if (bwfm_pci_cold_reattach(sc) != 0) {
+		device_printf(dev,
+		    "resume: cold reattach failed — kldunload+kldload "
+		    "to recover\n");
+	}
+	return (0);
+}
+
+static device_method_t bwfm_pci_methods[] = {
+	DEVMETHOD(device_probe,		bwfm_pci_probe),
+	DEVMETHOD(device_attach,	bwfm_pci_attach),
+	DEVMETHOD(device_detach,	bwfm_pci_detach),
+	DEVMETHOD(device_suspend,	bwfm_pci_suspend),
+	DEVMETHOD(device_resume,	bwfm_pci_resume),
+	DEVMETHOD_END
+};
+
+static driver_t bwfm_pci_driver = {
+	"bwfm_pci",
+	bwfm_pci_methods,
+	sizeof(struct bwfm_pci_softc)
+};
+
+DRIVER_MODULE(bwfm_pci, pci, bwfm_pci_driver, NULL, NULL);
+MODULE_DEPEND(bwfm_pci, pci, 1, 1, 1);
+#ifndef BWFM_PCI_PROBE_ONLY
+MODULE_DEPEND(bwfm_pci, wlan, 1, 1, 1);
+#endif
+MODULE_VERSION(bwfm_pci, 1);
