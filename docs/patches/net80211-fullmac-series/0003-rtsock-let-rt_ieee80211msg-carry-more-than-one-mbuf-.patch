@@ -1,0 +1,57 @@
+From 54d7529f4f005a768a2f9bacf92d6196be5ee705 Mon Sep 17 00:00:00 2001
+From: b1nc0d3x <b1nc0d3x@gmail.com>
+Date: Tue, 13 Oct 2026 12:43:11 -0400
+Subject: [PATCH 3/7] rtsock: let rt_ieee80211msg carry more than one mbuf of
+ data
+
+rt_ieee80211msg() copied a payload that did not fit behind the announce
+header into a fresh plain mbuf without checking that it fit there.  The
+callers so far pass small fixed structures, but the FullMAC framework
+passes received management frames of up to 2048 bytes, which overran
+the mbuf.  Use m_append(), which fills the announce mbuf and chains
+more as needed, and drop the message if the chain cannot be built.
+---
+ sys/net/rtsock.c | 25 ++++++-------------------
+ 1 file changed, 6 insertions(+), 19 deletions(-)
+
+diff --git a/sys/net/rtsock.c b/sys/net/rtsock.c
+index fffe3e8d32f1..ffcffff71847 100644
+--- a/sys/net/rtsock.c
++++ b/sys/net/rtsock.c
+@@ -2180,27 +2180,14 @@ rt_ieee80211msg(struct ifnet *ifp, int what, void *data, size_t data_len)
+ 	m = rt_makeifannouncemsg(ifp, RTM_IEEE80211, what, &info, NULL);
+ 	if (m != NULL) {
+ 		/*
+-		 * Append the ieee80211 data.  Try to stick it in the
+-		 * mbuf containing the ifannounce msg; otherwise allocate
+-		 * a new mbuf and append.
+-		 *
+-		 * NB: we assume m is a single mbuf.
++		 * Append the ieee80211 data.  m_append() fills the
++		 * announce mbuf first and chains more as needed; the data
++		 * can be a received management frame longer than MLEN.
+ 		 */
+-		if (data_len > M_TRAILINGSPACE(m)) {
+-			struct mbuf *n = m_get(M_NOWAIT, MT_DATA);
+-			if (n == NULL) {
+-				m_freem(m);
+-				return;
+-			}
+-			bcopy(data, mtod(n, void *), data_len);
+-			n->m_len = data_len;
+-			m->m_next = n;
+-		} else if (data_len > 0) {
+-			bcopy(data, mtod(m, u_int8_t *) + m->m_len, data_len);
+-			m->m_len += data_len;
++		if (data_len > 0 && m_append(m, data_len, data) == 0) {
++			m_freem(m);
++			return;
+ 		}
+-		if (m->m_flags & M_PKTHDR)
+-			m->m_pkthdr.len += data_len;
+ 		mtod(m, struct if_announcemsghdr *)->ifan_msglen += data_len;
+ 		rt_dispatch(m, AF_UNSPEC);
+ 	}
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,1420 @@
+diff --git a/sys/arm/broadcom/bcm2835/bcm2835_sdhci.c b/sys/arm/broadcom/bcm2835/bcm2835_sdhci.c
+index e0c4327d8..6979eb8d1 100644
+--- a/sys/arm/broadcom/bcm2835/bcm2835_sdhci.c
++++ b/sys/arm/broadcom/bcm2835/bcm2835_sdhci.c
+@@ -172,6 +172,17 @@ struct bcm_sdhci_softc {
+ 	device_t		clkman;
+ #endif
+ 	struct bcm_mmc_conf *	conf;
++	/*
++	 * SDIO card interrupt (mmcbr_sdio_intr).  The handler is called
++	 * from bcm_sdhci_intr with SDHCI_INT_CARD_INT masked; the SDIO
++	 * driver re-arms it once it has serviced the card.  The enable
++	 * lives in sc_slot.intmask so the core's own rewrites of
++	 * SDHCI_SIGNAL_ENABLE keep it.
++	 */
++	mmcbr_sdio_intr_fn_t *	sc_cardintr_fn;
++	void *			sc_cardintr_arg;
++	uint64_t		sc_cardintr_count;
++	uint64_t		sc_cardintr_hidden;
+ };
+ 
+ static int bcm_sdhci_probe(device_t);
+@@ -317,6 +328,14 @@ bcm_sdhci_attach(device_t dev)
+ 
+ 	sdhci_init_slot(dev, &sc->sc_slot, 0);
+ 	mmc_fdt_parse(dev, 0, &sc->sc_mmc_helper, &sc->sc_slot.host);
++	SYSCTL_ADD_U64(device_get_sysctl_ctx(dev),
++	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
++	    "card_intr", CTLFLAG_RD, &sc->sc_cardintr_count, 0,
++	    "SDIO card interrupts taken");
++	SYSCTL_ADD_U64(device_get_sysctl_ctx(dev),
++	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)), OID_AUTO,
++	    "card_intr_hidden", CTLFLAG_RD, &sc->sc_cardintr_hidden, 0,
++	    "Card interrupts hidden from the SDHCI core");
+ 
+ 	sc->sc_dma_ch = bcm_dma_allocate(BCM_DMA_CH_ANY);
+ 	if (sc->sc_dma_ch == BCM_DMA_CH_INVALID)
+@@ -382,12 +401,123 @@ bcm_sdhci_detach(device_t dev)
+ 	return (EBUSY);
+ }
+ 
++/*
++ * Pi 4 SDHCI fairness lock.  Shared with sdhci_iproc.c (extern below)
++ * so the two physical slots (WiFi at 0x7e300000, SD root at
++ * 0x7e340000) take strict mutual-exclusive turns through the SDHCI
++ * core.  Without this, heavy bwfm CMD53 traffic on the WiFi slot
++ * starves the SD-slot ithread enough that UFS write commands time
++ * out and the root filesystem gets forcibly unmounted (panic).
++ *
++ * The lock is taken at IRQ-handler entry — granularity is "one
++ * interrupt ack worth of work", which on SDHCI is a single command
++ * completion.  That keeps WiFi from holding off SD for more than
++ * one register-batch at a time even during back-to-back CMD53s.
++ */
++struct mtx pi4_sdhci_fair_mtx;
++MTX_SYSINIT(pi4_sdhci_fair, &pi4_sdhci_fair_mtx, "pi4 sdhci slot fair", MTX_DEF);
++
++static void
++pi4_sdhci_fair_destroy(void *unused __unused)
++{
++	mtx_destroy(&pi4_sdhci_fair_mtx);
++}
++SYSUNINIT(pi4_sdhci_fair_destroy, SI_SUB_LOCK, SI_ORDER_ANY,
++    pi4_sdhci_fair_destroy, NULL);
++
++static uint32_t	bcm_sdhci_read_4(device_t, struct sdhci_slot *, bus_size_t);
++static void	bcm_sdhci_write_4(device_t, struct sdhci_slot *, bus_size_t,
++		    uint32_t);
++
++/* set or clear the card interrupt enable; slot mutex held */
++static void
++bcm_sdhci_cardintr_unmask(struct bcm_sdhci_softc *sc, bool on)
++{
++	struct sdhci_slot *slot = &sc->sc_slot;
++
++	uint32_t ien;
++
++	mtx_assert(&slot->mtx, MA_OWNED);
++	if (on)
++		slot->intmask |= SDHCI_INT_CARD_INT;
++	else
++		slot->intmask &= ~SDHCI_INT_CARD_INT;
++	/*
++	 * Change only the card-interrupt bit in INT_ENABLE.  During a
++	 * transfer the core narrows slot->intmask and writes it to
++	 * SIGNAL_ENABLE alone, keeping INT_ENABLE broader so the command's
++	 * completion status still latches; writing slot->intmask to
++	 * INT_ENABLE here would drop those bits and time the command out.
++	 */
++	ien = bcm_sdhci_read_4(sc->sc_dev, slot, SDHCI_INT_ENABLE);
++	ien = on ? (ien | SDHCI_INT_CARD_INT) : (ien & ~SDHCI_INT_CARD_INT);
++	bcm_sdhci_write_4(sc->sc_dev, slot, SDHCI_INT_ENABLE, ien);
++	bcm_sdhci_write_4(sc->sc_dev, slot, SDHCI_SIGNAL_ENABLE,
++	    slot->intmask);
++}
++
+ static void
+ bcm_sdhci_intr(void *arg)
+ {
+ 	struct bcm_sdhci_softc *sc = arg;
++	mmcbr_sdio_intr_fn_t *fn = NULL;
++	void *fnarg = NULL;
+ 
++	mtx_lock(&pi4_sdhci_fair_mtx);
++	/*
++	 * SDIO card interrupt.  It is level-triggered by the card and
++	 * cannot be cleared in INT_STATUS, so mask it (SDHCI spec: clear
++	 * the Card Interrupt Status Enable while the card is serviced)
++	 * and let the SDIO driver re-arm it when done.
++	 */
++	/* raw read: bcm_sdhci_read_4 hides the card interrupt */
++	if (sc->sc_cardintr_fn != NULL &&
++	    (bus_space_read_4(sc->sc_bst, sc->sc_bsh, SDHCI_INT_STATUS) &
++	    SDHCI_INT_CARD_INT) != 0) {
++		mtx_lock(&sc->sc_slot.mtx);
++		bcm_sdhci_cardintr_unmask(sc, false);
++		fn = sc->sc_cardintr_fn;
++		fnarg = sc->sc_cardintr_arg;
++		sc->sc_cardintr_count++;
++		mtx_unlock(&sc->sc_slot.mtx);
++	}
+ 	sdhci_generic_intr(&sc->sc_slot);
++	mtx_assert(&pi4_sdhci_fair_mtx, MA_OWNED);
++	mtx_unlock(&pi4_sdhci_fair_mtx);
++	if (fn != NULL)
++		fn(fnarg);
++}
++
++/* mmcbr_sdio_intr: SDIO card interrupt for the function drivers */
++static int
++bcm_sdhci_sdio_intr(device_t brdev, device_t reqdev __unused, int op,
++    mmcbr_sdio_intr_fn_t *fn, void *arg)
++{
++	struct bcm_sdhci_softc *sc = device_get_softc(brdev);
++	int err = 0;
++
++	mtx_lock(&sc->sc_slot.mtx);
++	switch (op) {
++	case MMCBR_SDIO_INTR_ENABLE:
++		sc->sc_cardintr_fn = fn;
++		sc->sc_cardintr_arg = arg;
++		bcm_sdhci_cardintr_unmask(sc, true);
++		break;
++	case MMCBR_SDIO_INTR_REARM:
++		if (sc->sc_cardintr_fn != NULL)
++			bcm_sdhci_cardintr_unmask(sc, true);
++		break;
++	case MMCBR_SDIO_INTR_DISABLE:
++		bcm_sdhci_cardintr_unmask(sc, false);
++		sc->sc_cardintr_fn = NULL;
++		sc->sc_cardintr_arg = NULL;
++		break;
++	default:
++		err = EINVAL;
++		break;
++	}
++	mtx_unlock(&sc->sc_slot.mtx);
++	return (err);
+ }
+ 
+ static int
+@@ -483,8 +613,15 @@ static uint32_t
+ bcm_sdhci_read_4(device_t dev, struct sdhci_slot *slot, bus_size_t off)
+ {
+ 	struct bcm_sdhci_softc *sc = device_get_softc(dev);
++	uint32_t val = RD4(sc, off);
+ 
+-	return RD4(sc, off);
++	/* hide the card interrupt from the core; bcm_sdhci_intr takes it */
++	if (off == SDHCI_INT_STATUS && sc->sc_cardintr_fn != NULL &&
++	    (val & SDHCI_INT_CARD_INT) != 0) {
++		val &= ~SDHCI_INT_CARD_INT;
++		sc->sc_cardintr_hidden++;
++	}
++	return (val);
+ }
+ 
+ static void
+@@ -832,6 +969,7 @@ static device_method_t bcm_sdhci_methods[] = {
+ 	DEVMETHOD(mmcbr_get_ro,		bcm_sdhci_get_ro),
+ 	DEVMETHOD(mmcbr_acquire_host,	sdhci_generic_acquire_host),
+ 	DEVMETHOD(mmcbr_release_host,	sdhci_generic_release_host),
++	DEVMETHOD(mmcbr_sdio_intr,	bcm_sdhci_sdio_intr),
+ 
+ 	/* Platform transfer methods */
+ 	DEVMETHOD(sdhci_platform_will_handle,		bcm_sdhci_will_handle_transfer),
+diff --git a/sys/conf/files b/sys/conf/files
+index 7f925bfc3..2415b61f5 100644
+--- a/sys/conf/files
++++ b/sys/conf/files
+@@ -2460,6 +2460,7 @@ dev/mlx/mlx_pci.c		optional mlx pci
+ dev/mmc/host/dwmmc.c		optional dwmmc fdt
+ dev/mmc/mmc_subr.c		optional mmc | mmcsd !mmccam
+ dev/mmc/mmc.c			optional mmc !mmccam
++dev/mmc/sdio_func.c		optional mmc !mmccam
+ dev/mmc/mmcbr_if.m		standard
+ dev/mmc/mmcbus_if.m		standard
+ dev/mmc/mmcsd.c			optional mmcsd !mmccam
+diff --git a/sys/dev/mmc/bridge.h b/sys/dev/mmc/bridge.h
+index bd08b695c..144e7e9b2 100644
+--- a/sys/dev/mmc/bridge.h
++++ b/sys/dev/mmc/bridge.h
+@@ -137,7 +137,7 @@ struct mmc_ios {
+ };
+ 
+ enum mmc_card_mode {
+-	mode_mmc, mode_sd
++	mode_mmc, mode_sd, mode_sdio
+ };
+ 
+ enum mmc_retune_req {
+diff --git a/sys/dev/mmc/mmc.c b/sys/dev/mmc/mmc.c
+index f4ea8faca..222050313 100644
+--- a/sys/dev/mmc/mmc.c
++++ b/sys/dev/mmc/mmc.c
+@@ -72,6 +72,7 @@
+ #include <dev/mmc/mmcreg.h>
+ #include <dev/mmc/mmcbrvar.h>
+ #include <dev/mmc/mmcvar.h>
++#include <dev/mmc/sdio_func.h>
+ 
+ #include "mmcbr_if.h"
+ #include "mmcbus_if.h"
+@@ -206,6 +207,8 @@ static int mmc_send_csd(struct mmc_softc *sc, uint16_t rca, uint32_t *rawcsd);
+ static int mmc_send_if_cond(struct mmc_softc *sc, uint8_t vhs);
+ static int mmc_send_op_cond(struct mmc_softc *sc, uint32_t ocr,
+     uint32_t *rocr);
++static int mmc_send_io_op_cond(struct mmc_softc *sc, uint32_t ocr,
++    uint32_t *rocr);
+ static int mmc_send_relative_addr(struct mmc_softc *sc, uint32_t *resp);
+ static int mmc_set_blocklen(struct mmc_softc *sc, uint32_t len);
+ static int mmc_set_card_bus_width(struct mmc_softc *sc, struct mmc_ivars *ivar,
+@@ -638,6 +641,51 @@ mmc_send_op_cond(struct mmc_softc *sc, uint32_t ocr, uint32_t *rocr)
+ 	return (err);
+ }
+ 
++/*
++ * Probe for an SDIO (non-storage) device on the bus.  CMD5 is the
++ * SDIO-specific OCR exchange — opcode 5, R4 response.  The first
++ * call with arg=0 returns the card's OCR voltage window plus the
++ * number of I/O functions (R4_IO_NUM_FUNCTIONS) and the memory-
++ * present bit (combo cards).  A second call with the negotiated
++ * voltage window in arg drives the card to the "ready" state
++ * (MMC_OCR_CARD_BUSY a.k.a. SDIO's IORDY in R4 bit 31).
++ *
++ * Returns MMC_ERR_NONE on success and fills *rocr with the R4
++ * response if rocr is non-NULL.  A non-SDIO bus simply times out
++ * — the caller treats that as "no SDIO device here" and continues.
++ */
++static int
++mmc_send_io_op_cond(struct mmc_softc *sc, uint32_t ocr, uint32_t *rocr)
++{
++	struct mmc_command cmd;
++	int err = MMC_ERR_NONE, i;
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.opcode = SD_IO_SEND_OP_COND;
++	cmd.arg = ocr;
++	cmd.flags = MMC_RSP_R4 | MMC_CMD_BCR;
++	cmd.data = NULL;
++
++	for (i = 0; i < 1000; i++) {
++		err = mmc_wait_for_cmd(sc->dev, sc->dev, &cmd, CMD_RETRIES);
++		if (err != MMC_ERR_NONE)
++			break;
++		if ((cmd.resp[0] & MMC_OCR_CARD_BUSY) ||
++		    (ocr & R4_IO_OCR_MASK) == 0)
++			break;
++		err = MMC_ERR_TIMEOUT;
++		mmc_ms_delay(10);
++	}
++	if (rocr && err == MMC_ERR_NONE)
++		*rocr = cmd.resp[0];
++	/* Unconditional during initial bring-up: show raw R4 resp slots. */
++	device_printf(sc->dev,
++	    "mmc_send_io_op_cond: err=%d resp[0]=0x%08x resp[1]=0x%08x "
++	    "resp[2]=0x%08x resp[3]=0x%08x\n",
++	    err, cmd.resp[0], cmd.resp[1], cmd.resp[2], cmd.resp[3]);
++	return (err);
++}
++
+ static int
+ mmc_send_if_cond(struct mmc_softc *sc, uint8_t vhs)
+ {
+@@ -2055,20 +2103,52 @@ mmc_go_discovery(struct mmc_softc *sc)
+ 			device_printf(sc->dev,
+ 			    "SD 2.0 interface conditions: OK\n");
+ 		if (mmc_send_app_op_cond(sc, 0, &ocr) != MMC_ERR_NONE) {
++			int io_err;
++
+ 			if (bootverbose || mmc_debug)
+ 				device_printf(sc->dev, "SD probe: failed\n");
+ 			/*
+-			 * Failed, try MMC
++			 * SD storage failed; try SDIO (non-storage I/O card)
++			 * before falling back to legacy MMC.  CMD5 doesn't
++			 * exist on MMC cards, so this is a clean probe.
++			 *
++			 * Re-idle the bus before CMD5.  CMD55 (the AC of
++			 * ACMD41) leaves an SDIO card in an "expecting an
++			 * application command" state that makes CMD5
++			 * return all zeros.  CMD0 puts every card type back
++			 * to a clean idle so CMD5 gets a meaningful response.
+ 			 */
+-			mmcbr_set_mode(dev, mode_mmc);
+-			if (mmc_send_op_cond(sc, 0, &ocr) != MMC_ERR_NONE) {
++			mmc_idle_cards(sc);
++			io_err = mmc_send_io_op_cond(sc, 0, &ocr);
++			/* Unconditional during initial bring-up. */
++			device_printf(sc->dev,
++			    "SDIO probe: err=%d ocr=0x%08x nfn=%u\n",
++			    io_err, ocr,
++			    io_err == MMC_ERR_NONE ?
++			    R4_IO_NUM_FUNCTIONS(ocr) : 0);
++			if (io_err == MMC_ERR_NONE &&
++			    R4_IO_NUM_FUNCTIONS(ocr) != 0) {
++				mmcbr_set_mode(dev, mode_sdio);
++				/*
++				 * Keep only the OCR voltage bits — bits
++				 * 28-31 carry NF / MEM_PRESENT / IORDY,
++				 * not voltage.
++				 */
++				ocr &= R4_IO_OCR_MASK;
++			} else if (mmc_send_op_cond(sc, 0, &ocr) !=
++			    MMC_ERR_NONE) {
++				mmcbr_set_mode(dev, mode_mmc);
+ 				if (bootverbose || mmc_debug)
+ 					device_printf(sc->dev,
+ 					    "MMC probe: failed\n");
+-				ocr = 0; /* Failed both, powerdown. */
+-			} else if (bootverbose || mmc_debug)
+-				device_printf(sc->dev,
+-				    "MMC probe: OK (OCR: 0x%08x)\n", ocr);
++				ocr = 0; /* Failed all, powerdown. */
++			} else {
++				mmcbr_set_mode(dev, mode_mmc);
++				if (bootverbose || mmc_debug)
++					device_printf(sc->dev,
++					    "MMC probe: OK (OCR: 0x%08x)\n",
++					    ocr);
++			}
+ 		} else if (bootverbose || mmc_debug)
+ 			device_printf(sc->dev, "SD probe: OK (OCR: 0x%08x)\n",
+ 			    ocr);
+@@ -2099,14 +2179,89 @@ mmc_go_discovery(struct mmc_softc *sc)
+ 	/*
+ 	 * Reselect the cards after we've idled them above.
+ 	 */
+-	if (mmcbr_get_mode(dev) == mode_sd) {
++	switch (mmcbr_get_mode(dev)) {
++	case mode_sd:
+ 		err = mmc_send_if_cond(sc, 1);
+ 		mmc_send_app_op_cond(sc,
+ 		    (err ? 0 : MMC_OCR_CCS) | mmcbr_get_ocr(dev), NULL);
+-	} else
++		mmc_discover_cards(sc);
++		mmc_rescan_cards(sc);
++		break;
++	case mode_sdio: {
++		/*
++		 * Drive the SDIO card from idle to transfer state:
++		 *   CMD5 (with OCR) -> finalises voltage negotiation; the
++		 *                       response's IORDY bit (31) tells us
++		 *                       the card is powered up.
++		 *   CMD3            -> card hands us its own RCA so we can
++		 *                       address it on a multi-card bus.
++		 *   CMD7            -> select that RCA; card is now in
++		 *                       CMD52/CMD53 "transfer" state.
++		 *
++		 * Then we create an `sdio` newbus child of the mmc bus and
++		 * attach `sdio_bus_ivars` to it carrying the negotiated
++		 * (rca, nfn, ocr).  The sdio function-bus driver
++		 * (sys/dev/mmc/sdio_func.c) probes that child, walks the
++		 * CCCR/CIS, and instantiates one grand-child per I/O
++		 * function so per-vendor drivers (bwfm_sdio etc.) can
++		 * match.  Storage discover_cards / rescan_cards are
++		 * skipped — SDIO children come up through this path
++		 * instead.
++		 */
++		uint32_t io_resp = 0;
++		uint32_t rca_resp = 0;
++		uint16_t rca;
++		uint8_t nfn;
++		struct sdio_bus_ivars *sbi;
++		device_t sdio_child;
++		int err;
++
++		(void)mmc_send_io_op_cond(sc, mmcbr_get_ocr(dev), &io_resp);
++		nfn = R4_IO_NUM_FUNCTIONS(io_resp);
++
++		err = mmc_send_relative_addr(sc, &rca_resp);
++		if (err != MMC_ERR_NONE) {
++			device_printf(sc->dev,
++			    "SDIO: CMD3 (SEND_RCA) failed err=%d\n", err);
++			break;
++		}
++		rca = (uint16_t)(rca_resp >> 16);
++
++		err = mmc_select_card(sc, rca);
++		if (err != MMC_ERR_NONE) {
++			device_printf(sc->dev,
++			    "SDIO: CMD7 (SELECT) failed err=%d rca=0x%04x\n",
++			    err, rca);
++			break;
++		}
++
++		sbi = malloc(sizeof(*sbi), M_DEVBUF, M_WAITOK | M_ZERO);
++		sbi->sbi_ocr = io_resp;
++		sbi->sbi_rca = rca;
++		sbi->sbi_nfn = nfn;
++
++		sdio_child = device_add_child(sc->dev, "sdio",
++		    DEVICE_UNIT_ANY);
++		if (sdio_child == NULL) {
++			device_printf(sc->dev,
++			    "SDIO: device_add_child failed\n");
++			free(sbi, M_DEVBUF);
++			break;
++		}
++		device_set_ivars(sdio_child, sbi);
++		device_printf(sc->dev,
++		    "SDIO: handing off to function bus "
++		    "(nfn=%u rca=0x%04x ocr=0x%08x)\n",
++		    nfn, rca, io_resp);
++		break;
++	}
++	case mode_mmc:
++	default:
+ 		mmc_send_op_cond(sc, MMC_OCR_CCS | mmcbr_get_ocr(dev), NULL);
+-	mmc_discover_cards(sc);
+-	mmc_rescan_cards(sc);
++		mmc_discover_cards(sc);
++		mmc_rescan_cards(sc);
++		break;
++	}
+ 
+ 	mmcbr_set_bus_mode(dev, pushpull);
+ 	mmcbr_update_ios(dev);
+diff --git a/sys/dev/mmc/mmcbr_if.m b/sys/dev/mmc/mmcbr_if.m
+index a93984606..bff68754a 100644
+--- a/sys/dev/mmc/mmcbr_if.m
++++ b/sys/dev/mmc/mmcbr_if.m
+@@ -61,10 +61,27 @@
+ 
+ INTERFACE mmcbr;
+ 
++HEADER {
++	/* sdio_intr handler and ops */
++typedef void mmcbr_sdio_intr_fn_t(void *);
++#define	MMCBR_SDIO_INTR_DISABLE	0	/* mask, forget the handler */
++#define	MMCBR_SDIO_INTR_ENABLE	1	/* register fn/arg, unmask */
++#define	MMCBR_SDIO_INTR_REARM	2	/* unmask after servicing */
++};
++
+ #
+ # Default implementations of some methods.
+ #
+ CODE {
++	static int
++	null_sdio_intr(device_t brdev __unused, device_t reqdev __unused,
++	    int op __unused, mmcbr_sdio_intr_fn_t *fn __unused,
++	    void *arg __unused)
++	{
++
++		return (EOPNOTSUPP);
++	}
++
+ 	static int
+ 	null_switch_vccq(device_t brdev __unused, device_t reqdev __unused)
+ 	{
+@@ -162,3 +179,18 @@ METHOD int release_host {
+ 	device_t	brdev;
+ 	device_t	reqdev;
+ };
++
++#
++# SDIO card interrupt.  ENABLE registers fn/arg and unmasks the card
++# interrupt; when it fires, the bridge masks it and calls fn from its
++# interrupt thread (fn must not sleep).  The driver services the card
++# and then asks for REARM.  DISABLE masks it and drops the handler.
++# Bridges without SDIO interrupt support return EOPNOTSUPP.
++#
++METHOD int sdio_intr {
++	device_t	brdev;
++	device_t	reqdev;
++	int		op;
++	mmcbr_sdio_intr_fn_t *fn;
++	void		*arg;
++} DEFAULT null_sdio_intr;
+diff --git a/sys/dev/mmc/mmcreg.h b/sys/dev/mmc/mmcreg.h
+index e5783249c..264f901b7 100644
+--- a/sys/dev/mmc/mmcreg.h
++++ b/sys/dev/mmc/mmcreg.h
+@@ -311,6 +311,7 @@ struct mmc_request {
+ 			/* reserved for mfg: 63 */
+ 
+ /* Class 9: I/O cards (sd) */
++#define	SD_IO_SEND_OP_COND	5
+ #define	SD_IO_RW_DIRECT		52
+ /* CMD52 arguments */
+ #define	 SD_ARG_CMD52_READ		(0 << 31)
+diff --git a/sys/dev/mmc/sdio_func.c b/sys/dev/mmc/sdio_func.c
+new file mode 100644
+index 000000000..34e328876
+--- /dev/null
++++ b/sys/dev/mmc/sdio_func.c
+@@ -0,0 +1,721 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
++ *
++ * SDIO function-bus driver.  Attaches as a child of mmc(4) when
++ * mmc_go_discovery() lands on an SDIO card (mode_sdio), parses
++ * CCCR + CIS, then instantiates one newbus child per advertised
++ * I/O function (1..7).  Function drivers — bwfm_sdio, sdiobt,
++ * etc. — probe against the (manfid, prodid) ivars on each child.
++ *
++ * What this file does NOT do: it never reads or writes user data
++ * payloads.  All real I/O is initiated from the function driver
++ * via the sdio_{read,write}_* helpers, which marshal CMD52/CMD53
++ * and submit through the mmc bus.
++ */
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/bus.h>
++#include <sys/kernel.h>
++#include <sys/lock.h>
++#include <sys/malloc.h>
++#include <sys/module.h>
++#include <sys/mutex.h>
++
++#include <dev/mmc/bridge.h>
++#include <dev/mmc/mmcreg.h>
++#include <dev/mmc/mmcvar.h>
++#include <dev/mmc/mmc_subr.h>
++#include <dev/mmc/sdio_func.h>
++#include <dev/mmc/sdioreg.h>
++
++#include "mmcbus_if.h"
++#include "mmcbr_if.h"
++
++#include <sys/sysctl.h>
++
++MALLOC_DECLARE(M_SDIO);
++MALLOC_DEFINE(M_SDIO, "sdio", "SDIO function-bus state");
++
++struct sdio_softc {
++	device_t		 sc_dev;	/* the sdio bus device */
++	device_t		 sc_mmcbus;	/* parent mmc bus */
++	uint16_t		 sc_manfid;	/* CISTPL_MANFID code */
++	uint16_t		 sc_prodid;	/* CISTPL_MANFID product */
++	uint8_t			 sc_nfn;	/* # I/O functions present */
++	device_t		 sc_func[8];	/* function children */
++	int			 sc_debug;	/* dev.sdio.N.debug */
++};
++
++/*
++ * Per-instance DPRINTF.  Each sdio bus device gets its own
++ * dev.sdio.N.debug sysctl (CTLFLAG_RWTUN) added at attach time, so a
++ * bus carrying a card under investigation can be made noisy without
++ * spamming sibling buses.  Levels:
++ *   0 = silent (default)
++ *   1 = milestones (CCCR header dump, function-attach summary)
++ *   2 = protocol (per-CMD52 raw R5 response, CIS tuple bytes)
++ *   3 = reserved for per-byte hex dumps once CMD53 lands
++ */
++#define	DPRINTF(sc, level, fmt, ...)					\
++	do {								\
++		if ((sc)->sc_debug >= (level))				\
++			device_printf((sc)->sc_dev, fmt, ##__VA_ARGS__); \
++	} while (0)
++
++/* One command with the mmc bus held, as mmc_wait_for_request() requires. */
++static int
++sdio_wait_for_cmd(struct sdio_softc *sc, struct mmc_command *cmd)
++{
++	int err;
++
++	if (MMCBUS_ACQUIRE_BUS(sc->sc_mmcbus, sc->sc_mmcbus) != 0)
++		return (MMC_ERR_FAILED);
++	err = mmc_wait_for_cmd(sc->sc_mmcbus, sc->sc_dev, cmd, 0);
++	MMCBUS_RELEASE_BUS(sc->sc_mmcbus, sc->sc_mmcbus);
++	return (err);
++}
++
++/* Per-function ivars carried on each newbus child. */
++struct sdio_func_ivars {
++	uint8_t		fi_num;
++	uint16_t	fi_manfid;
++	uint16_t	fi_prodid;
++	uint8_t		fi_class;
++	uint16_t	fi_blksize;
++};
++
++/* ------------------------------------------------------------------
++ * CMD52 / CMD53 helpers — the public face of this module.  Function
++ * drivers call into these to do byte / block I/O against their slot.
++ * Both helpers route to the parent mmc bus, which knows how to drive
++ * the controller (sdhci_bcm on a Pi 4).
++ * ------------------------------------------------------------------ */
++
++/*
++ * CMD52 — single-byte direct I/O.  Builds a 32-bit argument from
++ * the (rw, func, raw, addr, data) tuple per the SD spec, submits
++ * the command, and on success returns the response byte (or stores
++ * it for read).  R5 response: low byte = data, high byte = status
++ * (we check the error bits and translate to errno).
++ */
++static int
++sdio_cmd52(device_t func, uint8_t func_num, uint32_t addr, bool write,
++    uint8_t in_val, uint8_t *out_val)
++{
++	struct sdio_softc *sc = device_get_softc(device_get_parent(func));
++	struct mmc_command cmd;
++	uint32_t arg;
++	int err;
++
++	if (addr & ~SD_ARG_CMD52_REG_MASK)
++		return (EINVAL);
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.opcode = SD_IO_RW_DIRECT;
++	cmd.flags = MMC_RSP_R5 | MMC_CMD_AC;
++	arg = ((uint32_t)func_num & SD_ARG_CMD52_FUNC_MASK) <<
++	    SD_ARG_CMD52_FUNC_SHIFT;
++	arg |= (addr & SD_ARG_CMD52_REG_MASK) << SD_ARG_CMD52_REG_SHIFT;
++	if (write) {
++		arg |= SD_ARG_CMD52_WRITE;
++		arg |= (in_val & SD_ARG_CMD52_DATA_MASK);
++		if (out_val != NULL)
++			arg |= SD_ARG_CMD52_EXCHANGE;
++	}
++	cmd.arg = arg;
++
++	err = sdio_wait_for_cmd(sc, &cmd);
++	if (err != MMC_ERR_NONE)
++		return (EIO);
++
++	/* R5 status: high 8 bits of resp[0] carry flags; bits 8-10 are
++	 * COM_CRC_ERROR, ILLEGAL_COMMAND, IO_CURRENT_STATE.  Any bit in
++	 * the upper status nibbles other than ready means a card error. */
++	if ((cmd.resp[0] & 0xCB00) != 0)
++		return (EIO);
++
++	if (out_val != NULL)
++		*out_val = (uint8_t)(cmd.resp[0] & 0xFF);
++	return (0);
++}
++
++int
++sdio_read_byte(device_t func, uint32_t addr, uint8_t *val)
++{
++	uint8_t fn = sdio_get_func_num(func);
++
++	return (sdio_cmd52(func, fn, addr, false, 0, val));
++}
++
++int
++sdio_write_byte(device_t func, uint32_t addr, uint8_t val)
++{
++	uint8_t fn = sdio_get_func_num(func);
++
++	return (sdio_cmd52(func, fn, addr, true, val, NULL));
++}
++
++/*
++ * CCCR access shortcuts.  Same CMD52, but hard-wired func_num=0
++ * regardless of which sdio child invoked us.  Useful from func-1..7
++ * drivers that need to flip CCCR.IO_EN / poll IO_READY / etc.
++ * without crafting a CMD52 themselves.
++ */
++int
++sdio_cccr_read_byte(device_t func, uint32_t addr, uint8_t *val)
++{
++	return (sdio_cmd52(func, 0, addr, false, 0, val));
++}
++
++int
++sdio_cccr_write_byte(device_t func, uint32_t addr, uint8_t val)
++{
++	return (sdio_cmd52(func, 0, addr, true, val, NULL));
++}
++
++/*
++ * CMD53 byte-mode workhorse.  One CMD53 carries up to 512 bytes via
++ * mmc_data + the host's DMA path.  Larger transfers are chunked by the
++ * public sdio_{read,write}_multi() wrappers below.
++ *
++ * Block-mode CMD53 (where the host pre-arms a per-function block size
++ * and the count field carries number-of-blocks) is faster for large
++ * payloads but requires:
++ *   - writing the FBR.IOBLKSZ for the target function (0x10..0x11 in
++ *     the function's FBR address space) to set the controller-side
++ *     block size, AND
++ *   - the host driver's CMD53 path honoring MMC_DATA_BLOCK_SIZE /
++ *     MMC_DATA_MULTI.
++ * Implement when bwfm_sdio's firmware upload starts feeling slow.
++ * Byte mode at 50 MHz / 4-bit is ~25 MB/s steady-state -- plenty for
++ * CCCR walk and the brcmfmac NVRAM (~3 KB).
++ */
++static int
++sdio_cmd53_byte(struct sdio_softc *sc, uint8_t fn, uint32_t addr,
++    bool write, void *buf, size_t len, bool incr)
++{
++	struct mmc_command cmd;
++	struct mmc_data data;
++	uint32_t arg, lenfield;
++	int err;
++
++	if (addr & ~SD_ARG_CMD53_REG_MASK)
++		return (EINVAL);
++	if (len == 0 || len > 512)
++		return (EINVAL);
++
++	memset(&cmd, 0, sizeof(cmd));
++	memset(&data, 0, sizeof(data));
++
++	/*
++	 * Byte-mode count field: 1..511 = N bytes, 0 = 512 bytes (the
++	 * "wraparound" encoding from the SDIO spec).
++	 */
++	lenfield = (len == 512) ? 0 : (uint32_t)len;
++
++	arg = ((uint32_t)fn & SD_ARG_CMD53_FUNC_MASK) <<
++	    SD_ARG_CMD53_FUNC_SHIFT;
++	arg |= (addr & SD_ARG_CMD53_REG_MASK) << SD_ARG_CMD53_REG_SHIFT;
++	arg |= (lenfield & SD_ARG_CMD53_LENGTH_MASK);
++	if (write)
++		arg |= SD_ARG_CMD53_WRITE;
++	if (incr)
++		arg |= SD_ARG_CMD53_INCREMENT;
++
++	cmd.opcode = SD_IO_RW_EXTENDED;
++	cmd.arg = arg;
++	cmd.flags = MMC_RSP_R5 | MMC_CMD_ADTC;
++	cmd.data = &data;
++
++	data.data = buf;
++	data.len = len;
++	data.flags = write ? MMC_DATA_WRITE : MMC_DATA_READ;
++
++	err = sdio_wait_for_cmd(sc, &cmd);
++	DPRINTF(sc, 2,
++	    "CMD53 %s fn=%u addr=0x%05x len=%zu incr=%d -> mmc_err=%d "
++	    "resp[0]=0x%08x\n",
++	    write ? "WR" : "RD", fn, addr, len, incr, err, cmd.resp[0]);
++	if (err != MMC_ERR_NONE)
++		return (EIO);
++	if ((cmd.resp[0] & 0xCB00) != 0)
++		return (EIO);
++	return (0);
++}
++
++int
++sdio_read_multi(device_t func, uint32_t addr, void *buf, size_t len, bool incr)
++{
++	struct sdio_softc *sc = device_get_softc(device_get_parent(func));
++	uint8_t fn = sdio_get_func_num(func);
++	uint8_t *p = buf;
++	size_t chunk;
++	int err;
++
++	while (len > 0) {
++		chunk = MIN(len, 512);
++		err = sdio_cmd53_byte(sc, fn, addr, false, p, chunk, incr);
++		if (err != 0)
++			return (err);
++		p += chunk;
++		len -= chunk;
++		if (incr)
++			addr += chunk;
++	}
++	return (0);
++}
++
++int
++sdio_write_multi(device_t func, uint32_t addr, const void *buf, size_t len,
++    bool incr)
++{
++	struct sdio_softc *sc = device_get_softc(device_get_parent(func));
++	uint8_t fn = sdio_get_func_num(func);
++	const uint8_t *p = buf;
++	size_t chunk;
++	int err;
++
++	while (len > 0) {
++		chunk = MIN(len, 512);
++		err = sdio_cmd53_byte(sc, fn, addr, true,
++		    __DECONST(void *, p), chunk, incr);
++		if (err != 0)
++			return (err);
++		p += chunk;
++		len -= chunk;
++		if (incr)
++			addr += chunk;
++	}
++	return (0);
++}
++
++/*
++ * The mmc bus and its host bridge, two and three levels above an SDIO
++ * function (func -> sdio bus -> mmc bus -> bridge).
++ */
++static device_t
++sdio_func_mmcbus(device_t func)
++{
++	return (device_get_parent(device_get_parent(func)));
++}
++
++/*
++ * Ask the host bridge for the card interrupt and enable it on the card
++ * for this function: CCCR 04h, the master enable (bit 0) plus the
++ * function's own bit.  handler runs from the bridge's interrupt thread
++ * with the card interrupt masked; call sdio_intr_rearm() once the card
++ * has been serviced.  ENOSYS-era callers keep working: a bridge without
++ * support returns EOPNOTSUPP and nothing on the card is changed.
++ */
++int
++sdio_enable_intr(device_t func, driver_intr_t *handler, void *arg)
++{
++	device_t mmc = sdio_func_mmcbus(func);
++	uint8_t fn = sdio_get_func_num(func);
++	uint8_t ien;
++	int err;
++
++	if (mmc == NULL || handler == NULL)
++		return (EINVAL);
++	err = MMCBR_SDIO_INTR(device_get_parent(mmc), mmc,
++	    MMCBR_SDIO_INTR_ENABLE, handler, arg);
++	if (err != 0)
++		return (err);
++	err = sdio_cccr_read_byte(func, SD_IO_CCCR_INT_ENABLE, &ien);
++	if (err == 0)
++		err = sdio_cccr_write_byte(func, SD_IO_CCCR_INT_ENABLE,
++		    ien | 0x01 | (1u << fn));
++	if (err != 0)
++		(void)MMCBR_SDIO_INTR(device_get_parent(mmc), mmc,
++		    MMCBR_SDIO_INTR_DISABLE, NULL, NULL);
++	return (err);
++}
++
++/* unmask the card interrupt again after servicing it */
++void
++sdio_intr_rearm(device_t func)
++{
++	device_t mmc = sdio_func_mmcbus(func);
++
++	if (mmc != NULL)
++		(void)MMCBR_SDIO_INTR(device_get_parent(mmc), mmc,
++		    MMCBR_SDIO_INTR_REARM, NULL, NULL);
++}
++
++/*
++ * Stop this function's card interrupt: clear its CCCR 04h bit, and the
++ * master enable and the bridge's handler once no function is left.
++ */
++void
++sdio_disable_intr(device_t func)
++{
++	device_t mmc = sdio_func_mmcbus(func);
++	uint8_t fn = sdio_get_func_num(func);
++	uint8_t ien;
++
++	if (mmc == NULL)
++		return;
++	if (sdio_cccr_read_byte(func, SD_IO_CCCR_INT_ENABLE, &ien) != 0)
++		ien = 0;
++	ien &= ~(1u << fn);
++	if ((ien & ~0x01u) == 0)
++		ien = 0;
++	(void)sdio_cccr_write_byte(func, SD_IO_CCCR_INT_ENABLE, ien);
++	if (ien == 0)
++		(void)MMCBR_SDIO_INTR(device_get_parent(mmc), mmc,
++		    MMCBR_SDIO_INTR_DISABLE, NULL, NULL);
++}
++
++/* ------------------------------------------------------------------
++ * Bus enumeration — CCCR header + CIS walk.  Called from attach().
++ * ------------------------------------------------------------------ */
++
++/*
++ * Read one byte from CCCR/CIS address space via CMD52 to function 0.
++ * CIS tuples are accessed against function 0 even when describing
++ * a higher-numbered function — the FBR redirects.
++ */
++static int
++sdio_f0_read_byte(struct sdio_softc *sc, uint32_t addr, uint8_t *val)
++{
++	struct mmc_command cmd;
++	int err;
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.opcode = SD_IO_RW_DIRECT;
++	cmd.flags = MMC_RSP_R5 | MMC_CMD_AC;
++	cmd.arg = (0 << SD_ARG_CMD52_FUNC_SHIFT) |
++	    ((addr & SD_ARG_CMD52_REG_MASK) << SD_ARG_CMD52_REG_SHIFT);
++
++	err = sdio_wait_for_cmd(sc, &cmd);
++	DPRINTF(sc, 2,
++	    "F0 read [0x%05x]: mmc_err=%d resp[0]=0x%08x resp[1]=0x%08x\n",
++	    addr, err, cmd.resp[0], cmd.resp[1]);
++	if (err != MMC_ERR_NONE)
++		return (EIO);
++	if ((cmd.resp[0] & 0xCB00) != 0)
++		return (EIO);
++	*val = (uint8_t)(cmd.resp[0] & 0xFF);
++	return (0);
++}
++
++static int
++sdio_parse_cis(struct sdio_softc *sc, uint32_t cisptr,
++    struct sdio_func_ivars *out)
++{
++	uint8_t code, len, data[16];
++	uint32_t addr = cisptr;
++	int err, i;
++
++	/*
++	 * CIS tuples are a chain of (code, length, data...) records
++	 * starting at the address held in SD_IO_CCCR_CISPTR (for
++	 * function 0) or FBR[n].CIS_OFFSET (for function n).  Each
++	 * tuple is read byte-by-byte via CMD52 against function 0;
++	 * the FBR/CCCR pointer addressing handles the redirection.
++	 *
++	 * Tuples we care about:
++	 *   CISTPL_MANFID (0x20)  4-byte: manfid LSB MSB prodid LSB MSB
++	 *   CISTPL_FUNCID (0x21)  2-byte: class | sysinit-mask
++	 *   CISTPL_FUNCE  (0x22)  function extension (block size,
++	 *                         max transfer rate, etc.)
++	 *   CISTPL_END    (0xff)  terminator
++	 *
++	 * 200-tuple safety bound covers any reasonable CIS table.
++	 */
++	for (i = 0; i < 200; i++) {
++		err = sdio_f0_read_byte(sc, addr++, &code);
++		if (err != 0)
++			return (err);
++		if (code == SD_IO_CISTPL_END)
++			return (0);
++		err = sdio_f0_read_byte(sc, addr++, &len);
++		if (err != 0)
++			return (err);
++		if (len > sizeof(data))
++			len = sizeof(data);
++		for (uint8_t j = 0; j < len; j++) {
++			err = sdio_f0_read_byte(sc, addr++, &data[j]);
++			if (err != 0)
++				return (err);
++		}
++
++		switch (code) {
++		case SD_IO_CISTPL_MANFID:
++			if (len >= 4) {
++				out->fi_manfid = data[0] | (data[1] << 8);
++				out->fi_prodid = data[2] | (data[3] << 8);
++			}
++			break;
++		case SD_IO_CISTPL_FUNCID:
++			if (len >= 1)
++				out->fi_class = data[0];
++			break;
++		case SD_IO_CISTPL_FUNCE:
++			/*
++			 * FUNCE extension byte 0 is the sub-type:
++			 *   0x00 = common (function 0) extension
++			 *   0x01 = per-function extension
++			 *
++			 * Per-function FUNCE layout (TPLFE_*):
++			 *   0   type (=0x01)
++			 *   1   function info byte
++			 *   2   std IO rev
++			 *   3-6 card PSN (LE)
++			 *   7-10 CSA size (LE)
++			 *   11  CSA property
++			 *   12-13 max block size (LE)  <- what we want
++			 *   ...
++			 *
++			 * We need to grow our local data[] buffer to at least
++			 * 14 bytes for this read; otherwise the truncation
++			 * in the tuple-read loop above silently zeroes block
++			 * size.  buf grew to 16 to handle this.
++			 */
++			if (data[0] == 0x01 && len >= 14)
++				out->fi_blksize = data[12] |
++				    ((uint16_t)data[13] << 8);
++			break;
++		}
++	}
++	return (0);
++}
++
++static int
++sdio_read_cisptr(struct sdio_softc *sc, uint32_t fbr_base, uint32_t *cisptr)
++{
++	uint8_t lo, mid, hi;
++	int err;
++
++	err = sdio_f0_read_byte(sc, fbr_base + 0, &lo);
++	if (err != 0)
++		return (err);
++	err = sdio_f0_read_byte(sc, fbr_base + 1, &mid);
++	if (err != 0)
++		return (err);
++	err = sdio_f0_read_byte(sc, fbr_base + 2, &hi);
++	if (err != 0)
++		return (err);
++	*cisptr = (uint32_t)lo | ((uint32_t)mid << 8) | ((uint32_t)hi << 16);
++	return (0);
++}
++
++static int
++sdio_attach_children(struct sdio_softc *sc)
++{
++	uint32_t cisptr;
++	uint8_t i, cardcap;
++	int err;
++
++	/*
++	 * Hex-dump the first 0x18 bytes of CCCR — covers the SDIO/CCCR
++	 * revision, capability bits, and the function-0 CIS pointer.
++	 * If these come back zero the card isn't talking to us at all
++	 * (vs talking but reporting empty fields), which sharply narrows
++	 * the diagnosis next.
++	 */
++	if (sc->sc_debug >= 1) {
++		uint8_t cccr[0x18];
++		int j;
++
++		for (j = 0; j < (int)sizeof(cccr); j++) {
++			if (sdio_f0_read_byte(sc, j, &cccr[j]) != 0)
++				cccr[j] = 0xff;
++		}
++		DPRINTF(sc, 1, "CCCR 0x00-0x17 dump:\n");
++		for (j = 0; j < (int)sizeof(cccr); j += 8) {
++			DPRINTF(sc, 1,
++			    "  %02x: %02x %02x %02x %02x %02x %02x %02x %02x\n",
++			    j, cccr[j+0], cccr[j+1], cccr[j+2], cccr[j+3],
++			    cccr[j+4], cccr[j+5], cccr[j+6], cccr[j+7]);
++		}
++	}
++
++	/*
++	 * Read CCCR header bytes we care about.  CARDCAP byte tells us
++	 * whether the card supports CMD53 block-mode (the SMB bit) —
++	 * we keep that on the sc for later sysctl reporting / sanity
++	 * checks but don't gate function discovery on it.
++	 */
++	(void)sdio_f0_read_byte(sc, SD_IO_CCCR_CARDCAP, &cardcap);
++	device_printf(sc->sc_dev,
++	    "SDIO bus: CARDCAP=0x%02x (block-mode %s, low-speed %s)\n",
++	    cardcap,
++	    (cardcap & CCCR_CC_SMB) ? "yes" : "no",
++	    (cardcap & CCCR_CC_LSC) ? "yes" : "no");
++
++	for (i = 1; i <= sc->sc_nfn; i++) {
++		struct sdio_func_ivars *iv;
++		device_t child;
++		uint32_t fbr;
++
++		iv = malloc(sizeof(*iv), M_SDIO, M_WAITOK | M_ZERO);
++		iv->fi_num = i;
++
++		/*
++		 * Function 0 holds the function-0 CIS at SD_IO_CCCR_CISPTR.
++		 * Functions 1..N have their own CIS pointers at the start
++		 * of their FBR block.
++		 */
++		fbr = SD_IO_FBR_START_F(i) + SD_IO_FBR_CIS_OFFSET;
++		err = sdio_read_cisptr(sc, fbr, &cisptr);
++		if (err == 0 && cisptr != 0)
++			(void)sdio_parse_cis(sc, cisptr, iv);
++
++		child = device_add_child(sc->sc_dev, NULL, DEVICE_UNIT_ANY);
++		if (child == NULL) {
++			free(iv, M_SDIO);
++			continue;
++		}
++		device_set_ivars(child, iv);
++		sc->sc_func[i] = child;
++		device_printf(sc->sc_dev,
++		    "sdio func %u: manfid=0x%04x prodid=0x%04x class=0x%02x "
++		    "blksize=%u\n",
++		    iv->fi_num, iv->fi_manfid, iv->fi_prodid, iv->fi_class,
++		    iv->fi_blksize);
++	}
++
++	bus_attach_children(sc->sc_dev);
++	return (0);
++}
++
++/* ------------------------------------------------------------------
++ * Newbus glue
++ * ------------------------------------------------------------------ */
++
++static int
++sdio_probe(device_t dev)
++{
++	device_set_desc(dev, "SDIO bus");
++	return (BUS_PROBE_DEFAULT);
++}
++
++static int
++sdio_attach(device_t dev)
++{
++	struct sdio_softc *sc = device_get_softc(dev);
++	struct sdio_bus_ivars *sbi;
++	struct mmc_command cmd;
++	int err;
++
++	sc->sc_dev = dev;
++	sc->sc_mmcbus = device_get_parent(dev);
++
++	/*
++	 * Per-instance debug knob: dev.sdio.N.debug.  Default 0; bump to
++	 * 1 for milestones, 2 for per-CMD52 raw responses + CIS tuple
++	 * bytes.  Loader-tunable so an investigator can pre-arm it.
++	 */
++	SYSCTL_ADD_INT(device_get_sysctl_ctx(dev),
++	    SYSCTL_CHILDREN(device_get_sysctl_tree(dev)),
++	    OID_AUTO, "debug", CTLFLAG_RWTUN, &sc->sc_debug, 0,
++	    "DPRINTF level: 0=silent 1=milestones 2=protocol 3=hex");
++
++	/*
++	 * mmc_go_discovery() does the CMD5/CMD3/CMD7 sequence and hands
++	 * us the negotiated (rca, nfn, ocr) via newbus ivars.  Pull them
++	 * here so sdio_attach_children() knows how many function slots
++	 * to walk.  If ivars are missing the SDIO probe never finished,
++	 * which is a bug in mmc.c -- bail with ENXIO rather than silently
++	 * enumerating zero functions.
++	 */
++	sbi = device_get_ivars(dev);
++	if (sbi == NULL) {
++		device_printf(dev,
++		    "no sdio_bus_ivars from parent mmc bus; bailing\n");
++		return (ENXIO);
++	}
++	sc->sc_nfn = sbi->sbi_nfn;
++	device_printf(dev,
++	    "SDIO bus attach: nfn=%u rca=0x%04x ocr=0x%08x\n",
++	    sbi->sbi_nfn, sbi->sbi_rca, sbi->sbi_ocr);
++
++	/*
++	 * Re-select the card.  mmc_go_discovery() did CMD7 to put the
++	 * card in TRAN state, but then mmc_calculate_clock() at the end
++	 * of go_discovery does mmc_select_card(sc, 0) which deselects
++	 * ALL cards back to STANDBY -- including ours.  Without this
++	 * second CMD7, every subsequent CMD52 times out.  Found during
++	 * BCM43xxx bring-up on Pi 4 (2026-06-17).
++	 */
++	memset(&cmd, 0, sizeof(cmd));
++	cmd.opcode = MMC_SELECT_CARD;
++	cmd.arg = (uint32_t)sbi->sbi_rca << 16;
++	cmd.flags = MMC_RSP_R1B | MMC_CMD_AC;
++	err = sdio_wait_for_cmd(sc, &cmd);
++	if (err != MMC_ERR_NONE) {
++		device_printf(dev,
++		    "CMD7 reselect (RCA=0x%04x) failed err=%d\n",
++		    sbi->sbi_rca, err);
++		return (ENXIO);
++	}
++	DPRINTF(sc, 1, "CMD7 reselect OK, card in TRAN state\n");
++
++	return (sdio_attach_children(sc));
++}
++
++static int
++sdio_detach(device_t dev)
++{
++	struct sdio_softc *sc = device_get_softc(dev);
++	int i;
++
++	for (i = 1; i < (int)nitems(sc->sc_func); i++) {
++		if (sc->sc_func[i] != NULL) {
++			void *iv = device_get_ivars(sc->sc_func[i]);
++
++			device_delete_child(dev, sc->sc_func[i]);
++			if (iv != NULL)
++				free(iv, M_SDIO);
++			sc->sc_func[i] = NULL;
++		}
++	}
++	return (0);
++}
++
++/* ------------------------------------------------------------------
++ * Ivar plumbing — exposes the per-function metadata to child drivers
++ * via newbus.  Pairs with the SDIO_ACCESSOR() macros in sdio_func.h.
++ * ------------------------------------------------------------------ */
++
++static int
++sdio_read_ivar(device_t bus, device_t child, int which, uintptr_t *result)
++{
++	struct sdio_func_ivars *iv = device_get_ivars(child);
++
++	if (iv == NULL)
++		return (ENOENT);
++
++	switch (which) {
++	case SDIO_IVAR_FUNC_NUM:	*result = iv->fi_num;     return (0);
++	case SDIO_IVAR_MANFID:		*result = iv->fi_manfid;  return (0);
++	case SDIO_IVAR_PRODID:		*result = iv->fi_prodid;  return (0);
++	case SDIO_IVAR_FUNC_CLASS:	*result = iv->fi_class;   return (0);
++	case SDIO_IVAR_BLOCKSIZE:	*result = iv->fi_blksize; return (0);
++	default:			return (ENOENT);
++	}
++}
++
++static device_method_t sdio_methods[] = {
++	DEVMETHOD(device_probe,		sdio_probe),
++	DEVMETHOD(device_attach,	sdio_attach),
++	DEVMETHOD(device_detach,	sdio_detach),
++
++	DEVMETHOD(bus_read_ivar,	sdio_read_ivar),
++	DEVMETHOD(bus_print_child,	bus_generic_print_child),
++
++	DEVMETHOD_END
++};
++
++static driver_t sdio_driver = {
++	"sdio",
++	sdio_methods,
++	sizeof(struct sdio_softc)
++};
++
++DRIVER_MODULE(sdio, mmc, sdio_driver, NULL, NULL);
++MODULE_VERSION(sdio, 1);
+diff --git a/sys/dev/mmc/sdio_func.h b/sys/dev/mmc/sdio_func.h
+new file mode 100644
+index 000000000..a77ce2fec
+--- /dev/null
++++ b/sys/dev/mmc/sdio_func.h
+@@ -0,0 +1,103 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
++ *
++ * SDIO function-bus API.  The mmc(4) probe layer creates one
++ * sdio_func device per I/O function (1-7) advertised via the
++ * card's CCCR.  Each function carries the parsed CIS metadata
++ * (manfid / prodid / class code) on its ivars so newbus probe
++ * methods can match.  Function drivers (bwfm_sdio, sdiobt, etc.)
++ * call the CMD52 / CMD53 helpers here to talk to their slice of
++ * the chip without learning the underlying mmc command machinery.
++ */
++
++#ifndef _DEV_MMC_SDIO_FUNC_H_
++#define _DEV_MMC_SDIO_FUNC_H_
++
++#include <sys/types.h>
++#include <sys/bus.h>
++
++/*
++ * Handoff structure from mmc(4) to the sdio function bus.  Allocated
++ * by mmc_go_discovery() when it lands on an SDIO card, attached to
++ * the newly-created `sdio` child as its newbus ivars.  sdio_attach()
++ * reads it via device_get_ivars() to learn the RCA + nfn the mmc
++ * layer already negotiated, instead of redoing CMD3/CMD7/CMD5.
++ */
++struct sdio_bus_ivars {
++	uint32_t	sbi_ocr;	/* OCR returned by second CMD5 */
++	uint16_t	sbi_rca;	/* relative card address */
++	uint8_t		sbi_nfn;	/* # I/O functions (1..7) */
++};
++
++/*
++ * Ivar accessors for SDIO function children.  Each child of the
++ * sdio bus exposes these via newbus.
++ */
++enum sdio_func_ivar {
++	SDIO_IVAR_FUNC_NUM = 1,	/* function number 1..7 */
++	SDIO_IVAR_MANFID,	/* CISTPL_MANFID manufacturer code */
++	SDIO_IVAR_PRODID,	/* CISTPL_MANFID product code */
++	SDIO_IVAR_FUNC_CLASS,	/* CISTPL_FUNCID class code */
++	SDIO_IVAR_BLOCKSIZE,	/* function block size (CMD53) */
++};
++
++#define	SDIO_ACCESSOR(var, ivar, type)					\
++	__BUS_ACCESSOR(sdio, var, SDIO, ivar, type)
++
++SDIO_ACCESSOR(func_num,    FUNC_NUM,    uint8_t)
++SDIO_ACCESSOR(manfid,      MANFID,      uint16_t)
++SDIO_ACCESSOR(prodid,      PRODID,      uint16_t)
++SDIO_ACCESSOR(func_class,  FUNC_CLASS,  uint8_t)
++SDIO_ACCESSOR(blocksize,   BLOCKSIZE,   uint16_t)
++
++#undef SDIO_ACCESSOR
++
++/*
++ * CMD52 — single-byte direct read/write to function `func` at
++ * `addr` within that function's address space.  Returns 0 on
++ * success, errno on failure (timeout, R5 response error bit).
++ *
++ * Function 0 is the CCCR — common control registers shared across
++ * the whole card.  Functions 1..N are vendor-defined.
++ */
++int sdio_read_byte(device_t func, uint32_t addr, uint8_t *val);
++int sdio_write_byte(device_t func, uint32_t addr, uint8_t val);
++
++/*
++ * CCCR access from a non-zero function child.  Function drivers that
++ * attach to func 1..7 still need to reach CCCR (function 0) to
++ * enable themselves (CCCR.IO_EN), poll CCCR.IO_READY, configure the
++ * interrupt mask (CCCR.INT_ENABLE), etc.  Both helpers route the
++ * underlying CMD52 with func_num=0 regardless of which child invoked
++ * them.  Pass any sdio child as `func`; the helpers find the parent
++ * sdio bus internally.
++ */
++int sdio_cccr_read_byte(device_t func, uint32_t addr, uint8_t *val);
++int sdio_cccr_write_byte(device_t func, uint32_t addr, uint8_t val);
++
++/*
++ * CMD53 — multi-byte / multi-block transfer.  `incr` true means
++ * the on-chip address advances with each byte; false leaves it
++ * fixed (typical for FIFO-style registers).  When `len` is a
++ * multiple of the function's block size, CMD53 runs in block mode
++ * which is dramatically faster — the caller doesn't have to know
++ * the difference; the helper picks the mode.
++ */
++int sdio_read_multi(device_t func, uint32_t addr, void *buf,
++    size_t len, bool incr);
++int sdio_write_multi(device_t func, uint32_t addr, const void *buf,
++    size_t len, bool incr);
++
++/*
++ * Function-level interrupt enable.  The SDIO card multiplexes
++ * function-specific interrupts onto the host's MMC IRQ; the host
++ * arms via CCCR.INT_ENABLE bit N and the function driver claims
++ * via this API.  Disabling routes the interrupt to /dev/null.
++ */
++int sdio_enable_intr(device_t func, driver_intr_t *handler, void *arg);
++void sdio_disable_intr(device_t func);
++void sdio_intr_rearm(device_t func);
++
++#endif /* _DEV_MMC_SDIO_FUNC_H_ */
+diff --git a/sys/dev/mmc/sdioreg.h b/sys/dev/mmc/sdioreg.h
+new file mode 100644
+index 000000000..1363bfc44
+--- /dev/null
++++ b/sys/dev/mmc/sdioreg.h
+@@ -0,0 +1,77 @@
++/*-
++ * SPDX-License-Identifier: BSD-2-Clause
++ *
++ * Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
++ *
++ * SDIO vendor / device / function-class IDs.  Function-bus drivers
++ * (bwfm_sdio, sdiobt, etc.) match against (manfid, prodid) pairs
++ * via newbus probe methods on the sdio_func bus.  Centralised here
++ * so multiple drivers can share the namespace without each rolling
++ * its own table.
++ *
++ * Naming follows the FreeBSD pcireg.h convention (PCI_VENDOR_*,
++ * PCI_DEVICE_*) since the matching model is the same.
++ *
++ * Sources:
++ *   - SD Association SDIO Specification 3.0 (CIS tuple layout)
++ *   - SDIO Card Manufacturer ID registry (incl. cypress.com PDF)
++ *   - Linux drivers/net/wireless/broadcom/brcm80211/brcmfmac/sdio.h
++ *   - Linux drivers/mmc/core/sdio_ids.h
++ */
++
++#ifndef _DEV_MMC_SDIOREG_H_
++#define _DEV_MMC_SDIOREG_H_
++
++/* ------------------------------------------------------------------
++ * Manufacturer (vendor) IDs.  CISTPL_MANFID first word.
++ * ------------------------------------------------------------------ */
++#define	SDIO_VENDOR_BROADCOM		0x02d0	/* Broadcom / Cypress */
++#define	SDIO_VENDOR_ATHEROS		0x0271	/* Atheros / QCA */
++#define	SDIO_VENDOR_MARVELL		0x02df	/* Marvell */
++#define	SDIO_VENDOR_TI			0x0097	/* Texas Instruments */
++#define	SDIO_VENDOR_REALTEK		0x024c	/* Realtek */
++#define	SDIO_VENDOR_INTEL		0x0089	/* Intel */
++#define	SDIO_VENDOR_SIANO		0x039a	/* Siano (DTV demod) */
++#define	SDIO_VENDOR_CYPRESS		0x04b4	/* Cypress (post-Broadcom) */
++
++/* ------------------------------------------------------------------
++ * Broadcom WiFi SDIO product IDs (CISTPL_MANFID second word).  These
++ * match the chip family — actual firmware/NVRAM lookup uses the
++ * (manfid, prodid) pair as a key.
++ * ------------------------------------------------------------------ */
++#define	SDIO_DEVICE_BCM4329		0x4329	/* BCM4329 */
++#define	SDIO_DEVICE_BCM4330		0x4330	/* BCM4330 */
++#define	SDIO_DEVICE_BCM4334		0x4334	/* BCM4334 */
++#define	SDIO_DEVICE_BCM43340		0xa94c	/* BCM43340 */
++#define	SDIO_DEVICE_BCM43341		0xa94d	/* BCM43341 */
++#define	SDIO_DEVICE_BCM43362		0xa962	/* BCM43362 */
++#define	SDIO_DEVICE_BCM43364		0xa9a4	/* BCM43364 */
++#define	SDIO_DEVICE_BCM43430		0xa9a6	/* BCM43430 (Pi 3) */
++#define	SDIO_DEVICE_BCM43455		0xa9bf	/* BCM43455 (Pi 3B+/4) */
++#define	SDIO_DEVICE_BCM43456		0xa9c0	/* BCM43456 (Pi CM4) */
++#define	SDIO_DEVICE_BCM4339		0x4339	/* BCM4339 */
++#define	SDIO_DEVICE_BCM4345		0x4345	/* BCM4345 */
++#define	SDIO_DEVICE_BCM4354		0x4354	/* BCM4354 */
++#define	SDIO_DEVICE_BCM4356		0x4356	/* BCM4356 */
++#define	SDIO_DEVICE_BCM4359		0x4359	/* BCM4359 */
++#define	SDIO_DEVICE_BCM4373		0x4373	/* BCM4373 (Cypress CYW4373) */
++
++/* ------------------------------------------------------------------
++ * SDIO Function-class codes (CISTPL_FUNCID class byte).  These tell
++ * the bus what KIND of function a card slot exposes, before the
++ * per-vendor (manfid, prodid) lookup.  Most modern WiFi chips report
++ * 0x0c (WLAN); some older ones use 0xff (vendor-specific).
++ * ------------------------------------------------------------------ */
++#define	SDIO_FUNCCLASS_NONE		0x00	/* No standard interface */
++#define	SDIO_FUNCCLASS_UART		0x01	/* UART */
++#define	SDIO_FUNCCLASS_BT_TYPEA		0x02	/* Bluetooth Type-A */
++#define	SDIO_FUNCCLASS_BT_TYPEB		0x03	/* Bluetooth Type-B */
++#define	SDIO_FUNCCLASS_GPS		0x04	/* GPS receiver */
++#define	SDIO_FUNCCLASS_CAMERA		0x05	/* Camera */
++#define	SDIO_FUNCCLASS_PHS		0x06	/* PHS (Personal Handy-phone) */
++#define	SDIO_FUNCCLASS_WLAN		0x07	/* WLAN interface */
++#define	SDIO_FUNCCLASS_ATA		0x08	/* Embedded SDIO-ATA standard */
++#define	SDIO_FUNCCLASS_BT_TYPEAMP	0x09	/* Bluetooth AMP */
++#define	SDIO_FUNCCLASS_VENDOR		0xff	/* Vendor-specific */
++
++#endif /* _DEV_MMC_SDIOREG_H_ */

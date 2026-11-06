@@ -1,0 +1,96 @@
+From f1aa27592196d4c5e2200587a643b8f5d030e011 Mon Sep 17 00:00:00 2001
+From: b1nc0d3x <b1nc0d3x@gmail.com>
+Date: Tue, 13 Oct 2026 21:05:58 -0400
+Subject: [PATCH 6/7] net80211: fullmac: zero the MGMT_TX buffer and shorten
+ comments
+
+The frame buffer for IEEE80211_IOC_MGMT_TX is allocated with M_ZERO.
+Comments added in the previous commit are cut to a line or two.
+---
+ sys/net80211/ieee80211_fullmac.c | 35 ++++++++------------------------
+ 1 file changed, 8 insertions(+), 27 deletions(-)
+
+diff --git a/sys/net80211/ieee80211_fullmac.c b/sys/net80211/ieee80211_fullmac.c
+index 1d14d2793a2f..f918b7796fc5 100644
+--- a/sys/net80211/ieee80211_fullmac.c
++++ b/sys/net80211/ieee80211_fullmac.c
+@@ -142,13 +142,7 @@ static const struct ieee80211_cipher fmac_bip_cipher = {
+ 	.ic_demic	= fmac_bip_demic,
+ };
+ 
+-/*
+- * Each vap's own net80211 hooks, saved when the framework rewires
+- * them.  Kept per vap (a station and an access point have different
+- * iv_newstate) and on a global list under fmac_mtx, apart from
+- * fmac_state, so the shims can always reach the hooks they replaced,
+- * even while the framework detaches.
+- */
++/* Each vap's saved net80211 hooks, on a global list under fmac_mtx. */
+ struct fmac_vap {
+ 	LIST_ENTRY(fmac_vap)	fv_link;
+ 	struct ieee80211vap	*fv_vap;
+@@ -187,9 +181,8 @@ struct fmac_state {
+ 	void	(*fs_save_vap_delete)(struct ieee80211vap *);
+ 
+ 	/*
+-	 * fs_vap_going is a vap being deleted, and fs_dying is set while
+-	 * the framework detaches.  The AP and age tasks pass over that
+-	 * vap and stop re-arming the age callout.  Both under fs_ap_mtx.
++	 * fs_vap_going: a vap being deleted.  fs_dying: framework detaching.
++	 * Both under fs_ap_mtx.
+ 	 */
+ 	struct ieee80211vap		   *fs_vap_going;
+ 	bool				    fs_dying;
+@@ -336,11 +329,7 @@ fmac_vap_hooks(struct ieee80211vap *vap, struct fmac_vap *out)
+ 	mtx_unlock(&fmac_mtx);
+ }
+ 
+-/*
+- * Put back the hooks the framework replaced on every vap of ic and
+- * forget them.  Called from detach, before fmac_state is freed, so no
+- * vap is left calling a shim that can no longer find its state.
+- */
++/* Restore the saved hooks on every vap of ic.  Called from detach. */
+ static void
+ fmac_vap_restore_all(struct ieee80211com *ic)
+ {
+@@ -706,11 +695,8 @@ ieee80211_fmac_detach(struct ieee80211com *ic)
+  *   - net.wlan.N.fullmac_pmk exists when the driver can take a PMK.
+  */
+ /*
+- * ic_vap_delete wrapper.  The AP and age tasks find the access point
+- * vap by walking ic_vaps on taskqueue_thread, which vap teardown does
+- * not drain.  Mark the vap as going so they pass it over, drain them,
+- * and only then let the driver delete it.  The saved hooks are
+- * dropped last, since the vap's trip to INIT still uses them.
++ * ic_vap_delete wrapper: drain the AP and age tasks before the
++ * driver deletes the vap.
+  */
+ static void
+ fmac_vap_delete(struct ieee80211vap *vap)
+@@ -2136,12 +2122,7 @@ fmac_ap_leave(struct ieee80211vap *vap, const struct fmac_ap_evt *fe)
+ 	ieee80211_free_node(ni);
+ }
+ 
+-/*
+- * The hostap vap stations belong to, if it is running.  A vap being
+- * deleted is passed over (fmac_vap_delete drains the tasks that call
+- * this before the vap goes), and so is everything once the framework
+- * detaches.
+- */
++/* The running hostap vap, passing over one being deleted. */
+ static struct ieee80211vap *
+ fmac_ap_vap(struct fmac_state *fs)
+ {
+@@ -2624,7 +2605,7 @@ fmac_extauth_ioctl(struct ieee80211vap *vap, u_long cmd,
+ 			error = EINVAL;
+ 			break;
+ 		}
+-		frame = malloc(ireq->i_len, M_TEMP, M_WAITOK);
++		frame = malloc(ireq->i_len, M_TEMP, M_WAITOK | M_ZERO);
+ 		error = copyin(ireq->i_data, frame, ireq->i_len);
+ 		wh = (const struct ieee80211_frame *)frame;
+ 		/* Only Authentication frames: that is all SAE needs. */
+-- 
+2.50.1 (Apple Git-155)
+

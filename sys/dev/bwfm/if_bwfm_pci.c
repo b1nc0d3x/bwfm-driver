@@ -5,6 +5,8 @@
  *
  * Broadcom FullMAC PCIe transport glue for bwfm.
  *
+ * Needs no kernel patches; COMPATIBILITY.md lists what each bus needs.
+ *
  * Matches the BCM43602 and the other BCM43xx PCIe parts by ID, maps
  * BAR0 (the register window) and BAR2 (chip RAM), walks the backplane
  * cores, downloads the firmware into chip RAM and releases the ARM,

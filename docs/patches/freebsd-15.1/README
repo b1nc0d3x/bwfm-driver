@@ -1,0 +1,17 @@
+Kernel patches for FreeBSD 15.1.  They apply with "git apply" to
+releng/15.1 at 893c7c99b ("Add UPDATING entries and bump version"), in
+this order:
+
+01-mmc-sdio-function-driver.diff
+	Adds SDIO support to the mmc stack, which bwfm_sdio needs: SDIO
+	card discovery in mmc.c, the sdio_func layer (sdio_func.c/.h,
+	sdioreg.h) and the SDIO card interrupt.  In bcm2835_sdhci.c it
+	adds the card interrupt and a lock that shares the Raspberry
+	Pi 4's controller fairly between the WiFi and the SD card, so
+	heavy WiFi traffic can't starve the root filesystem.
+
+02-net80211.diff
+	Adds key slots 4 and 5 for the 802.11w group management key, and
+	an Extended Capabilities element in management frames so newer
+	access points don't treat the station as an old one.  Needed for
+	802.11w and WPA3 on any bus.

@@ -7,6 +7,10 @@
  * BCM43xxx family the Raspberry Pi 4 carries on its internal SDIO
  * bus (BCM43430 / CYW43436 / BCM43455).
  *
+ * Needs the kernel patch docs/patches/freebsd-15.1/
+ * 01-mmc-sdio-function-driver.diff; COMPATIBILITY.md lists what each
+ * bus needs.
+ *
  * Lifecycle:
  *   1. sdio0 enumerates I/O functions and creates one newbus child per
  *      function (sdio_func.c).  Each child carries manfid/prodid/class

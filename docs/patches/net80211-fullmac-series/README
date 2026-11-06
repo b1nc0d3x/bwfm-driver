@@ -1,0 +1,6 @@
+The FullMAC framework as a patch series for net80211, seven commits on
+FreeBSD main at 2321b3df1f0d.  Apply them in order with "git am".
+
+The seventh commit brings the series level with the copy in
+sys/net80211 here.  A 16.0-CURRENT GENERIC kernel with the series
+builds cleanly with -Werror.

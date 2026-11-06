@@ -2,6 +2,8 @@
 
 KMOD=	bwfm_usb
 
+# Needs no kernel patches.  See COMPATIBILITY.md.
+
 # Standalone module.  It links in the shared core, bwfm.c and the
 # FullMAC framework where the kernel lacks it, so that bwfm_attach and
 # ieee80211_fmac_attach resolve without a separate bwfm.ko.  The

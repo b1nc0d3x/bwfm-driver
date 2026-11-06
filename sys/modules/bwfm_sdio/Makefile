@@ -2,8 +2,9 @@
 # sdio newbus parent (sys/dev/mmc/sdio_func.c) and probes Broadcom
 # BCM43xxx WLAN functions.
 #
-# The SDIO headers (mmc_subr.h, sdio_func.h, sdioreg.h) are in base
-# from 15.1.  On 14.x, add -I${KERN_TREE}/sys on the command line.
+# Stock FreeBSD has no sdio_func layer.  The kernel needs
+# docs/patches/freebsd-15.1/01-mmc-sdio-function-driver.diff, and this
+# module must be built against that patched tree.  See COMPATIBILITY.md.
 
 .PATH:	${SRCTOP}/sys/dev/bwfm
 

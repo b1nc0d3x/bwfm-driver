@@ -1,0 +1,91 @@
+From 3a9c400ed0363416264a992dfa945c2cefb2801a Mon Sep 17 00:00:00 2001
+From: b1nc0d3x <b1nc0d3x@gmail.com>
+Date: Tue, 13 Oct 2026 12:52:25 -0400
+Subject: [PATCH 4/7] net80211: check element lengths in the FullMAC scan walk
+
+fmac_walk_ies() stored a pointer to every element it knew without the
+length checks ieee80211_parse_beacon() makes.  sta_add() copies the Mesh
+ID into a 34-byte buffer, so a beacon with a longer one overran the heap
+whenever the kernel has IEEE80211_SUPPORT_MESH, and a short TIM, country,
+HT or VHT element at the end of the blob was later read at its full
+size.  Leave out any element that parse_beacon would reject.
+---
+ sys/net80211/ieee80211_fullmac.c | 30 +++++++++++++++++++++---------
+ 1 file changed, 21 insertions(+), 9 deletions(-)
+
+diff --git a/sys/net80211/ieee80211_fullmac.c b/sys/net80211/ieee80211_fullmac.c
+index 8b1a6218fa09..5461d5eb4f90 100644
+--- a/sys/net80211/ieee80211_fullmac.c
++++ b/sys/net80211/ieee80211_fullmac.c
+@@ -1345,7 +1345,10 @@ ieee80211_fmac_rx(struct ieee80211com *ic, struct mbuf *m)
+  * Walk a firmware-supplied IE blob and populate the IE-pointer fields
+  * of an ieee80211_scanparams.  Same shape as ieee80211_parse_beacon's
+  * IE switch, but operates on a raw byte range — no mbuf, no node, no
+- * IEEE80211_DISCARD logging.  Caller must zero `sp` first.
++ * IEEE80211_DISCARD logging.  Caller must zero `sp` first.  An element
++ * too short (or, for the mesh ID, too long) for the checks that
++ * ieee80211_parse_beacon would make is left out, since later code reads
++ * these at fixed sizes.
+  *
+  * Stack budget on aarch64 is ~16 KB.  Going through ieee80211_input ->
+  * sta_recv_mgmt -> ieee80211_parse_beacon costs ~3 frames and ~1 KB
+@@ -1372,15 +1375,18 @@ fmac_walk_ies(const uint8_t *ies, size_t ies_len,
+ 			sp->rates = __DECONST(uint8_t *, frm);
+ 			break;
+ 		case IEEE80211_ELEMID_COUNTRY:
+-			sp->country = __DECONST(uint8_t *, frm);
++			if (frm[1] >= 3)
++				sp->country = __DECONST(uint8_t *, frm);
+ 			break;
+ 		case IEEE80211_ELEMID_DSPARMS:
+ 			if (frm[1] >= 1)
+ 				sp->chan = frm[2];
+ 			break;
+ 		case IEEE80211_ELEMID_TIM:
+-			sp->tim = __DECONST(uint8_t *, frm);
+-			sp->timoff = frm - ies;
++			if (frm[1] >= 4) {
++				sp->tim = __DECONST(uint8_t *, frm);
++				sp->timoff = frm - ies;
++			}
+ 			break;
+ 		case IEEE80211_ELEMID_XRATES:
+ 			sp->xrates = __DECONST(uint8_t *, frm);
+@@ -1390,23 +1396,29 @@ fmac_walk_ies(const uint8_t *ies, size_t ies_len,
+ 				sp->erp = frm[2] | 0x100;
+ 			break;
+ 		case IEEE80211_ELEMID_HTCAP:
+-			sp->htcap = __DECONST(uint8_t *, frm);
++			if (frm[1] >= sizeof(struct ieee80211_ie_htcap) - 2)
++				sp->htcap = __DECONST(uint8_t *, frm);
+ 			break;
+ 		case IEEE80211_ELEMID_VHT_CAP:
+-			sp->vhtcap = __DECONST(uint8_t *, frm);
++			if (frm[1] >= sizeof(struct ieee80211_vht_cap))
++				sp->vhtcap = __DECONST(uint8_t *, frm);
+ 			break;
+ 		case IEEE80211_ELEMID_VHT_OPMODE:
+-			sp->vhtopmode = __DECONST(uint8_t *, frm);
++			if (frm[1] >= sizeof(struct ieee80211_vht_operation))
++				sp->vhtopmode = __DECONST(uint8_t *, frm);
+ 			break;
+ 		case IEEE80211_ELEMID_RSN:
+ 			sp->rsn = __DECONST(uint8_t *, frm);
+ 			break;
+ 		case IEEE80211_ELEMID_HTINFO:
+-			sp->htinfo = __DECONST(uint8_t *, frm);
++			if (frm[1] >= sizeof(struct ieee80211_ie_htinfo) - 2)
++				sp->htinfo = __DECONST(uint8_t *, frm);
+ 			break;
+ #ifdef IEEE80211_SUPPORT_MESH
+ 		case IEEE80211_ELEMID_MESHID:
+-			sp->meshid = __DECONST(uint8_t *, frm);
++			/* sta_add copies it into a 2 + 32 byte buffer. */
++			if (frm[1] <= IEEE80211_MESHID_LEN)
++				sp->meshid = __DECONST(uint8_t *, frm);
+ 			break;
+ 		case IEEE80211_ELEMID_MESHCONF:
+ 			sp->meshconf = __DECONST(uint8_t *, frm);
+-- 
+2.50.1 (Apple Git-155)
+

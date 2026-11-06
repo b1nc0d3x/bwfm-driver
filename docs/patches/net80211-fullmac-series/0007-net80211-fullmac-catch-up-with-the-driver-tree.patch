@@ -1,0 +1,698 @@
+From f25f227c35b5252330348ee89af0989eb2662031 Mon Sep 17 00:00:00 2001
+From: b1nc0d3x <b1nc0d3x@gmail.com>
+Date: Tue, 3 Nov 2026 07:44:12 -0500
+Subject: [PATCH 7/7] net80211: fullmac: catch up with the driver tree
+
+Bring the framework up to what bwfm runs today:
+
+- report the association request the firmware sent, through
+  ieee80211_fmac_assoc_ies() and IEEE80211_IOC_ASSOC_REQ_IE, so
+  wpa_supplicant builds 4-way message 2 from the elements the AP saw
+  (needed for SAE-H2E against APs that differ from the beacon);
+- let the firmware finish its scan, end a scan it refused or never
+  completes, and run every ioctl scan on the firmware;
+- rescan after a failed join or lost link when the device roams,
+  and handle a lost link the way net80211 does;
+- give a shim already running the vap's own hooks once detach has
+  put them back;
+- carry the channel width and centre for access points at 40 and
+  80 MHz.
+
+Document the new up-call and request in ieee80211_fullmac(9).
+---
+ share/man/man9/Makefile            |   3 +-
+ share/man/man9/ieee80211_fullmac.9 |  32 +++-
+ sys/net80211/ieee80211_fullmac.c   | 293 ++++++++++++++++++++++++-----
+ sys/net80211/ieee80211_fullmac.h   |  10 +
+ sys/net80211/ieee80211_ioctl.h     |   4 +
+ 5 files changed, 290 insertions(+), 52 deletions(-)
+
+diff --git a/share/man/man9/Makefile b/share/man/man9/Makefile
+index 06d7bcfa7543..3cd46fd054b2 100644
+--- a/share/man/man9/Makefile
++++ b/share/man/man9/Makefile
+@@ -1266,7 +1266,8 @@ MLINKS+=ieee80211_crypto.9 ieee80211_crypto_available.9 \
+ 	ieee80211_crypto.9 ieee80211_key_update_end.9 \
+ 	ieee80211_crypto.9 ieee80211_notify_michael_failure.9 \
+ 	ieee80211_crypto.9 ieee80211_notify_replay_failure.9
+-MLINKS+=ieee80211_fullmac.9 ieee80211_fmac_assoc_reject.9 \
++MLINKS+=ieee80211_fullmac.9 ieee80211_fmac_assoc_ies.9 \
++	ieee80211_fullmac.9 ieee80211_fmac_assoc_reject.9 \
+ 	ieee80211_fullmac.9 ieee80211_fmac_attach.9 \
+ 	ieee80211_fullmac.9 ieee80211_fmac_detach.9 \
+ 	ieee80211_fullmac.9 ieee80211_fmac_extauth_req.9 \
+diff --git a/share/man/man9/ieee80211_fullmac.9 b/share/man/man9/ieee80211_fullmac.9
+index 4e5ad033b5dd..26acbf0e09cf 100644
+--- a/share/man/man9/ieee80211_fullmac.9
++++ b/share/man/man9/ieee80211_fullmac.9
+@@ -3,7 +3,7 @@
+ .\"
+ .\" Copyright (c) 2026 Kyle Crenshaw <b1nc0d3x@gmail.com>
+ .\"
+-.Dd October 12, 2026
++.Dd November 3, 2026
+ .Dt IEEE80211_FULLMAC 9
+ .Os
+ .Sh NAME
+@@ -75,6 +75,12 @@
+ .Fa "const uint8_t bssid[IEEE80211_ADDR_LEN]"
+ .Fa "uint16_t status"
+ .Fc
++.Ft void
++.Fo ieee80211_fmac_assoc_ies
++.Fa "struct ieee80211com *ic"
++.Fa "const uint8_t *ies"
++.Fa "size_t len"
++.Fc
+ .Sh DESCRIPTION
+ A FullMAC device runs scanning, authentication, association and often
+ the key handshake in its own firmware, and exchanges Ethernet frames
+@@ -241,6 +247,15 @@ The firmware wants the host to run SAE with an access point.
+ An Authentication frame received for the host's SAE exchange.
+ .It Fn ieee80211_fmac_assoc_reject
+ The firmware gave up on a join, with an 802.11 status code.
++.It Fn ieee80211_fmac_assoc_ies
++The information elements of the association request the firmware sent,
++so that
++.Xr wpa_supplicant 8
++builds message 2 of the 4-way handshake from what the access point
++received.
++Call it before
++.Fn ieee80211_fmac_link_up ;
++a length of 0 forgets them.
+ .El
+ .Pp
+ .Fn ieee80211_fmac_link_up ,
+@@ -258,14 +273,19 @@ socket messages,
+ .Dv RTM_IEEE80211_MGMT_RX
+ and
+ .Dv RTM_IEEE80211_ASSOC_REJECT ,
+-and four
+-.Dv SIOCS80211
+-requests,
++and five requests:
+ .Dv IEEE80211_IOC_MGMT_TX ,
+-.Dv IEEE80211_IOC_EXTAUTH_STATUS ,
++.Dv IEEE80211_IOC_EXTAUTH_STATUS
++and
++.Dv IEEE80211_IOC_PMKSA
++through
++.Dv SIOCS80211 ,
++and
+ .Dv IEEE80211_IOC_EXTAUTH_CAPS
+ and
+-.Dv IEEE80211_IOC_PMKSA .
++.Dv IEEE80211_IOC_ASSOC_REQ_IE
++through
++.Dv SIOCG80211 .
+ They are defined in
+ .In net80211/ieee80211_freebsd.h
+ and
+diff --git a/sys/net80211/ieee80211_fullmac.c b/sys/net80211/ieee80211_fullmac.c
+index f918b7796fc5..649cd897c3f3 100644
+--- a/sys/net80211/ieee80211_fullmac.c
++++ b/sys/net80211/ieee80211_fullmac.c
+@@ -63,6 +63,9 @@ struct fmac_ap_evt {
+ 
+ /* Bound on queued station events; a stuck task must not eat memory. */
+ #define	FMAC_AP_MAXEVTS		256
++#define	FMAC_SCAN_TIMEOUT_MS	15000	/* longest firmware scan we wait for */
++#define	FMAC_SCAN_RETRY_MS	1000	/* end a scan the firmware refused */
++static const struct timeval fmac_scan_fail_iv = { 5, 0 };
+ 
+ /*
+  * Management frame protection (802.11w) needs a BIP-CMAC-128 cipher
+@@ -171,6 +174,9 @@ struct fmac_state {
+ 
+ 	void	(*fs_save_scan_start)(struct ieee80211com *);
+ 	void	(*fs_save_scan_end)(struct ieee80211com *);
++	void	(*fs_save_scan_curchan)(struct ieee80211_scan_state *,
++		    unsigned long);
++	void	(*fs_save_scan_mindwell)(struct ieee80211_scan_state *);
+ 	int	(*fs_save_setregdomain)(struct ieee80211com *,
+ 		    struct ieee80211_regdomain *, int,
+ 		    struct ieee80211_channel []);
+@@ -203,6 +209,11 @@ struct fmac_state {
+ 	 * cancelled.  fmac_scan_end_shim cancels only a running scan.
+ 	 */
+ 	volatile bool			    fs_scan_active;
++	/* the firmware refused net80211's scan; fs_scan_timeout ends it */
++	volatile bool			    fs_scan_retry;
++	struct timeval			    fs_scan_fail_log;
++	/* ends a firmware scan whose completion never arrives */
++	struct timeout_task		    fs_scan_timeout;
+ 
+ 	/*
+ 	 * ieee80211_fmac_roamed is moving a station vap to a new BSS:
+@@ -279,6 +290,10 @@ struct fmac_state {
+ 	struct task			    fs_left_task;
+ 	struct fmac_left_bss		   *volatile fs_left;
+ 
++	/* our last association request's elements, under the com lock */
++	uint8_t				    fs_assoc_ie[IEEE80211_FMAC_ASSOC_IE_MAX];
++	size_t				    fs_assoc_ielen;
++
+ 	/*
+ 	 * Outstanding-lookup refcount.  fmac_lookup bumps fs_refs before
+ 	 * returning, so a concurrent ieee80211_fmac_detach can't free the
+@@ -314,7 +329,18 @@ fmac_vap_find_locked(struct ieee80211vap *vap)
+ 	return (NULL);
+ }
+ 
+-/* A copy of the vap's saved hooks; zero if the vap is not ours. */
++static int	fmac_newstate(struct ieee80211vap *,
++		    enum ieee80211_state, int);
++static int	fmac_reset(struct ieee80211vap *, u_long);
++static int	fmac_key_set(struct ieee80211vap *,
++		    const struct ieee80211_key *);
++static int	fmac_key_delete(struct ieee80211vap *,
++		    const struct ieee80211_key *);
++
++/*
++ * A copy of the vap's saved hooks.  Once detach has put the originals
++ * back on the vap, a shim already running gets those instead.
++ */
+ static void
+ fmac_vap_hooks(struct ieee80211vap *vap, struct fmac_vap *out)
+ {
+@@ -322,10 +348,19 @@ fmac_vap_hooks(struct ieee80211vap *vap, struct fmac_vap *out)
+ 
+ 	mtx_lock(&fmac_mtx);
+ 	fv = fmac_vap_find_locked(vap);
+-	if (fv != NULL)
++	if (fv != NULL) {
+ 		*out = *fv;
+-	else
++	} else {
+ 		memset(out, 0, sizeof(*out));
++		if (vap->iv_newstate != fmac_newstate)
++			out->fv_newstate = vap->iv_newstate;
++		if (vap->iv_key_set != fmac_key_set)
++			out->fv_key_set = vap->iv_key_set;
++		if (vap->iv_key_delete != fmac_key_delete)
++			out->fv_key_delete = vap->iv_key_delete;
++		if (vap->iv_reset != fmac_reset)
++			out->fv_reset = vap->iv_reset;
++	}
+ 	mtx_unlock(&fmac_mtx);
+ }
+ 
+@@ -428,13 +463,10 @@ static void	fmac_scan_add(struct ieee80211com *,
+ 		    const struct ieee80211_fmac_bss *, bool);
+ static void	fmac_note_left(struct fmac_state *, struct ieee80211vap *);
+ static void	fmac_left_task(void *, int);
+-static int	fmac_newstate(struct ieee80211vap *,
+-		    enum ieee80211_state, int);
+ static int	fmac_setregdomain(struct ieee80211com *,
+ 		    struct ieee80211_regdomain *, int,
+ 		    struct ieee80211_channel []);
+ static void	fmac_country_task(void *, int);
+-static int	fmac_reset(struct ieee80211vap *, u_long);
+ static void fmac_vap_delete(struct ieee80211vap *);
+ static struct ieee80211vap *fmac_vap_create(struct ieee80211com *,
+ 		    const char [IFNAMSIZ], int, enum ieee80211_opmode, int,
+@@ -446,10 +478,6 @@ static void	fmac_sig_task(void *, int);
+ static int8_t	fmac_node_getrssi(const struct ieee80211_node *);
+ static void	fmac_node_getsignal(const struct ieee80211_node *, int8_t *,
+ 		    int8_t *);
+-static int	fmac_key_set(struct ieee80211vap *,
+-		    const struct ieee80211_key *);
+-static int	fmac_key_delete(struct ieee80211vap *,
+-		    const struct ieee80211_key *);
+ 
+ /* ------------------------------------------------------------------
+  * Attach / detach
+@@ -457,6 +485,10 @@ static int	fmac_key_delete(struct ieee80211vap *,
+ 
+ static void	fmac_scan_start_shim(struct ieee80211com *);
+ static void	fmac_scan_end_shim(struct ieee80211com *);
++static void	fmac_scan_curchan(struct ieee80211_scan_state *,
++		    unsigned long);
++static void	fmac_scan_mindwell(struct ieee80211_scan_state *);
++static void	fmac_scan_timeout(void *, int);
+ static void	fmac_ap_task(void *, int);
+ static void	fmac_age_task(void *, int);
+ static void	fmac_ap_sec_save(struct fmac_state *,
+@@ -515,10 +547,20 @@ ieee80211_fmac_attach(struct ieee80211com *ic,
+ 	 * never need to set ic->ic_scan_start / ic_scan_end themselves;
+ 	 * fmop_scan_start owns the chip-side dispatch.
+ 	 */
+-	fs->fs_save_scan_start = ic->ic_scan_start;
+-	fs->fs_save_scan_end   = ic->ic_scan_end;
++	/* a reattach finds our shims still installed; never chain to them */
++	if (ic->ic_scan_start != fmac_scan_start_shim)
++		fs->fs_save_scan_start = ic->ic_scan_start;
++	if (ic->ic_scan_end != fmac_scan_end_shim)
++		fs->fs_save_scan_end = ic->ic_scan_end;
+ 	ic->ic_scan_start = fmac_scan_start_shim;
+ 	ic->ic_scan_end   = fmac_scan_end_shim;
++	/* the firmware walks the channels, so net80211 must not time them */
++	fs->fs_save_scan_curchan  = ic->ic_scan_curchan;
++	fs->fs_save_scan_mindwell = ic->ic_scan_mindwell;
++	ic->ic_scan_curchan  = fmac_scan_curchan;
++	ic->ic_scan_mindwell = fmac_scan_mindwell;
++	TIMEOUT_TASK_INIT(taskqueue_thread, &fs->fs_scan_timeout, 0,
++	    fmac_scan_timeout, fs);
+ 
+ 	/* Every vap the driver creates is set up here as well. */
+ 	fs->fs_save_vap_create = ic->ic_vap_create;
+@@ -630,8 +672,14 @@ ieee80211_fmac_detach(struct ieee80211com *ic)
+ 	fs->fs_dying = true;
+ 	mtx_unlock(&fs->fs_ap_mtx);
+ 	fmac_vap_restore_all(ic);
+-	ic->ic_scan_start = fs->fs_save_scan_start;
+-	ic->ic_scan_end   = fs->fs_save_scan_end;
++	/* net80211 calls these until ifdetach; the shims cope without fs */
++	if (fs->fs_save_scan_start != NULL)
++		ic->ic_scan_start = fs->fs_save_scan_start;
++	if (fs->fs_save_scan_end != NULL)
++		ic->ic_scan_end = fs->fs_save_scan_end;
++	ic->ic_scan_curchan  = fs->fs_save_scan_curchan;
++	ic->ic_scan_mindwell = fs->fs_save_scan_mindwell;
++	taskqueue_drain_timeout(taskqueue_thread, &fs->fs_scan_timeout);
+ 	ic->ic_vap_create = fs->fs_save_vap_create;
+ 	ic->ic_vap_delete = fs->fs_save_vap_delete;
+ 	if (fs->fs_ops->fmop_set_country != NULL)
+@@ -692,6 +740,8 @@ ieee80211_fmac_detach(struct ieee80211com *ic)
+  *   - roaming is the device's (IEEE80211_ROAMING_DEVICE), and so is
+  *     scanning (IEEE80211_FEXT_SCAN_OFFLOAD): net80211's scanner sends
+  *     no probe requests and no power-save frames of its own;
++ *   - a scan asked for through the ioctl always reaches the firmware
++ *     (fmac_vap_ioctl), as with Linux;
+  *   - net.wlan.N.fullmac_pmk exists when the driver can take a PMK.
+  */
+ /*
+@@ -862,6 +912,7 @@ fmac_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
+ 	struct fmac_state *fs;
+ 	struct ieee80211_fmac_assoc fa;
+ 	struct fmac_vap hooks;
++	enum ieee80211_state ostate;
+ 	int rc;
+ 
+ 	fmac_vap_hooks(vap, &hooks);
+@@ -917,9 +968,9 @@ fmac_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
+ 	 * The station logic below does not apply.
+ 	 */
+ 	if (vap->iv_opmode == IEEE80211_M_HOSTAP) {
+-		enum ieee80211_state ostate = vap->iv_state;
+ 		int want = FMAC_AP_NONE;
+ 
++		ostate = vap->iv_state;
+ 		rc = hooks.fv_newstate(vap, nstate, arg);
+ 		if (fs->fs_ops->fmop_start_ap != NULL) {
+ 			if (nstate == IEEE80211_S_RUN &&
+@@ -972,10 +1023,22 @@ fmac_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
+ 		(void)fs->fs_ops->fmop_disassoc(ic,
+ 		    IEEE80211_REASON_AUTH_LEAVE);
+ 		break;
++	case IEEE80211_S_SCAN:
++		/* a lost link: keep the firmware from rejoining by itself */
++		if (vap->iv_state >= IEEE80211_S_AUTH)
++			(void)fs->fs_ops->fmop_disassoc(ic,
++			    IEEE80211_REASON_AUTH_LEAVE);
++		break;
+ 	default:
+ 		break;
+ 	}
++	ostate = vap->iv_state;
+ 	rc = hooks.fv_newstate(vap, nstate, arg);
++	/* net80211 rescans only for ROAMING_AUTO; a device-roaming STA rescans here */
++	if (rc == 0 && vap->iv_opmode == IEEE80211_M_STA &&
++	    nstate == IEEE80211_S_SCAN && ostate >= IEEE80211_S_AUTH &&
++	    vap->iv_roaming == IEEE80211_ROAMING_DEVICE)
++		ieee80211_check_scan_current(vap);
+ 	fmac_release(fs);
+ 	return (rc);
+ }
+@@ -1133,7 +1196,7 @@ fmac_reset(struct ieee80211vap *vap, u_long cmd)
+  * directly; the framework owns them.  fmop_scan_start receives a
+  * single SSID at most (net80211's ic_scan_state may have more but
+  * almost every FullMAC chip's scan engine takes one).  When the
+- * driver returns non-zero, fall back to the saved net80211 hook
++ * driver returns ENXIO, fall back to the saved net80211 hook
+  * (which is typically a no-op for SoftMAC-shaped scan engines).
+  */
+ static void
+@@ -1157,10 +1220,22 @@ fmac_scan_start_shim(struct ieee80211com *ic)
+ 		active = (ss->ss_flags & IEEE80211_SCAN_ACTIVE) != 0;
+ 	}
+ 	rc = fs->fs_ops->fmop_scan_start(ic, ssid, ssidlen, active);
+-	if (rc == 0)
++	if (rc == 0) {
+ 		fs->fs_scan_active = true;
+-	else if (fs->fs_save_scan_start != NULL)
+-		fs->fs_save_scan_start(ic);
++		taskqueue_enqueue_timeout(taskqueue_thread,
++		    &fs->fs_scan_timeout, MSEC_2_TICKS(FMAC_SCAN_TIMEOUT_MS));
++	} else if (rc == ENXIO) {
++		if (fs->fs_save_scan_start != NULL)
++			fs->fs_save_scan_start(ic);
++	} else {
++		/* nothing will end net80211's scan; end it so it retries */
++		if (ratecheck(&fs->fs_scan_fail_log, &fmac_scan_fail_iv))
++			ic_printf(ic, "firmware refused a scan (%d), "
++			    "retrying\n", rc);
++		fs->fs_scan_retry = true;
++		taskqueue_enqueue_timeout(taskqueue_thread,
++		    &fs->fs_scan_timeout, MSEC_2_TICKS(FMAC_SCAN_RETRY_MS));
++	}
+ 	fmac_release(fs);
+ }
+ 
+@@ -1177,6 +1252,8 @@ fmac_scan_end_shim(struct ieee80211com *ic)
+ 
+ 	if (fs == NULL)
+ 		return;
++	taskqueue_cancel_timeout(taskqueue_thread, &fs->fs_scan_timeout, NULL);
++	fs->fs_scan_retry = false;
+ 	if (fs->fs_scan_active) {
+ 		fs->fs_scan_active = false;
+ 		if (fs->fs_ops->fmop_scan_cancel != NULL)
+@@ -1187,6 +1264,39 @@ fmac_scan_end_shim(struct ieee80211com *ic)
+ 	fmac_release(fs);
+ }
+ 
++/*
++ * Per-channel hooks.  The firmware scans every channel itself, so
++ * these do nothing and net80211 waits for ieee80211_fmac_scan_done,
++ * as iwm, iwx and rsu do.
++ */
++static void
++fmac_scan_curchan(struct ieee80211_scan_state *ss __unused,
++    unsigned long maxdwell __unused)
++{
++}
++
++static void
++fmac_scan_mindwell(struct ieee80211_scan_state *ss __unused)
++{
++}
++
++/* the firmware never reported the end of its scan, or refused it */
++static void
++fmac_scan_timeout(void *arg, int pending __unused)
++{
++	struct fmac_state *fs = arg;
++	struct ieee80211com *ic = fs->fs_ic;
++
++	if (fs->fs_scan_active) {
++		ic_printf(ic, "firmware scan timed out\n");
++		if (fs->fs_ops->fmop_scan_cancel != NULL)
++			fs->fs_ops->fmop_scan_cancel(ic);
++	} else if (!fs->fs_scan_retry)
++		return;
++	fs->fs_scan_retry = false;
++	ieee80211_fmac_scan_done(ic);
++}
++
+ /* ------------------------------------------------------------------
+  * Driver -> net80211 up-calls
+  * ------------------------------------------------------------------ */
+@@ -1392,7 +1502,17 @@ ieee80211_fmac_link_up(struct ieee80211com *ic,
+ 	return (ENOENT);
+ }
+ 
+-/* firmware says the link dropped: reset to init */
++/* the state a vap ends in once its queued transitions have run */
++static enum ieee80211_state
++fmac_last_state(const struct ieee80211vap *vap)
++{
++	if (vap->iv_nstate_n == 0)
++		return (vap->iv_state);
++	return (vap->iv_nstates[(vap->iv_nstate_b + vap->iv_nstate_n - 1) %
++	    NET80211_IV_NSTATE_NUM]);
++}
++
++/* firmware says the link dropped: rescan, as after a beacon miss */
+ int
+ ieee80211_fmac_link_down(struct ieee80211com *ic, uint16_t reason)
+ {
+@@ -1401,12 +1521,19 @@ ieee80211_fmac_link_down(struct ieee80211com *ic, uint16_t reason)
+ 
+ 	(void)reason;
+ 	fmac_sig_stop(ic);
++	ieee80211_fmac_assoc_ies(ic, NULL, 0);
++	IEEE80211_LOCK(ic);
+ 	TAILQ_FOREACH(vap, &ic->ic_vaps, iv_next) {
+ 		if (vap->iv_opmode != IEEE80211_M_STA)
+ 			continue;
+-		(void)ieee80211_new_state(vap, IEEE80211_S_INIT, -1);
+ 		n++;
++		/* not one going down, or already headed for INIT */
++		if (ieee80211_vap_ifp_check_is_running(vap) &&
++		    fmac_last_state(vap) >= IEEE80211_S_AUTH)
++			(void)ieee80211_new_state_locked(vap,
++			    IEEE80211_S_SCAN, 0);
+ 	}
++	IEEE80211_UNLOCK(ic);
+ 	return (n != 0 ? 0 : ENOENT);
+ }
+ 
+@@ -1620,14 +1747,6 @@ fmac_scan_add(struct ieee80211com *ic, const struct ieee80211_fmac_bss *bb,
+ 
+ 	if (bb == NULL || bb->fb_ies == NULL || bb->fb_ielen == 0)
+ 		return;
+-	if (TAILQ_FIRST(&ic->ic_vaps) == NULL)
+-		return;
+-	if (ic->ic_scan == NULL || ic->ic_scan->ss_ops == NULL ||
+-	    ic->ic_scan->ss_ops->scan_add == NULL ||
+-	    (!anytime && (ic->ic_flags & IEEE80211_F_SCAN) == 0) ||
+-	    ic->ic_scan->ss_vap == NULL)
+-		return;
+-
+ 	is5g = bb->fb_chan_flags == 5 || bb->fb_chan_freq >= 4900;
+ 	rxchan = ieee80211_find_channel(ic, bb->fb_chan_freq,
+ 	    is5g ? IEEE80211_CHAN_A : IEEE80211_CHAN_G);
+@@ -1677,17 +1796,21 @@ fmac_scan_add(struct ieee80211com *ic, const struct ieee80211_fmac_bss *bb,
+ 	memcpy(wh.i_addr2, bb->fb_bssid, IEEE80211_ADDR_LEN);
+ 	memcpy(wh.i_addr3, bb->fb_bssid, IEEE80211_ADDR_LEN);
+ 
+-	(void)ic->ic_scan->ss_ops->scan_add(ic->ic_scan, rxchan, &sp, &wh,
+-	    IEEE80211_FC0_SUBTYPE_BEACON, rssi, nf);
++	/* vap detach frees the scan table under the com lock. */
++	IEEE80211_LOCK(ic);
++	if (TAILQ_FIRST(&ic->ic_vaps) != NULL && ic->ic_scan != NULL &&
++	    ic->ic_scan->ss_ops != NULL &&
++	    ic->ic_scan->ss_ops->scan_add != NULL &&
++	    (anytime || (ic->ic_flags & IEEE80211_F_SCAN) != 0) &&
++	    ic->ic_scan->ss_vap != NULL)
++		(void)ic->ic_scan->ss_ops->scan_add(ic->ic_scan, rxchan, &sp,
++		    &wh, IEEE80211_FC0_SUBTYPE_BEACON, rssi, nf);
++	IEEE80211_UNLOCK(ic);
+ }
+ 
+ /*
+  * The firmware's scan has delivered every result: end net80211's scan.
+- * ieee80211_scan_done alone only wakes the software scanner, which
+- * then walks its whole channel list (about 10 s) while an association
+- * request waits behind it, so cancel the scan too; a cancelled scan
+- * still sends the scan-done notification.  Call from a context that
+- * can sleep, without the com lock.
++ * Call from a context that can sleep, without the com lock.
+  */
+ void
+ ieee80211_fmac_scan_done(struct ieee80211com *ic)
+@@ -1697,6 +1820,8 @@ ieee80211_fmac_scan_done(struct ieee80211com *ic)
+ 
+ 	if (fs != NULL) {
+ 		fs->fs_scan_active = false;
++		taskqueue_cancel_timeout(taskqueue_thread,
++		    &fs->fs_scan_timeout, NULL);
+ 		fmac_release(fs);
+ 	}
+ 	vap = (ic->ic_scan != NULL && ic->ic_scan->ss_vap != NULL) ?
+@@ -1704,15 +1829,6 @@ ieee80211_fmac_scan_done(struct ieee80211com *ic)
+ 	if (vap == NULL)
+ 		return;
+ 	ieee80211_scan_done(vap);
+-	/*
+-	 * Only a station's scan is cancelled.  A cancelled scan skips the
+-	 * scan module's end, and for an access point that end is where
+-	 * net80211 creates the BSS on the configured channel, so a hostap
+-	 * vap whose scan was cancelled never reaches RUN.
+-	 */
+-	if ((ic->ic_flags & IEEE80211_F_SCAN) &&
+-	    vap->iv_opmode == IEEE80211_M_STA)
+-		ieee80211_cancel_scan(vap);
+ }
+ 
+ /*
+@@ -1948,6 +2064,8 @@ fmac_ap_snapshot(struct ieee80211vap *vap, struct ieee80211_fmac_ap *ap)
+ 	if (c != NULL && c != IEEE80211_CHAN_ANYC) {
+ 		ap->fp_chan_freq = c->ic_freq;
+ 		ap->fp_chan_ieee = c->ic_ieee;
++		ap->fp_chan_flags = c->ic_flags;
++		ap->fp_chan_center = c->ic_vht_ch_freq1;
+ 	}
+ 	ap->fp_chan_auto = vap->iv_des_chan == IEEE80211_CHAN_ANYC;
+ 	ap->fp_bintval = ni->ni_intval != 0 ? ni->ni_intval : ic->ic_bintval;
+@@ -2448,6 +2566,17 @@ ieee80211_fmac_mgmt_rx(struct ieee80211com *ic, const uint8_t *frame,
+ 	if (vap == NULL || len < sizeof(struct ieee80211_frame) ||
+ 	    len > IEEE80211_MGMT_TX_MAXLEN)
+ 		return;
++	/*
++	 * Drop a payload too big for one mbuf; rt_ieee80211msg()
++	 * does not check.
++	 */
++	if (sizeof(*ev) + len > MLEN) {
++		IEEE80211_DPRINTF(vap, IEEE80211_MSG_AUTH,
++		    "%s: %zu byte frame too long for a routing message\n",
++		    __func__, len);
++		vap->iv_stats.is_rx_mgtdiscard++;
++		return;
++	}
+ 	ev = malloc(sizeof(*ev) + len, M_TEMP, M_NOWAIT | M_ZERO);
+ 	if (ev == NULL)
+ 		return;
+@@ -2467,6 +2596,7 @@ ieee80211_fmac_assoc_reject(struct ieee80211com *ic,
+     const uint8_t bssid[IEEE80211_ADDR_LEN], uint16_t status)
+ {
+ 	struct ieee80211_assoc_reject_event ev;
++	struct ieee80211_join_event jev;
+ 	struct ieee80211vap *vap = fmac_sta_vap(ic);
+ 
+ 	if (vap == NULL)
+@@ -2474,12 +2604,75 @@ ieee80211_fmac_assoc_reject(struct ieee80211com *ic,
+ 	memset(&ev, 0, sizeof(ev));
+ 	IEEE80211_ADDR_COPY(ev.iev_bssid, bssid);
+ 	ev.iev_status = status;
++	memset(&jev, 0, sizeof(jev));
++	IEEE80211_ADDR_COPY(jev.iev_addr, bssid);
++	/* Leave AUTH first, as net80211 does on a refused join, so a retry joins again. */
++	IEEE80211_LOCK(ic);
++	if (ieee80211_vap_ifp_check_is_running(vap) &&
++	    (fmac_last_state(vap) == IEEE80211_S_AUTH ||
++	    fmac_last_state(vap) == IEEE80211_S_ASSOC))
++		(void)ieee80211_new_state_locked(vap, IEEE80211_S_SCAN,
++		    IEEE80211_SCAN_FAIL_STATUS);
++	IEEE80211_UNLOCK(ic);
+ 	CURVNET_SET(if_getvnet(vap->iv_ifp));
+ 	rt_ieee80211msg(vap->iv_ifp, RTM_IEEE80211_ASSOC_REJECT, &ev,
+ 	    sizeof(ev));
++	/* a supplicant without ASSOC_REJECT retries on disassoc */
++	rt_ieee80211msg(vap->iv_ifp, RTM_IEEE80211_DISASSOC, &jev,
++	    sizeof(jev));
+ 	CURVNET_RESTORE();
+ }
+ 
++void
++ieee80211_fmac_assoc_ies(struct ieee80211com *ic, const uint8_t *ies,
++    size_t len)
++{
++	struct fmac_state *fs;
++
++	fs = fmac_lookup(ic);
++	if (fs == NULL)
++		return;
++	if (len > sizeof(fs->fs_assoc_ie))
++		len = 0;
++	IEEE80211_LOCK(ic);
++	if (len != 0)
++		memcpy(fs->fs_assoc_ie, ies, len);
++	fs->fs_assoc_ielen = len;
++	IEEE80211_UNLOCK(ic);
++	fmac_release(fs);
++}
++
++/* IEEE80211_IOC_ASSOC_REQ_IE: ENOENT when the driver gave none */
++static int
++fmac_assoc_ie_ioctl(struct ieee80211vap *vap, struct ieee80211req *ireq)
++{
++	struct ieee80211com *ic = vap->iv_ic;
++	struct fmac_state *fs;
++	uint8_t *buf;
++	size_t len;
++	int error;
++
++	fs = fmac_lookup(ic);
++	if (fs == NULL)
++		return (ENXIO);
++	buf = malloc(sizeof(fs->fs_assoc_ie), M_TEMP, M_WAITOK);
++	IEEE80211_LOCK(ic);
++	len = fs->fs_assoc_ielen;
++	memcpy(buf, fs->fs_assoc_ie, len);
++	IEEE80211_UNLOCK(ic);
++	fmac_release(fs);
++	if (len == 0)
++		error = ENOENT;
++	else if (ireq->i_len < len)
++		error = ENOSPC;
++	else {
++		error = copyout(buf, ireq->i_data, len);
++		ireq->i_len = len;
++	}
++	free(buf, M_TEMP);
++	return (error);
++}
++
+ /*
+  * IEEE80211_IOC_PMKSA: change the PMKSA list and hand all of it to the
+  * driver.  A new entry for a BSSID already listed replaces it; when the
+@@ -2661,5 +2854,15 @@ fmac_vap_ioctl(if_t ifp, u_long cmd, caddr_t data)
+ 	if ((cmd == SIOCS80211 || cmd == SIOCG80211) &&
+ 	    ireq->i_type == IEEE80211_IOC_PMKSA)
+ 		return (fmac_pmksa_ioctl(vap, cmd, ireq));
++	if (cmd == SIOCG80211 && ireq->i_type == IEEE80211_IOC_ASSOC_REQ_IE)
++		return (fmac_assoc_ie_ioctl(vap, ireq));
++	/* A scan asked for by ioctl runs on the firmware, not from the cache. */
++	if (cmd == SIOCS80211 && ireq->i_type == IEEE80211_IOC_SCAN_REQ) {
++		struct ieee80211com *ic = vap->iv_ic;
++
++		IEEE80211_LOCK(ic);
++		ic->ic_lastscan = ticks - vap->iv_scanvalid - 1;
++		IEEE80211_UNLOCK(ic);
++	}
+ 	return (ieee80211_ioctl(ifp, cmd, data));
+ }
+diff --git a/sys/net80211/ieee80211_fullmac.h b/sys/net80211/ieee80211_fullmac.h
+index ea0525779358..0bde1a9be7f7 100644
+--- a/sys/net80211/ieee80211_fullmac.h
++++ b/sys/net80211/ieee80211_fullmac.h
+@@ -118,6 +118,8 @@ struct ieee80211_fmac_ap {
+ 	uint16_t	fp_chan_freq;	/* MHz */
+ 	uint8_t		fp_chan_ieee;	/* channel number */
+ 	bool		fp_chan_auto;	/* none was set: net80211 picked it */
++	uint32_t	fp_chan_flags;	/* IEEE80211_CHAN_*: HT40U/D, VHT80 */
++	uint8_t		fp_chan_center;	/* VHT80: centre channel number */
+ 	uint16_t	fp_bintval;	/* beacon interval, TU */
+ 	uint8_t		fp_dtim;	/* DTIM period, beacons */
+ 	bool		fp_privacy;	/* privacy bit (WEP or WPA) */
+@@ -353,5 +355,13 @@ void	ieee80211_fmac_mgmt_rx(struct ieee80211com *,
+ void	ieee80211_fmac_assoc_reject(struct ieee80211com *,
+ 	    const uint8_t bssid[IEEE80211_ADDR_LEN], uint16_t status);
+ 
++/*
++ * The elements of the association request the firmware sent, for
++ * IEEE80211_IOC_ASSOC_REQ_IE: wpa_supplicant builds 4-way message 2 from
++ * them.  Call before ieee80211_fmac_link_up; len 0 forgets them.
++ */
++void	ieee80211_fmac_assoc_ies(struct ieee80211com *,
++	    const uint8_t *ies, size_t len);
++
+ #endif /* _KERNEL */
+ #endif /* _NET80211_IEEE80211_FULLMAC_H_ */
+diff --git a/sys/net80211/ieee80211_ioctl.h b/sys/net80211/ieee80211_ioctl.h
+index e3458a487bef..5a34b246e5fe 100644
+--- a/sys/net80211/ieee80211_ioctl.h
++++ b/sys/net80211/ieee80211_ioctl.h
+@@ -759,6 +759,7 @@ struct ieee80211req {
+ #define	IEEE80211_IOC_EXTAUTH_STATUS	212	/* external auth outcome */
+ #define	IEEE80211_IOC_EXTAUTH_CAPS	213	/* IEEE80211_EXTAUTH_CAP_* */
+ #define	IEEE80211_IOC_PMKSA		214	/* PMKSA cache add/del/flush */
++#define	IEEE80211_IOC_ASSOC_REQ_IE	215	/* our association request's elements */
+ 
+ /*
+  * External authentication, for devices that run the join themselves
+@@ -791,6 +792,9 @@ struct ieee80211_pmksa_req {
+ #define	IEEE80211_PMKSA_DEL		1
+ #define	IEEE80211_PMKSA_FLUSH		2
+ 
++/* IEEE80211_IOC_ASSOC_REQ_IE: most element bytes a device reports. */
++#define	IEEE80211_FMAC_ASSOC_IE_MAX	512
++
+ /*
+  * Parameters for controlling a scan requested with
+  * IEEE80211_IOC_SCAN_REQ.
+-- 
+2.50.1 (Apple Git-155)
+

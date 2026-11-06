@@ -1,0 +1,553 @@
+From 13427877d0ebe35501ad078fb3227c4dd58f3626 Mon Sep 17 00:00:00 2001
+From: b1nc0d3x <b1nc0d3x@gmail.com>
+Date: Tue, 13 Oct 2026 18:10:12 -0400
+Subject: [PATCH 5/7] net80211: fullmac: keep vap hooks per vap and put them
+ back on detach
+
+The framework saved a vap's iv_newstate, iv_key_set, iv_key_delete and
+iv_reset in the per-com state, from the first vap only, and never put
+them back.  A station and an access point have different iv_newstate,
+so a hostap vap created after a station one ran sta_newstate.  And
+ieee80211_fmac_detach, which comes before ieee80211_ifdetach, freed
+the state while every vap still pointed at the shims: destroying the
+vaps then sent INIT through a shim that could no longer find its
+state, returned EINVAL, and tripped the INIT assertion in
+ieee80211_newstate_cb.
+
+The hooks are now saved per vap, on a list under fmac_mtx.  The shims
+fall back to them when the state is gone, and detach restores every
+vap's hooks, ic_vap_delete included, before it frees anything.
+
+A new ic_vap_delete wrapper marks the vap as going and drains the AP
+and age tasks before the driver deletes it.  Those tasks walked
+ic_vaps without a lock and could create a node on a vap that
+ieee80211_node_vdetach had already swept.  They now walk it under the
+com lock and pass over a vap being deleted.
+
+Detach drained the age callout before the AP task, which could start
+it again on freed state.  The AP task is drained first now, and a
+dying flag stops both from arming the callout.  If references do not
+drain, detach keeps waiting instead of leaking the state with the
+shims still installed, since the caller frees ic right after.
+
+The AP security check read iv_appie_wpa without the com lock, under
+which the ioctl path swaps and frees it, and a firmware report for the
+vap's own address was joined as a station.
+---
+ sys/net80211/ieee80211_fullmac.c | 304 ++++++++++++++++++++++++-------
+ 1 file changed, 241 insertions(+), 63 deletions(-)
+
+diff --git a/sys/net80211/ieee80211_fullmac.c b/sys/net80211/ieee80211_fullmac.c
+index 5461d5eb4f90..1d14d2793a2f 100644
+--- a/sys/net80211/ieee80211_fullmac.c
++++ b/sys/net80211/ieee80211_fullmac.c
+@@ -142,6 +142,26 @@ static const struct ieee80211_cipher fmac_bip_cipher = {
+ 	.ic_demic	= fmac_bip_demic,
+ };
+ 
++/*
++ * Each vap's own net80211 hooks, saved when the framework rewires
++ * them.  Kept per vap (a station and an access point have different
++ * iv_newstate) and on a global list under fmac_mtx, apart from
++ * fmac_state, so the shims can always reach the hooks they replaced,
++ * even while the framework detaches.
++ */
++struct fmac_vap {
++	LIST_ENTRY(fmac_vap)	fv_link;
++	struct ieee80211vap	*fv_vap;
++	int	(*fv_newstate)(struct ieee80211vap *, enum ieee80211_state,
++		    int);
++	int	(*fv_key_set)(struct ieee80211vap *,
++		    const struct ieee80211_key *);
++	int	(*fv_key_delete)(struct ieee80211vap *,
++		    const struct ieee80211_key *);
++	int	(*fv_reset)(struct ieee80211vap *, u_long);
++	bool	fv_ioctl;		/* if_ioctl replaced */
++};
++
+ /*
+  * Per-com framework state.  Tracked in a global list rather than a
+  * direct ic-slot pointer; see the file banner for why.
+@@ -155,22 +175,24 @@ struct fmac_state {
+ 	struct ieee80211com		   *fs_ic;	/* the net80211 device */
+ 	const struct ieee80211_fullmac_ops *fs_ops;	/* driver callbacks */
+ 
+-	int	(*fs_save_newstate)(struct ieee80211vap *,
+-		    enum ieee80211_state, int);
+ 	void	(*fs_save_scan_start)(struct ieee80211com *);
+ 	void	(*fs_save_scan_end)(struct ieee80211com *);
+-	int	(*fs_save_key_set)(struct ieee80211vap *,
+-		    const struct ieee80211_key *);
+-	int	(*fs_save_key_delete)(struct ieee80211vap *,
+-		    const struct ieee80211_key *);
+ 	int	(*fs_save_setregdomain)(struct ieee80211com *,
+ 		    struct ieee80211_regdomain *, int,
+ 		    struct ieee80211_channel []);
+-	int	(*fs_save_reset)(struct ieee80211vap *, u_long);
+ 	struct ieee80211vap *(*fs_save_vap_create)(struct ieee80211com *,
+ 		    const char [IFNAMSIZ], int, enum ieee80211_opmode, int,
+ 		    const uint8_t [IEEE80211_ADDR_LEN],
+ 		    const uint8_t [IEEE80211_ADDR_LEN]);
++	void	(*fs_save_vap_delete)(struct ieee80211vap *);
++
++	/*
++	 * fs_vap_going is a vap being deleted, and fs_dying is set while
++	 * the framework detaches.  The AP and age tasks pass over that
++	 * vap and stop re-arming the age callout.  Both under fs_ap_mtx.
++	 */
++	struct ieee80211vap		   *fs_vap_going;
++	bool				    fs_dying;
+ 
+ 	/*
+ 	 * Country change.  net80211 calls ic_setregdomain with the com
+@@ -283,6 +305,79 @@ struct fmac_state {
+ static struct mtx			fmac_mtx;
+ MTX_SYSINIT(fmac_mtx, &fmac_mtx, "80211_fmac", MTX_DEF);
+ 
++/* Every vap the framework has rewired, under fmac_mtx. */
++static LIST_HEAD(, fmac_vap)		fmac_vaps =
++    LIST_HEAD_INITIALIZER(fmac_vaps);
++
++static struct fmac_vap *
++fmac_vap_find_locked(struct ieee80211vap *vap)
++{
++	struct fmac_vap *fv;
++
++	mtx_assert(&fmac_mtx, MA_OWNED);
++	LIST_FOREACH(fv, &fmac_vaps, fv_link)
++		if (fv->fv_vap == vap)
++			return (fv);
++	return (NULL);
++}
++
++/* A copy of the vap's saved hooks; zero if the vap is not ours. */
++static void
++fmac_vap_hooks(struct ieee80211vap *vap, struct fmac_vap *out)
++{
++	struct fmac_vap *fv;
++
++	mtx_lock(&fmac_mtx);
++	fv = fmac_vap_find_locked(vap);
++	if (fv != NULL)
++		*out = *fv;
++	else
++		memset(out, 0, sizeof(*out));
++	mtx_unlock(&fmac_mtx);
++}
++
++/*
++ * Put back the hooks the framework replaced on every vap of ic and
++ * forget them.  Called from detach, before fmac_state is freed, so no
++ * vap is left calling a shim that can no longer find its state.
++ */
++static void
++fmac_vap_restore_all(struct ieee80211com *ic)
++{
++	struct fmac_vap *fv, *tmp;
++	struct ieee80211vap *vap;
++
++	mtx_lock(&fmac_mtx);
++	LIST_FOREACH_SAFE(fv, &fmac_vaps, fv_link, tmp) {
++		vap = fv->fv_vap;
++		if (vap->iv_ic != ic)
++			continue;
++		vap->iv_newstate = fv->fv_newstate;
++		vap->iv_key_set = fv->fv_key_set;
++		vap->iv_key_delete = fv->fv_key_delete;
++		vap->iv_reset = fv->fv_reset;
++		if (fv->fv_ioctl)
++			if_setioctlfn(vap->iv_ifp, ieee80211_ioctl);
++		LIST_REMOVE(fv, fv_link);
++		free(fv, M_80211_FMAC);
++	}
++	mtx_unlock(&fmac_mtx);
++}
++
++/* Forget a vap that has been deleted. */
++static void
++fmac_vap_forget(struct ieee80211vap *vap)
++{
++	struct fmac_vap *fv;
++
++	mtx_lock(&fmac_mtx);
++	fv = fmac_vap_find_locked(vap);
++	if (fv != NULL)
++		LIST_REMOVE(fv, fv_link);
++	mtx_unlock(&fmac_mtx);
++	free(fv, M_80211_FMAC);
++}
++
+ /* The state hangs off the device's ic_fmac. */
+ static struct fmac_state *
+ fmac_find_locked(struct ieee80211com *ic)
+@@ -351,6 +446,7 @@ static int	fmac_setregdomain(struct ieee80211com *,
+ 		    struct ieee80211_channel []);
+ static void	fmac_country_task(void *, int);
+ static int	fmac_reset(struct ieee80211vap *, u_long);
++static void fmac_vap_delete(struct ieee80211vap *);
+ static struct ieee80211vap *fmac_vap_create(struct ieee80211com *,
+ 		    const char [IFNAMSIZ], int, enum ieee80211_opmode, int,
+ 		    const uint8_t [IEEE80211_ADDR_LEN],
+@@ -438,6 +534,8 @@ ieee80211_fmac_attach(struct ieee80211com *ic,
+ 	/* Every vap the driver creates is set up here as well. */
+ 	fs->fs_save_vap_create = ic->ic_vap_create;
+ 	ic->ic_vap_create = fmac_vap_create;
++	fs->fs_save_vap_delete = ic->ic_vap_delete;
++	ic->ic_vap_delete = fmac_vap_delete;
+ 
+ 	/* Regulatory: country changes reach the firmware through the op. */
+ 	TASK_INIT(&fs->fs_country_task, 0, fmac_country_task, fs);
+@@ -515,45 +613,38 @@ ieee80211_fmac_detach(struct ieee80211com *ic)
+ 	}
+ 	fmac_unlink_locked(fs);
+ 	/*
+-	 * Bounded drain, capped at 30 s.  If refs don't reach zero by
+-	 * then a caller is stuck (a wedged firmware command, a livelocked
+-	 * thread) and blocking forever would hang the system, so leak fs
+-	 * instead of freeing it.  Print the ref count and saved ic slots
+-	 * to help diagnose the hang.
++	 * Wait for outstanding lookups to drop their references.  The
++	 * caller frees ic once this returns, so leaking fs and leaving
++	 * the shims in place would only move the crash; keep waiting and
++	 * say so every 30 s.
+ 	 */
+ 	{
+-		int wi;
++		int wi = 0;
+ 
+-		for (wi = 0; wi < 30; wi++) {
+-			if (fs->fs_refs == 0)
+-				break;
++		while (fs->fs_refs != 0) {
+ 			(void)mtx_sleep(fs, &fmac_mtx, 0, "fmacdet", hz);
+-		}
+-		if (fs->fs_refs != 0) {
+-			printf("ieee80211_fmac_detach: fs_refs=%u after 30s "
+-			    "wait, leaking fs=%p ic=%p to avoid hang "
+-			    "(save_newstate=%p scan_start=%p key_set=%p)\n",
+-			    fs->fs_refs, fs, ic, fs->fs_save_newstate,
+-			    fs->fs_save_scan_start, fs->fs_save_key_set);
+-			/*
+-			 * Link it back (it was unlinked above), then
+-			 * unlock and bail.  ic slots stay pointing at our
+-			 * shims — the caller must not free ic yet.
+-			 */
+-			fmac_link_locked(fs);
+-			mtx_unlock(&fmac_mtx);
+-			return;
++			if (++wi % 30 == 0)
++				printf("ieee80211_fmac_detach: still waiting "
++				    "for %u reference(s) on %p\n",
++				    fs->fs_refs, ic);
+ 		}
+ 	}
+ 	mtx_unlock(&fmac_mtx);
+ 
+ 	/*
+-	 * Restore saved ic slots.  Safe outside fmac_mtx because
+-	 * every reader that could have raced us just released its ref.
++	 * Restore saved ic slots and every vap's hooks.  Safe outside
++	 * fmac_mtx because every reader that could have raced us just
++	 * released its ref, and the vap shims fall back to the saved
++	 * hooks once fs is unlinked.
+ 	 */
++	mtx_lock(&fs->fs_ap_mtx);
++	fs->fs_dying = true;
++	mtx_unlock(&fs->fs_ap_mtx);
++	fmac_vap_restore_all(ic);
+ 	ic->ic_scan_start = fs->fs_save_scan_start;
+ 	ic->ic_scan_end   = fs->fs_save_scan_end;
+ 	ic->ic_vap_create = fs->fs_save_vap_create;
++	ic->ic_vap_delete = fs->fs_save_vap_delete;
+ 	if (fs->fs_ops->fmop_set_country != NULL)
+ 		ic->ic_setregdomain = fs->fs_save_setregdomain;
+ 	taskqueue_drain(taskqueue_thread, &fs->fs_country_task);
+@@ -567,10 +658,14 @@ ieee80211_fmac_detach(struct ieee80211com *ic)
+ 	}
+ 	if (fs->fs_save_raw_xmit != NULL)
+ 		ic->ic_raw_xmit = fs->fs_save_raw_xmit;
++	/*
++	 * The AP task can start the age callout, so drain it first;
++	 * fs_dying keeps both from re-arming the callout.
++	 */
++	taskqueue_drain(taskqueue_thread, &fs->fs_ap_task);
+ 	callout_drain(&fs->fs_age_callout);
+ 	taskqueue_drain(taskqueue_thread, &fs->fs_age_task);
+ 	callout_drain(&fs->fs_age_callout);
+-	taskqueue_drain(taskqueue_thread, &fs->fs_ap_task);
+ 	{
+ 		struct fmac_ap_evt *fe;
+ 
+@@ -610,6 +705,47 @@ ieee80211_fmac_detach(struct ieee80211com *ic)
+  *     no probe requests and no power-save frames of its own;
+  *   - net.wlan.N.fullmac_pmk exists when the driver can take a PMK.
+  */
++/*
++ * ic_vap_delete wrapper.  The AP and age tasks find the access point
++ * vap by walking ic_vaps on taskqueue_thread, which vap teardown does
++ * not drain.  Mark the vap as going so they pass it over, drain them,
++ * and only then let the driver delete it.  The saved hooks are
++ * dropped last, since the vap's trip to INIT still uses them.
++ */
++static void
++fmac_vap_delete(struct ieee80211vap *vap)
++{
++	struct ieee80211com *ic = vap->iv_ic;
++	struct fmac_state *fs = fmac_lookup(ic);
++	void (*del)(struct ieee80211vap *);
++
++	if (fs == NULL) {
++		/* Not reached: detach puts ic_vap_delete back first. */
++		fmac_vap_forget(vap);
++		return;
++	}
++	del = fs->fs_save_vap_delete;
++	mtx_lock(&fs->fs_ap_mtx);
++	fs->fs_vap_going = vap;
++	mtx_unlock(&fs->fs_ap_mtx);
++	taskqueue_drain(taskqueue_thread, &fs->fs_ap_task);
++	callout_drain(&fs->fs_age_callout);
++	taskqueue_drain(taskqueue_thread, &fs->fs_age_task);
++	callout_drain(&fs->fs_age_callout);
++	fmac_release(fs);
++
++	del(vap);
++	fmac_vap_forget(vap);
++
++	if ((fs = fmac_lookup(ic)) != NULL) {
++		mtx_lock(&fs->fs_ap_mtx);
++		if (fs->fs_vap_going == vap)
++			fs->fs_vap_going = NULL;
++		mtx_unlock(&fs->fs_ap_mtx);
++		fmac_release(fs);
++	}
++}
++
+ static struct ieee80211vap *
+ fmac_vap_create(struct ieee80211com *ic, const char name[IFNAMSIZ],
+     int unit, enum ieee80211_opmode opmode, int flags,
+@@ -618,6 +754,7 @@ fmac_vap_create(struct ieee80211com *ic, const char name[IFNAMSIZ],
+ {
+ 	struct fmac_state *fs = fmac_lookup(ic);
+ 	struct ieee80211vap *vap;
++	struct fmac_vap *fv;
+ 
+ 	if (fs == NULL)
+ 		return (NULL);
+@@ -628,14 +765,16 @@ fmac_vap_create(struct ieee80211com *ic, const char name[IFNAMSIZ],
+ 		return (NULL);
+ 	}
+ 
+-	if (fs->fs_save_newstate == NULL)
+-		fs->fs_save_newstate = vap->iv_newstate;
+-	if (fs->fs_save_key_set == NULL)
+-		fs->fs_save_key_set = vap->iv_key_set;
+-	if (fs->fs_save_key_delete == NULL)
+-		fs->fs_save_key_delete = vap->iv_key_delete;
+-	if (fs->fs_save_reset == NULL)
+-		fs->fs_save_reset = vap->iv_reset;
++	fv = malloc(sizeof(*fv), M_80211_FMAC, M_WAITOK | M_ZERO);
++	fv->fv_vap = vap;
++	fv->fv_newstate = vap->iv_newstate;
++	fv->fv_key_set = vap->iv_key_set;
++	fv->fv_key_delete = vap->iv_key_delete;
++	fv->fv_reset = vap->iv_reset;
++	fv->fv_ioctl = (opmode == IEEE80211_M_STA);
++	mtx_lock(&fmac_mtx);
++	LIST_INSERT_HEAD(&fmac_vaps, fv, fv_link);
++	mtx_unlock(&fmac_mtx);
+ 	vap->iv_newstate   = fmac_newstate;
+ 	vap->iv_key_set    = fmac_key_set;
+ 	vap->iv_key_delete = fmac_key_delete;
+@@ -734,12 +873,17 @@ static int
+ fmac_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
+ {
+ 	struct ieee80211com *ic = vap->iv_ic;
+-	struct fmac_state *fs = fmac_lookup(ic);
++	struct fmac_state *fs;
+ 	struct ieee80211_fmac_assoc fa;
++	struct fmac_vap hooks;
+ 	int rc;
+ 
+-	if (fs == NULL)
++	fmac_vap_hooks(vap, &hooks);
++	if (hooks.fv_newstate == NULL)
+ 		return (EINVAL);
++	fs = fmac_lookup(ic);
++	if (fs == NULL)		/* detaching: plain net80211 */
++		return (hooks.fv_newstate(vap, nstate, arg));
+ 
+ 	/*
+ 	 * The firmware has roamed and ieee80211_sta_join has put the new
+@@ -790,7 +934,7 @@ fmac_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
+ 		enum ieee80211_state ostate = vap->iv_state;
+ 		int want = FMAC_AP_NONE;
+ 
+-		rc = fs->fs_save_newstate(vap, nstate, arg);
++		rc = hooks.fv_newstate(vap, nstate, arg);
+ 		if (fs->fs_ops->fmop_start_ap != NULL) {
+ 			if (nstate == IEEE80211_S_RUN &&
+ 			    ostate != IEEE80211_S_RUN && rc == 0)
+@@ -845,7 +989,7 @@ fmac_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
+ 	default:
+ 		break;
+ 	}
+-	rc = fs->fs_save_newstate(vap, nstate, arg);
++	rc = hooks.fv_newstate(vap, nstate, arg);
+ 	fmac_release(fs);
+ 	return (rc);
+ }
+@@ -870,10 +1014,14 @@ fmac_key_set(struct ieee80211vap *vap, const struct ieee80211_key *key)
+ {
+ 	struct ieee80211com *ic = vap->iv_ic;
+ 	struct fmac_state *fs = fmac_lookup(ic);
++	struct fmac_vap hooks;
+ 	int rc;
+ 
+-	if (fs == NULL)
+-		return (0);
++	if (fs == NULL) {
++		fmac_vap_hooks(vap, &hooks);
++		return (hooks.fv_key_set != NULL ?
++		    hooks.fv_key_set(vap, key) : 0);
++	}
+ 	if (vap->iv_opmode == IEEE80211_M_HOSTAP &&
+ 	    (key->wk_flags & IEEE80211_KEY_GROUP) != 0)
+ 		fmac_ap_sec_check(fs, vap);
+@@ -891,14 +1039,17 @@ fmac_key_delete(struct ieee80211vap *vap, const struct ieee80211_key *key)
+ {
+ 	struct ieee80211com *ic = vap->iv_ic;
+ 	struct fmac_state *fs = fmac_lookup(ic);
++	struct fmac_vap hooks;
+ 	int ok = 1;
+ 
++	fmac_vap_hooks(vap, &hooks);
+ 	if (fs == NULL)
+-		return (0);
++		return (hooks.fv_key_delete != NULL ?
++		    hooks.fv_key_delete(vap, key) : 1);
+ 	if (fs->fs_ops->fmop_del_key != NULL)
+ 		ok = fs->fs_ops->fmop_del_key(ic, key) == 0;
+-	else if (fs->fs_save_key_delete != NULL)
+-		ok = fs->fs_save_key_delete(vap, key);
++	else if (hooks.fv_key_delete != NULL)
++		ok = hooks.fv_key_delete(vap, key);
+ 	fmac_release(fs);
+ 	return (ok);
+ }
+@@ -972,16 +1123,19 @@ fmac_reset(struct ieee80211vap *vap, u_long cmd)
+ {
+ 	struct ieee80211com *ic = vap->iv_ic;
+ 	struct fmac_state *fs = fmac_lookup(ic);
++	struct fmac_vap hooks;
+ 	int rc;
+ 
++	fmac_vap_hooks(vap, &hooks);
+ 	if (fs == NULL)
+-		return (ENETRESET);
++		return (hooks.fv_reset != NULL ? hooks.fv_reset(vap, cmd) :
++		    ENETRESET);
+ 	if (cmd == IEEE80211_IOC_POWERSAVE &&
+ 	    fs->fs_ops->fmop_set_powersave != NULL)
+ 		rc = fs->fs_ops->fmop_set_powersave(ic,
+ 		    (vap->iv_flags & IEEE80211_F_PMGTON) != 0);
+-	else if (fs->fs_save_reset != NULL)
+-		rc = fs->fs_save_reset(vap, cmd);
++	else if (hooks.fv_reset != NULL)
++		rc = hooks.fv_reset(vap, cmd);
+ 	else
+ 		rc = ENETRESET;
+ 	fmac_release(fs);
+@@ -1876,7 +2030,10 @@ fmac_ap_sec_check(struct fmac_state *fs, struct ieee80211vap *vap)
+ 	ap = malloc(sizeof(*ap), M_80211_FMAC, M_NOWAIT | M_ZERO);
+ 	if (ap == NULL)
+ 		return;
++	/* The ioctl path swaps and frees iv_appie_wpa under the com lock. */
++	IEEE80211_LOCK(vap->iv_ic);
+ 	fmac_ap_snapshot(vap, ap);
++	IEEE80211_UNLOCK(vap->iv_ic);
+ 	mtx_lock(&fs->fs_ap_mtx);
+ 	changed = fs->fs_ap_sec_valid && ap->fp_ielen != 0 &&
+ 	    (ap->fp_wpa != fs->fs_ap_sec_wpa ||
+@@ -1916,6 +2073,11 @@ fmac_ap_join(struct ieee80211vap *vap, const struct fmac_ap_evt *fe)
+ 	const uint8_t *p, *end, *rates = NULL, *xrates = NULL;
+ 
+ 	ni = ieee80211_find_vap_node(&ic->ic_sta, vap, fe->fe_mac);
++	if (ni == vap->iv_bss) {
++		/* A report for our own address; not a station. */
++		ieee80211_free_node(ni);
++		return;
++	}
+ 	if (ni == NULL) {
+ 		ni = ieee80211_dup_bss(vap, fe->fe_mac);
+ 		if (ni == NULL)
+@@ -1974,17 +2136,32 @@ fmac_ap_leave(struct ieee80211vap *vap, const struct fmac_ap_evt *fe)
+ 	ieee80211_free_node(ni);
+ }
+ 
+-/* The hostap vap stations belong to, if it is running. */
++/*
++ * The hostap vap stations belong to, if it is running.  A vap being
++ * deleted is passed over (fmac_vap_delete drains the tasks that call
++ * this before the vap goes), and so is everything once the framework
++ * detaches.
++ */
+ static struct ieee80211vap *
+-fmac_ap_vap(struct ieee80211com *ic)
++fmac_ap_vap(struct fmac_state *fs)
+ {
+-	struct ieee80211vap *vap;
++	struct ieee80211com *ic = fs->fs_ic;
++	struct ieee80211vap *vap, *going;
++	bool dying;
+ 
++	mtx_lock(&fs->fs_ap_mtx);
++	going = fs->fs_vap_going;
++	dying = fs->fs_dying;
++	mtx_unlock(&fs->fs_ap_mtx);
++	if (dying)
++		return (NULL);
++	IEEE80211_LOCK(ic);
+ 	TAILQ_FOREACH(vap, &ic->ic_vaps, iv_next)
+-		if (vap->iv_opmode == IEEE80211_M_HOSTAP &&
++		if (vap != going && vap->iv_opmode == IEEE80211_M_HOSTAP &&
+ 		    vap->iv_state == IEEE80211_S_RUN)
+-			return (vap);
+-	return (NULL);
++			break;
++	IEEE80211_UNLOCK(ic);
++	return (vap);
+ }
+ 
+ /*
+@@ -2015,7 +2192,8 @@ fmac_ap_task(void *arg, int pending __unused)
+ 			ic_printf(ic, "%s: access point \"%.*s\" did not "
+ 			    "start: error %d\n", fs->fs_ops->fmop_name,
+ 			    ap.fp_ssidlen, ap.fp_ssid, rc);
+-		else if (fs->fs_ops->fmop_sta_idle != NULL)
++		else if (fs->fs_ops->fmop_sta_idle != NULL &&
++		    fmac_ap_vap(fs) != NULL)
+ 			callout_reset(&fs->fs_age_callout,
+ 			    IEEE80211_INACT_WAIT * hz, fmac_age_callout, fs);
+ 		/*
+@@ -2053,7 +2231,7 @@ fmac_ap_task(void *arg, int pending __unused)
+ 			if (fs->fs_ops->fmop_sta_deauth != NULL)
+ 				(void)fs->fs_ops->fmop_sta_deauth(ic,
+ 				    fe->fe_mac, fe->fe_reason);
+-		} else if ((vap = fmac_ap_vap(ic)) != NULL) {
++		} else if ((vap = fmac_ap_vap(fs)) != NULL) {
+ 			if (fe->fe_type == FMAC_EVT_LEAVE)
+ 				fmac_ap_leave(vap, fe);
+ 			else
+@@ -2113,7 +2291,7 @@ fmac_age_task(void *arg, int pending __unused)
+ 	int i;
+ 
+ 	al = malloc(sizeof(*al), M_80211_FMAC, M_WAITOK | M_ZERO);
+-	al->al_vap = fmac_ap_vap(ic);
++	al->al_vap = fmac_ap_vap(fs);
+ 	if (al->al_vap == NULL)
+ 		goto out;
+ 	ieee80211_iterate_nodes(&ic->ic_sta, fmac_age_collect, al);
+-- 
+2.50.1 (Apple Git-155)
+

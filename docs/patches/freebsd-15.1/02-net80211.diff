@@ -1,0 +1,192 @@
+diff --git a/sys/net80211/ieee80211.c b/sys/net80211/ieee80211.c
+index 1299f86eb..8ad5bc2ab 100644
+--- a/sys/net80211/ieee80211.c
++++ b/sys/net80211/ieee80211.c
+@@ -2707,7 +2707,7 @@ ieee80211_is_key_global(const struct ieee80211vap *vap,
+     const struct ieee80211_key *key)
+ {
+ 	return (&vap->iv_nw_keys[0] <= key &&
+-	    key < &vap->iv_nw_keys[IEEE80211_WEP_NKID]);
++	    key < &vap->iv_nw_keys[IEEE80211_MAX_NKID]);
+ }
+ 
+ /**
+diff --git a/sys/net80211/ieee80211.h b/sys/net80211/ieee80211.h
+index cfe545b24..c12e93baf 100644
+--- a/sys/net80211/ieee80211.h
++++ b/sys/net80211/ieee80211.h
+@@ -2049,6 +2049,13 @@ enum {
+ 					 IEEE80211_WEP_KIDLEN + \
+ 					 IEEE80211_WEP_CRCLEN)
+ #define	IEEE80211_WEP_NKID		4	/* number of key ids */
++#define	IEEE80211_IGTK_NKID		2	/* MFP IGTK key ids (4,5) */
++#define	IEEE80211_IGTK_KID_BASE		IEEE80211_WEP_NKID
++#define	IEEE80211_MAX_NKID		(IEEE80211_WEP_NKID +		\
++					 IEEE80211_IGTK_NKID)
++#define	IEEE80211_KEY_IS_IGTK(kid)					\
++	((kid) >= IEEE80211_IGTK_KID_BASE &&				\
++	 (kid) < IEEE80211_IGTK_KID_BASE + IEEE80211_IGTK_NKID)
+ 
+ /*
+  * 802.11i defines an extended IV for use with non-WEP ciphers.
+diff --git a/sys/net80211/ieee80211_crypto.c b/sys/net80211/ieee80211_crypto.c
+index 566f0b2e0..894b0f1a3 100644
+--- a/sys/net80211/ieee80211_crypto.c
++++ b/sys/net80211/ieee80211_crypto.c
+@@ -229,9 +229,9 @@ ieee80211_crypto_vattach(struct ieee80211vap *vap)
+ 	int i;
+ 
+ 	/* NB: we assume everything is pre-zero'd */
+-	vap->iv_max_keyix = IEEE80211_WEP_NKID;
++	vap->iv_max_keyix = IEEE80211_MAX_NKID;
+ 	vap->iv_def_txkey = IEEE80211_KEYIX_NONE;
+-	for (i = 0; i < IEEE80211_WEP_NKID; i++)
++	for (i = 0; i < IEEE80211_MAX_NKID; i++)
+ 		ieee80211_crypto_resetkey(vap, &vap->iv_nw_keys[i],
+ 			IEEE80211_KEYIX_NONE);
+ 	/*
+@@ -562,7 +562,7 @@ ieee80211_crypto_delglobalkeys(struct ieee80211vap *vap)
+ 	int i;
+ 
+ 	ieee80211_key_update_begin(vap);
+-	for (i = 0; i < IEEE80211_WEP_NKID; i++)
++	for (i = 0; i < IEEE80211_MAX_NKID; i++)
+ 		(void) _ieee80211_crypto_delkey(vap, &vap->iv_nw_keys[i]);
+ 	ieee80211_key_update_end(vap);
+ }
+@@ -958,7 +958,7 @@ ieee80211_crypto_reload_keys(struct ieee80211com *ic)
+ 	TAILQ_FOREACH(vap, &ic->ic_vaps, iv_next) {
+ 		if (vap->iv_state != IEEE80211_S_RUN)
+ 			continue;
+-		for (i = 0; i < IEEE80211_WEP_NKID; i++) {
++		for (i = 0; i < IEEE80211_MAX_NKID; i++) {
+ 			const struct ieee80211_key *k = &vap->iv_nw_keys[i];
+ 			if (k->wk_flags & IEEE80211_KEY_DEVKEY)
+ 				dev_key_set(vap, k);
+diff --git a/sys/net80211/ieee80211_ddb.c b/sys/net80211/ieee80211_ddb.c
+index 1dd8e38b9..d0cff4780 100644
+--- a/sys/net80211/ieee80211_ddb.c
++++ b/sys/net80211/ieee80211_ddb.c
+@@ -606,7 +606,7 @@ _db_show_vap(const struct ieee80211vap *vap, int showmesh, int showprocs)
+ 	db_printf("\tmax_keyix %u", vap->iv_max_keyix);
+ 	db_printf(" def_txkey %d", vap->iv_def_txkey);
+ 	db_printf("\n");
+-	for (i = 0; i < IEEE80211_WEP_NKID; i++)
++	for (i = 0; i < IEEE80211_MAX_NKID; i++)
+ 		_db_show_key("\tnw_keys[%u]", i, &vap->iv_nw_keys[i]);
+ 
+ 	db_printf("\tauth %p(%s)", vap->iv_auth, vap->iv_auth->ia_name);
+diff --git a/sys/net80211/ieee80211_ioctl.c b/sys/net80211/ieee80211_ioctl.c
+index 4c3e5fa94..97bd0164f 100644
+--- a/sys/net80211/ieee80211_ioctl.c
++++ b/sys/net80211/ieee80211_ioctl.c
+@@ -93,7 +93,7 @@ ieee80211_ioctl_getkey(u_long cmd, struct ieee80211vap *vap,
+ 			return ENOENT;
+ 		wk = &ni->ni_ucastkey;
+ 	} else {
+-		if (kid >= IEEE80211_WEP_NKID)
++		if (kid >= IEEE80211_MAX_NKID)
+ 			return EINVAL;
+ 		wk = &vap->iv_nw_keys[kid];
+ 		IEEE80211_ADDR_COPY(&ik.ik_macaddr, vap->iv_bss->ni_macaddr);
+@@ -1203,7 +1203,7 @@ ieee80211_ioctl_setkey(struct ieee80211vap *vap, struct ieee80211req *ireq)
+ 		}
+ 		wk = &ni->ni_ucastkey;
+ 	} else {
+-		if (kid >= IEEE80211_WEP_NKID)
++		if (kid >= IEEE80211_MAX_NKID)
+ 			return EINVAL;
+ 		wk = &vap->iv_nw_keys[kid];
+ 		/*
+@@ -1280,7 +1280,7 @@ ieee80211_ioctl_delkey(struct ieee80211vap *vap, struct ieee80211req *ireq)
+ 		ieee80211_node_delucastkey(ni);
+ 		ieee80211_free_node(ni);
+ 	} else {
+-		if (kid >= IEEE80211_WEP_NKID)
++		if (kid >= IEEE80211_MAX_NKID)
+ 			return EINVAL;
+ 		/* XXX error return */
+ 		ieee80211_crypto_delkey(vap, &vap->iv_nw_keys[kid]);
+diff --git a/sys/net80211/ieee80211_output.c b/sys/net80211/ieee80211_output.c
+index 116fc76a9..96b6768a1 100644
+--- a/sys/net80211/ieee80211_output.c
++++ b/sys/net80211/ieee80211_output.c
+@@ -2168,6 +2168,40 @@ ieee80211_add_cfparms(uint8_t *frm, struct ieee80211com *ic)
+ #undef ADDSHORT
+ }
+ 
++/*
++ * Append a minimal Extended Capabilities IE (tag 127) to mgmt frames.
++ * Without this, modern HE/HT APs (especially Asus families running
++ * full HE/MU-EDCA mode) treat the STA as "legacy" and queue EAPOL
++ * traffic into a slot that's only flushed irregularly -- visible as
++ * intermittent rejection of MAC-ACKed M2 frames.
++ *
++ * Bits set:
++ *   - 19  BSS Transition Management   (byte 2 bit 3 = 0x08)
++ *   - 31  Interworking                (byte 3 bit 7 = 0x80)
++ *   - 63  Operating Mode Notification (byte 7 bit 7 = 0x80)
++ *
++ * Length 10 bytes matches what mainline Linux mac80211 emits for an
++ * HT-only STA against an HE BSS; APs accept 10-byte ext-cap bodies as
++ * standard per 802.11-2020.
++ */
++static uint8_t *
++ieee80211_add_extcap(uint8_t *frm, struct ieee80211vap *vap __unused)
++{
++	*frm++ = IEEE80211_ELEMID_EXTCAP;
++	*frm++ = 10;
++	*frm++ = 0x00;
++	*frm++ = 0x00;
++	*frm++ = 0x08;	/* BSS Transition Management */
++	*frm++ = 0x80;	/* Interworking */
++	*frm++ = 0x00;
++	*frm++ = 0x00;
++	*frm++ = 0x00;
++	*frm++ = 0x80;	/* Operating Mode Notification */
++	*frm++ = 0x00;
++	*frm++ = 0x00;
++	return (frm);
++}
++
+ static __inline uint8_t *
+ add_appie(uint8_t *frm, const struct ieee80211_appie *ie)
+ {
+@@ -2835,6 +2869,7 @@ ieee80211_send_mgmt(struct ieee80211_node *ni, int type, int arg)
+ #ifdef IEEE80211_SUPPORT_SUPERG
+ 		       + sizeof(struct ieee80211_ath_ie)
+ #endif
++		       + 2 + 10	/* Extended Capabilities IE */
+ 		       + (vap->iv_appie_wpa != NULL ?
+ 				vap->iv_appie_wpa->ie_len : 0)
+ 		       + (vap->iv_appie_assocreq != NULL ?
+@@ -2903,6 +2938,16 @@ ieee80211_send_mgmt(struct ieee80211_node *ni, int type, int arg)
+ 			frm = ieee80211_add_vhtcap(frm, ni);
+ 		}
+ 
++		/*
++		 * Extended Capabilities IE -- modern HT/HE APs gate
++		 * EAPOL state-machine behavior on a STA advertising at
++		 * least Operating Mode Notification + Interworking +
++		 * BSS Transition Management.  Always send; the cost is
++		 * 12 bytes and the benefit is consistent treatment as a
++		 * post-2008 STA rather than legacy.
++		 */
++		frm = ieee80211_add_extcap(frm, vap);
++
+ 		frm = ieee80211_add_wpa(frm, vap);
+ 		if ((vap->iv_flags & IEEE80211_F_WME) &&
+ 		    ni->ni_ies.wme_ie != NULL)
+diff --git a/sys/net80211/ieee80211_var.h b/sys/net80211/ieee80211_var.h
+index 7b45261f5..69b44eaa7 100644
+--- a/sys/net80211/ieee80211_var.h
++++ b/sys/net80211/ieee80211_var.h
+@@ -511,7 +511,7 @@ struct ieee80211vap {
+ 	/* Key management */
+ 	uint16_t		iv_max_keyix;	/* max h/w key index */
+ 	ieee80211_keyix		iv_def_txkey;	/* default/group tx key index */
+-	struct ieee80211_key	iv_nw_keys[IEEE80211_WEP_NKID];
++	struct ieee80211_key	iv_nw_keys[IEEE80211_MAX_NKID];
+ 	int			(*iv_key_alloc)(struct ieee80211vap *,
+ 				    struct ieee80211_key *,
+ 				    ieee80211_keyix *, ieee80211_keyix *);

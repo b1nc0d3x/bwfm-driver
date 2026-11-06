@@ -1,0 +1,151 @@
+From 3b38d38f197c896ce02bca6395f90a26e5a9290b Mon Sep 17 00:00:00 2001
+From: b1nc0d3x <b1nc0d3x@gmail.com>
+Date: Mon, 12 Oct 2026 21:46:49 -0400
+Subject: [PATCH 1/7] net80211: make room for the 802.11w IGTK in the group key
+ table
+
+802.11w protects broadcast management frames with an integrity group
+temporal key (IGTK), and the standard gives it key ids 4 and 5, right
+after the four WEP/GTK ids.  The vap's group key table only holds four
+entries, so when wpa_supplicant or hostapd installs the IGTK through
+IEEE80211_IOC_WPAKEY the ioctl rejects key id 4 with EINVAL, and a
+driver that could offload BIP never gets the key.
+
+Grow iv_nw_keys to IEEE80211_MAX_NKID (six) and use that bound wherever
+the table is walked or indexed: the key ioctls, global key reset and
+reload, ieee80211_is_key_global() and the ddb printer.  The WEP-specific
+ioctls (IEEE80211_IOC_WEPKEY, NUMWEPKEYS, WEPTXKEY) keep their limit of
+four, and drivers that walk only the first four entries are unaffected,
+since nothing installs keys 4 or 5 unless userland asks for 802.11w.
+
+This changes the size of struct ieee80211vap.
+---
+ sys/net80211/ieee80211.c        | 2 +-
+ sys/net80211/ieee80211.h        | 3 +++
+ sys/net80211/ieee80211_crypto.c | 8 ++++----
+ sys/net80211/ieee80211_ddb.c    | 2 +-
+ sys/net80211/ieee80211_ioctl.c  | 6 +++---
+ sys/net80211/ieee80211_var.h    | 2 +-
+ 6 files changed, 13 insertions(+), 10 deletions(-)
+
+diff --git a/sys/net80211/ieee80211.c b/sys/net80211/ieee80211.c
+index 1299f86ebdc7..8ad5bc2abeda 100644
+--- a/sys/net80211/ieee80211.c
++++ b/sys/net80211/ieee80211.c
+@@ -2707,7 +2707,7 @@ ieee80211_is_key_global(const struct ieee80211vap *vap,
+     const struct ieee80211_key *key)
+ {
+ 	return (&vap->iv_nw_keys[0] <= key &&
+-	    key < &vap->iv_nw_keys[IEEE80211_WEP_NKID]);
++	    key < &vap->iv_nw_keys[IEEE80211_MAX_NKID]);
+ }
+ 
+ /**
+diff --git a/sys/net80211/ieee80211.h b/sys/net80211/ieee80211.h
+index cfe545b24c26..363b1fb10af8 100644
+--- a/sys/net80211/ieee80211.h
++++ b/sys/net80211/ieee80211.h
+@@ -2049,6 +2049,9 @@ enum {
+ 					 IEEE80211_WEP_KIDLEN + \
+ 					 IEEE80211_WEP_CRCLEN)
+ #define	IEEE80211_WEP_NKID		4	/* number of key ids */
++#define	IEEE80211_IGTK_NKID		2	/* 802.11w IGTK key ids (4, 5) */
++#define	IEEE80211_MAX_NKID		(IEEE80211_WEP_NKID +		\
++					 IEEE80211_IGTK_NKID)	/* group key ids */
+ 
+ /*
+  * 802.11i defines an extended IV for use with non-WEP ciphers.
+diff --git a/sys/net80211/ieee80211_crypto.c b/sys/net80211/ieee80211_crypto.c
+index 2d85d3d5ecad..d78179df3fc8 100644
+--- a/sys/net80211/ieee80211_crypto.c
++++ b/sys/net80211/ieee80211_crypto.c
+@@ -229,9 +229,9 @@ ieee80211_crypto_vattach(struct ieee80211vap *vap)
+ 	int i;
+ 
+ 	/* NB: we assume everything is pre-zero'd */
+-	vap->iv_max_keyix = IEEE80211_WEP_NKID;
++	vap->iv_max_keyix = IEEE80211_MAX_NKID;
+ 	vap->iv_def_txkey = IEEE80211_KEYIX_NONE;
+-	for (i = 0; i < IEEE80211_WEP_NKID; i++)
++	for (i = 0; i < IEEE80211_MAX_NKID; i++)
+ 		ieee80211_crypto_resetkey(vap, &vap->iv_nw_keys[i],
+ 			IEEE80211_KEYIX_NONE);
+ 	/*
+@@ -562,7 +562,7 @@ ieee80211_crypto_delglobalkeys(struct ieee80211vap *vap)
+ 	int i;
+ 
+ 	ieee80211_key_update_begin(vap);
+-	for (i = 0; i < IEEE80211_WEP_NKID; i++)
++	for (i = 0; i < IEEE80211_MAX_NKID; i++)
+ 		(void) _ieee80211_crypto_delkey(vap, &vap->iv_nw_keys[i]);
+ 	ieee80211_key_update_end(vap);
+ }
+@@ -976,7 +976,7 @@ ieee80211_crypto_reload_keys(struct ieee80211com *ic)
+ 	TAILQ_FOREACH(vap, &ic->ic_vaps, iv_next) {
+ 		if (vap->iv_state != IEEE80211_S_RUN)
+ 			continue;
+-		for (i = 0; i < IEEE80211_WEP_NKID; i++) {
++		for (i = 0; i < IEEE80211_MAX_NKID; i++) {
+ 			const struct ieee80211_key *k = &vap->iv_nw_keys[i];
+ 			if (k->wk_flags & IEEE80211_KEY_DEVKEY)
+ 				dev_key_set(vap, k);
+diff --git a/sys/net80211/ieee80211_ddb.c b/sys/net80211/ieee80211_ddb.c
+index 1dd8e38b9896..d0cff47806e6 100644
+--- a/sys/net80211/ieee80211_ddb.c
++++ b/sys/net80211/ieee80211_ddb.c
+@@ -606,7 +606,7 @@ _db_show_vap(const struct ieee80211vap *vap, int showmesh, int showprocs)
+ 	db_printf("\tmax_keyix %u", vap->iv_max_keyix);
+ 	db_printf(" def_txkey %d", vap->iv_def_txkey);
+ 	db_printf("\n");
+-	for (i = 0; i < IEEE80211_WEP_NKID; i++)
++	for (i = 0; i < IEEE80211_MAX_NKID; i++)
+ 		_db_show_key("\tnw_keys[%u]", i, &vap->iv_nw_keys[i]);
+ 
+ 	db_printf("\tauth %p(%s)", vap->iv_auth, vap->iv_auth->ia_name);
+diff --git a/sys/net80211/ieee80211_ioctl.c b/sys/net80211/ieee80211_ioctl.c
+index fc297e8bf668..471a338fb6b5 100644
+--- a/sys/net80211/ieee80211_ioctl.c
++++ b/sys/net80211/ieee80211_ioctl.c
+@@ -93,7 +93,7 @@ ieee80211_ioctl_getkey(u_long cmd, struct ieee80211vap *vap,
+ 			return ENOENT;
+ 		wk = &ni->ni_ucastkey;
+ 	} else {
+-		if (kid >= IEEE80211_WEP_NKID)
++		if (kid >= IEEE80211_MAX_NKID)
+ 			return EINVAL;
+ 		wk = &vap->iv_nw_keys[kid];
+ 		IEEE80211_ADDR_COPY(&ik.ik_macaddr, vap->iv_bss->ni_macaddr);
+@@ -1247,7 +1247,7 @@ ieee80211_ioctl_setkey(struct ieee80211vap *vap, struct ieee80211req *ireq)
+ 		}
+ 		wk = &ni->ni_ucastkey;
+ 	} else {
+-		if (kid >= IEEE80211_WEP_NKID)
++		if (kid >= IEEE80211_MAX_NKID)
+ 			return EINVAL;
+ 		wk = &vap->iv_nw_keys[kid];
+ 		/*
+@@ -1382,7 +1382,7 @@ ieee80211_ioctl_delkey(struct ieee80211vap *vap, struct ieee80211req *ireq)
+ 		ieee80211_node_delucastkey(ni);
+ 		ieee80211_free_node(ni);
+ 	} else {
+-		if (kid >= IEEE80211_WEP_NKID)
++		if (kid >= IEEE80211_MAX_NKID)
+ 			return EINVAL;
+ 		/* XXX error return */
+ 		ieee80211_crypto_delkey(vap, &vap->iv_nw_keys[kid]);
+diff --git a/sys/net80211/ieee80211_var.h b/sys/net80211/ieee80211_var.h
+index f38489174986..28cedc9f47c6 100644
+--- a/sys/net80211/ieee80211_var.h
++++ b/sys/net80211/ieee80211_var.h
+@@ -534,7 +534,7 @@ struct ieee80211vap {
+ 	/* Key management */
+ 	uint16_t		iv_max_keyix;	/* max h/w key index */
+ 	ieee80211_keyix		iv_def_txkey;	/* default/group tx key index */
+-	struct ieee80211_key	iv_nw_keys[IEEE80211_WEP_NKID];
++	struct ieee80211_key	iv_nw_keys[IEEE80211_MAX_NKID];
+ 	int			(*iv_key_alloc)(struct ieee80211vap *,
+ 				    struct ieee80211_key *,
+ 				    ieee80211_keyix *, ieee80211_keyix *);
+-- 
+2.50.1 (Apple Git-155)
+

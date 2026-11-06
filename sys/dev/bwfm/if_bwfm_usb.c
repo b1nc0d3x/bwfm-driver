@@ -5,6 +5,8 @@
  *
  * Broadcom FullMAC USB transport glue for bwfm.
  *
+ * Needs no kernel patches; COMPATIBILITY.md lists what each bus needs.
+ *
  * Lifecycle (BCM43236 example):
  *   1. uhub matches us via STRUCT_USB_HOST_ID; probe accepts iface 0.
  *   2. attach() discovers bulk-IN / bulk-OUT endpoints, sets up the

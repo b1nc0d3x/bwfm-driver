@@ -32,7 +32,7 @@ the driver, so the driver only implements a table of operations.
 |------|------------------------|----------------------------|
 | PCIe | BCM43602 (`14e4:43ba`) | MacBook Pro, amd64         |
 | SDIO | BCM43455               | Raspberry Pi 4, arm64      |
-| USB  | BCM43236 rev B         | USB dongle on a Pi 4       |
+| USB  | BCM43236 rev B         | USB dongle on a MacBook Pro (amd64) and a Pi 4 |
 
 Other chips are recognised by the driver's tables (PCIe BCM4350,
 4364, 4365, 4366; SDIO BCM43430, 43456 and others; USB BCM43143, 43242,
@@ -44,14 +44,11 @@ can be shipped.
 
 - FreeBSD 15.0 or later with kernel sources in `/usr/src`.  `bwfm_usb` and
   `bwfm_pci` build against the stock sources (tested on 15.0 and 15.1).
-  `bwfm_sdio` also needs the kernel's SDIO function layer
-  (`sys/dev/mmc/sdio_func.[ch]` and the matching `mmc.c` changes), which
-  stock FreeBSD does not have yet; it is on the `rkdev` branch of
-  [FBSD_DEV](https://github.com/b1nc0d3x/FBSD_DEV). It now also needs SDIO
-  card interrupt support in that layer (`sdio_enable_intr`,
-  `sdio_intr_rearm` and the `mmcbr_sdio_intr` bridge method, implemented
-  for the Raspberry Pi's `bcm2835_sdhci`), which is not published yet;
-  without it the module does not load.
+  `bwfm_sdio` also needs a kernel patch, because stock FreeBSD has no
+  SDIO layer for WiFi chips:
+  `docs/patches/freebsd-15.1/01-mmc-sdio-function-driver.diff`.
+  [COMPATIBILITY.md](COMPATIBILITY.md) lists what each bus needs and
+  which patches go with 802.11w and WPA3.
 - The net80211 cipher modules. The firmware does the encryption, but
   net80211 still needs `wlan_ccmp` (and `wlan_tkip` for TKIP group keys)
   loaded before keys can be installed, so load them first.

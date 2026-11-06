@@ -2,6 +2,8 @@
 
 KMOD=	bwfm_pci
 
+# Needs no kernel patches.  See COMPATIBILITY.md.
+
 .if ${MACHINE_ARCH} == "aarch64"
 # arm64 builds probe-only, without net80211: wlan.ko symbols did
 # not resolve there.  bwfm_stub_arm64.c stands in for bwfm.c and

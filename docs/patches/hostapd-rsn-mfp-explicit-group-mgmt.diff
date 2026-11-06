@@ -1,0 +1,30 @@
+hostapd: always write the PMKID Count and Group Management Cipher Suite
+when MFP is on, even for the default BIP-CMAC-128.
+
+The bwfm 43602 firmware builds its own beacon RSN element and ends it
+with "00 00 00 0f ac 06".  hostapd leaves those six bytes out of 4-way
+message 3, so stations, which compare the two byte for byte, disconnect
+with reason 17.  Both forms are valid; this makes hostapd's match.
+
+Apply in /usr/src (FreeBSD 15.1 contrib/wpa, hostapd 2.11) and rebuild
+usr.sbin/wpa/hostapd.
+
+--- a/contrib/wpa/src/ap/wpa_auth_ie.c	2026-10-09 21:37:23
++++ b/contrib/wpa/src/ap/wpa_auth_ie.c	2026-10-09 21:37:23
+@@ -344,8 +344,14 @@
+ 		pos += PMKID_LEN;
+ 	}
+ 
+-	if (conf->ieee80211w != NO_MGMT_FRAME_PROTECTION &&
+-	    conf->group_mgmt_cipher != WPA_CIPHER_AES_128_CMAC) {
++	/*
++	 * With MFP, always write the PMKID Count and the Group Management
++	 * Cipher Suite, even for the default BIP-CMAC-128.  FullMAC
++	 * firmware that builds its own beacon RSN element (Broadcom 43602)
++	 * writes them, and the element in 4-way message 3 has to match the
++	 * beacon byte for byte or stations disconnect with reason 17.
++	 */
++	if (conf->ieee80211w != NO_MGMT_FRAME_PROTECTION) {
+ 		if (2 + 4 > buf + len - pos)
+ 			return -1;
+ 		if (pmkid == NULL) {

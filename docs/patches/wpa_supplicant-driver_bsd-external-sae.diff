@@ -1,0 +1,340 @@
+diff --git a/src/drivers/driver_bsd.c b/src/drivers/driver_bsd.c
+index 3c1ff1b..d4b9879 100644
+--- a/src/drivers/driver_bsd.c
++++ b/src/drivers/driver_bsd.c
+@@ -49,6 +49,82 @@
+ 
+ #include "l2_packet/l2_packet.h"
+ 
++/*
++ * External SAE: firmware that runs its own join but leaves SAE to the
++ * host asks for it with RTM_IEEE80211_EXTAUTH, passes the access point's
++ * Authentication frames up with RTM_IEEE80211_MGMT_RX, and takes ours
++ * and the outcome through IEEE80211_IOC_MGMT_TX and
++ * IEEE80211_IOC_EXTAUTH_STATUS.  Kernels without it have none of these.
++ */
++#ifndef RTM_IEEE80211_EXTAUTH
++#define	RTM_IEEE80211_EXTAUTH		117	/* start/abort external auth */
++#define	RTM_IEEE80211_MGMT_RX		118	/* management frame for us */
++
++#define	IEEE80211_IOC_MGMT_TX		211	/* send a management frame */
++#define	IEEE80211_IOC_EXTAUTH_STATUS	212	/* external auth outcome */
++#define	IEEE80211_IOC_EXTAUTH_CAPS	213	/* get: IEEE80211_EXTAUTH_CAP_* */
++
++#define	IEEE80211_EXTAUTH_CAP_SAE	0x0001	/* external SAE (station) */
++
++#define	IEEE80211_EXTAUTH_START		0
++#define	IEEE80211_EXTAUTH_ABORT		1
++
++struct ieee80211_extauth_event {
++	uint8_t		iev_bssid[6];
++	uint8_t		iev_action;		/* IEEE80211_EXTAUTH_* */
++	uint8_t		iev_ssid_len;
++	uint8_t		iev_ssid[32];
++	uint32_t	iev_key_mgmt;		/* AKM suite, e.g. 0x000fac08 */
++};
++
++struct ieee80211_mgmt_rx_event {
++	uint16_t	iev_len;		/* frame length, header included */
++	uint16_t	iev_freq;		/* MHz, 0 if unknown */
++	int8_t		iev_rssi;		/* dBm, 0 if unknown */
++	uint8_t		iev_pad[3];
++};
++
++struct ieee80211_extauth_status {
++	uint8_t		is_bssid[6];
++	uint8_t		is_ssid_len;
++	uint8_t		is_ssid[32];
++	uint8_t		is_pad;
++};
++#endif /* RTM_IEEE80211_EXTAUTH */
++
++/*
++ * The elements of the association request the firmware really sent:
++ * 4-way message 2/4 must carry the same RSNE and RSNXE.
++ */
++#ifndef IEEE80211_IOC_ASSOC_REQ_IE
++#define	IEEE80211_IOC_ASSOC_REQ_IE	215	/* get: our association request's elements */
++#endif
++
++/*
++ * PMKSA caching for such firmware: the PMKIDs we hold go down through
++ * IEEE80211_IOC_PMKSA, and a join the firmware gave up on comes back as
++ * RTM_IEEE80211_ASSOC_REJECT so a stale PMKSA can be dropped.
++ */
++#ifndef RTM_IEEE80211_ASSOC_REJECT
++#define	RTM_IEEE80211_ASSOC_REJECT	119	/* the join was refused */
++
++#define	IEEE80211_IOC_PMKSA		214	/* set: PMKSA cache entry */
++
++#define	IEEE80211_PMKSA_ADD		0
++#define	IEEE80211_PMKSA_DEL		1
++#define	IEEE80211_PMKSA_FLUSH		2
++
++struct ieee80211_pmksa_req {
++	uint8_t		ip_bssid[6];
++	uint8_t		ip_pmkid[16];
++};
++
++struct ieee80211_assoc_reject_event {
++	uint8_t		iev_bssid[6];
++	uint16_t	iev_status;		/* 802.11 status code */
++};
++#endif /* RTM_IEEE80211_ASSOC_REJECT */
++
+ struct bsd_driver_global {
+ 	void		*ctx;
+ 	int		sock;			/* socket for 802.11 ioctls */
+@@ -783,6 +859,32 @@ bsd_route_overflow(int sock, void *ctx, struct bsd_driver_global *global)
+ }
+ #endif /* SO_RERROR */
+ 
++/* report the association, with the request's elements when the driver has them */
++static void
++bsd_assoc_event(struct bsd_driver_data *drv)
++{
++	union wpa_event_data event;
++	struct ieee80211req ireq;
++	u8 ies[512];
++
++	os_memset(&ireq, 0, sizeof(ireq));
++	os_strlcpy(ireq.i_name, drv->ifname, sizeof(ireq.i_name));
++	ireq.i_type = IEEE80211_IOC_ASSOC_REQ_IE;
++	ireq.i_len = sizeof(ies);
++	ireq.i_data = ies;
++	if (ioctl(drv->global->sock, SIOCG80211, &ireq) < 0 ||
++	    ireq.i_len <= 0 || ireq.i_len > (int) sizeof(ies)) {
++		wpa_supplicant_event(drv->ctx, EVENT_ASSOC, NULL);
++		return;
++	}
++	wpa_hexdump(MSG_DEBUG, "BSD: association request elements",
++		    ies, ireq.i_len);
++	os_memset(&event, 0, sizeof(event));
++	event.assoc_info.req_ies = ies;
++	event.assoc_info.req_ies_len = ireq.i_len;
++	wpa_supplicant_event(drv->ctx, EVENT_ASSOC, &event);
++}
++
+ static void
+ bsd_wireless_event_receive(int sock, void *ctx, void *sock_ctx)
+ {
+@@ -796,6 +898,9 @@ bsd_wireless_event_receive(int sock, void *ctx, void *sock_ctx)
+ 	struct ieee80211_michael_event *mic;
+ 	struct ieee80211_leave_event *leave;
+ 	struct ieee80211_join_event *join;
++	struct ieee80211_extauth_event *extauth;
++	struct ieee80211_mgmt_rx_event *mgmt_rx;
++	struct ieee80211_assoc_reject_event *assoc_rej;
+ 	int n;
+ 
+ 	n = read(sock, event_buf, sizeof(event_buf));
+@@ -828,7 +933,7 @@ bsd_wireless_event_receive(int sock, void *ctx, void *sock_ctx)
+ 		case RTM_IEEE80211_REASSOC:
+ 			if (drv->is_ap)
+ 				break;
+-			wpa_supplicant_event(drv->ctx, EVENT_ASSOC, NULL);
++			bsd_assoc_event(drv);
+ 			break;
+ 		case RTM_IEEE80211_DISASSOC:
+ 			if (drv->is_ap)
+@@ -868,6 +973,66 @@ bsd_wireless_event_receive(int sock, void *ctx, void *sock_ctx)
+ 			wpa_supplicant_event(drv->ctx,
+ 					     EVENT_MICHAEL_MIC_FAILURE, &event);
+ 			break;
++		case RTM_IEEE80211_EXTAUTH:
++			if (drv->is_ap ||
++			    (size_t) n < sizeof(*ifan) + sizeof(*extauth))
++				break;
++			extauth = (struct ieee80211_extauth_event *) &ifan[1];
++			wpa_printf(MSG_DEBUG,
++				   "External auth %s with " MACSTR " AKM %08x",
++				   extauth->iev_action ==
++				   IEEE80211_EXTAUTH_ABORT ? "abort" : "start",
++				   MAC2STR(extauth->iev_bssid),
++				   extauth->iev_key_mgmt);
++			event.external_auth.action =
++				extauth->iev_action == IEEE80211_EXTAUTH_ABORT ?
++				EXT_AUTH_ABORT : EXT_AUTH_START;
++			event.external_auth.bssid = extauth->iev_bssid;
++			event.external_auth.ssid = extauth->iev_ssid;
++			event.external_auth.ssid_len =
++				extauth->iev_ssid_len >
++				sizeof(extauth->iev_ssid) ?
++				sizeof(extauth->iev_ssid) :
++				extauth->iev_ssid_len;
++			event.external_auth.key_mgmt_suite =
++				extauth->iev_key_mgmt;
++			wpa_supplicant_event(drv->ctx, EVENT_EXTERNAL_AUTH,
++					     &event);
++			break;
++		case RTM_IEEE80211_MGMT_RX:
++			if ((size_t) n < sizeof(*ifan) + sizeof(*mgmt_rx))
++				break;
++			mgmt_rx = (struct ieee80211_mgmt_rx_event *) &ifan[1];
++			if (mgmt_rx->iev_len >
++			    (size_t) n - sizeof(*ifan) - sizeof(*mgmt_rx)) {
++				wpa_printf(MSG_DEBUG,
++					   "Management frame of %u bytes "
++					   "truncated; dropped",
++					   mgmt_rx->iev_len);
++				break;
++			}
++			event.rx_mgmt.frame = (const u8 *) &mgmt_rx[1];
++			event.rx_mgmt.frame_len = mgmt_rx->iev_len;
++			event.rx_mgmt.freq = mgmt_rx->iev_freq;
++			event.rx_mgmt.ssi_signal = mgmt_rx->iev_rssi;
++			wpa_supplicant_event(drv->ctx, EVENT_RX_MGMT, &event);
++			break;
++		case RTM_IEEE80211_ASSOC_REJECT:
++			if (drv->is_ap ||
++			    (size_t) n < sizeof(*ifan) + sizeof(*assoc_rej))
++				break;
++			assoc_rej = (struct ieee80211_assoc_reject_event *)
++				&ifan[1];
++			wpa_printf(MSG_DEBUG,
++				   "Association with " MACSTR
++				   " rejected, status %u",
++				   MAC2STR(assoc_rej->iev_bssid),
++				   assoc_rej->iev_status);
++			event.assoc_reject.bssid = assoc_rej->iev_bssid;
++			event.assoc_reject.status_code = assoc_rej->iev_status;
++			wpa_supplicant_event(drv->ctx, EVENT_ASSOC_REJECT,
++					     &event);
++			break;
+ 		}
+ 		break;
+ 	case RTM_IFANNOUNCE:
+@@ -1274,7 +1439,20 @@ wpa_driver_bsd_set_rsn_wpa_ie(struct bsd_driver_data * drv,
+ {
+ 	int privacy;
+ 	size_t ie_len = ie[1] ? ie[1] + 2 : 0;
+-
++	const u8 *rsnxe = NULL;
++	u8 buf[2 * 257];
++
++	/* the RSNXE goes out with the RSN element, as 4-way msg 2/4 has it */
++	if (ie_len && ie[0] == WLAN_EID_RSN)
++		rsnxe = get_ie(params->wpa_ie, params->wpa_ie_len,
++		    WLAN_EID_RSNX);
++	if (rsnxe != NULL && rsnxe[1] > 0) {
++		os_memcpy(buf, ie, ie_len);
++		os_memcpy(buf + ie_len, rsnxe, 2 + rsnxe[1]);
++		if (wpa_driver_bsd_set_wpa_ie(drv, buf,
++		    ie_len + 2 + rsnxe[1]) < 0)
++			return -1;
++	} else
+ 	/* XXX error handling is wrong but unclear what to do... */
+ 	if (wpa_driver_bsd_set_wpa_ie(drv, ie, ie_len) < 0)
+ 		return -1;
+@@ -1642,6 +1820,24 @@ static int wpa_driver_bsd_capa(struct bsd_driver_data *drv)
+ 	drv->capa.auth = WPA_DRIVER_AUTH_OPEN |
+ 		WPA_DRIVER_AUTH_SHARED |
+ 		WPA_DRIVER_AUTH_LEAP;
++
++	/*
++	 * External SAE.  Asked quietly: drivers without it refuse the
++	 * request, and that is no error.
++	 */
++	{
++		struct ieee80211req ireq;
++
++		os_memset(&ireq, 0, sizeof(ireq));
++		os_strlcpy(ireq.i_name, drv->ifname, sizeof(ireq.i_name));
++		ireq.i_type = IEEE80211_IOC_EXTAUTH_CAPS;
++		if (ioctl(drv->global->sock, SIOCG80211, &ireq) == 0 &&
++		    (ireq.i_val & IEEE80211_EXTAUTH_CAP_SAE)) {
++			wpa_printf(MSG_DEBUG, "%s: external SAE", __func__);
++			drv->capa.flags |= WPA_DRIVER_FLAGS_SAE;
++			drv->capa.key_mgmt |= WPA_DRIVER_CAPA_KEY_MGMT_SAE;
++		}
++	}
+ 	return 0;
+ }
+ 
+@@ -1775,6 +1971,74 @@ wpa_driver_bsd_get_capa(void *priv, struct wpa_driver_capa *capa)
+ 	os_memcpy(capa, &drv->capa, sizeof(*capa));
+ 	return 0;
+ }
++
++/* External SAE: our Authentication frames, whole, header included. */
++static int
++wpa_driver_bsd_send_mlme(void *priv, const u8 *data, size_t data_len,
++			 int noack, unsigned int freq, const u16 *csa_offs,
++			 size_t csa_offs_len, int no_encrypt,
++			 unsigned int wait, int link_id)
++{
++	struct bsd_driver_data *drv = priv;
++
++	return set80211var(drv, IEEE80211_IOC_MGMT_TX, data, data_len);
++}
++
++static int
++wpa_driver_bsd_send_external_auth_status(void *priv,
++					 struct external_auth *params)
++{
++	struct bsd_driver_data *drv = priv;
++	struct ieee80211_extauth_status st;
++
++	if (params->bssid == NULL ||
++	    params->ssid_len > sizeof(st.is_ssid))
++		return -1;
++	os_memset(&st, 0, sizeof(st));
++	os_memcpy(st.is_bssid, params->bssid, ETH_ALEN);
++	st.is_ssid_len = params->ssid_len;
++	if (params->ssid_len)
++		os_memcpy(st.is_ssid, params->ssid, params->ssid_len);
++	wpa_printf(MSG_DEBUG, "%s: " MACSTR " status %u", __func__,
++		   MAC2STR(params->bssid), params->status);
++	return bsd_set80211(drv, IEEE80211_IOC_EXTAUTH_STATUS, params->status,
++			    &st, sizeof(st));
++}
++
++static int
++wpa_driver_bsd_pmkid(struct bsd_driver_data *drv, int op,
++		     struct wpa_pmkid_params *params)
++{
++	struct ieee80211_pmksa_req req;
++
++	os_memset(&req, 0, sizeof(req));
++	if (op != IEEE80211_PMKSA_FLUSH) {
++		/* The firmware keys PMKSAs by BSSID; FILS cache IDs aren't. */
++		if (params->bssid == NULL || params->pmkid == NULL)
++			return -1;
++		os_memcpy(req.ip_bssid, params->bssid, ETH_ALEN);
++		os_memcpy(req.ip_pmkid, params->pmkid, PMKID_LEN);
++	}
++	return bsd_set80211(drv, IEEE80211_IOC_PMKSA, op, &req, sizeof(req));
++}
++
++static int
++wpa_driver_bsd_add_pmkid(void *priv, struct wpa_pmkid_params *params)
++{
++	return wpa_driver_bsd_pmkid(priv, IEEE80211_PMKSA_ADD, params);
++}
++
++static int
++wpa_driver_bsd_remove_pmkid(void *priv, struct wpa_pmkid_params *params)
++{
++	return wpa_driver_bsd_pmkid(priv, IEEE80211_PMKSA_DEL, params);
++}
++
++static int
++wpa_driver_bsd_flush_pmkid(void *priv)
++{
++	return wpa_driver_bsd_pmkid(priv, IEEE80211_PMKSA_FLUSH, NULL);
++}
+ #endif /* HOSTAPD */
+ 
+ static void *
+@@ -1878,6 +2142,11 @@ const struct wpa_driver_ops wpa_driver_bsd_ops = {
+ 	.deauthenticate		= wpa_driver_bsd_deauthenticate,
+ 	.associate		= wpa_driver_bsd_associate,
+ 	.get_capa		= wpa_driver_bsd_get_capa,
++	.send_mlme		= wpa_driver_bsd_send_mlme,
++	.send_external_auth_status = wpa_driver_bsd_send_external_auth_status,
++	.add_pmkid		= wpa_driver_bsd_add_pmkid,
++	.remove_pmkid		= wpa_driver_bsd_remove_pmkid,
++	.flush_pmkid		= wpa_driver_bsd_flush_pmkid,
+ #endif /* HOSTAPD */
+ 	.set_freq		= bsd_set_freq,
+ 	.set_key		= bsd_set_key,
